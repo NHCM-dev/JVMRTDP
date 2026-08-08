@@ -1,0 +1,21 @@
+plugins {
+    id 'java'
+}
+
+group = 'JVMRTDP'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+
+}
+
+jar {
+    manifest {
+        attributes(
+                'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump'
+        )
+    }
+}
