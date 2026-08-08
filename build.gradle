@@ -1,21 +1,114 @@
 plugins {
     id 'java'
+    id 'application'
 }
 
-group = 'JVMRTDP'
+group = 'nhcm.jvmrtdp'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+application {
+    mainClass = 'nhcm.jvmrtdp.JVMRuntimeDump'
+}
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
 
+def isWindows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+def msbuildExecutable = providers.gradleProperty('msbuild')
+        .orElse('C:/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe')
+def nativeOutput = layout.projectDirectory.dir('natives/x64/Release')
+def generatedNativeResources = layout.buildDirectory.dir('generated-resources')
+def java8Launcher = javaToolchains.launcherFor {
+    languageVersion = JavaLanguageVersion.of(8)
+}
+
+tasks.register('buildInjectorNative', Exec) {
+    group = 'build'
+    description = 'Builds the x64 Release LoadLibrary injector DLL.'
+    onlyIf { isWindows }
+    inputs.files(fileTree('CPPProjects/Injector') {
+        include '**/*.cpp', '**/*.h', '**/*.vcxproj'
+    })
+    outputs.file(nativeOutput.file('jvmrtdp-injector.dll'))
+    commandLine msbuildExecutable.get(),
+            file('CPPProjects/Injector/Injector.vcxproj'),
+            '/m', '/t:Build', '/p:Configuration=Release', '/p:Platform=x64'
+    doFirst {
+        environment 'JAVA_HOME', java8Launcher.get().metadata.installationPath.asFile.absolutePath
+    }
+}
+
+tasks.register('buildAgentNative', Exec) {
+    group = 'build'
+    description = 'Builds the x64 Release target-side JNI/JVMTI DLL.'
+    onlyIf { isWindows }
+    inputs.files(fileTree('CPPProjects/JVMRTDP') {
+        include '**/*.cpp', '**/*.h', '**/*.vcxproj'
+    })
+    outputs.file(nativeOutput.file('jvmrtdp-agent.dll'))
+    commandLine msbuildExecutable.get(),
+            file('CPPProjects/JVMRTDP/JVMRTDP.vcxproj'),
+            '/m', '/t:Build', '/p:Configuration=Release', '/p:Platform=x64'
+    doFirst {
+        environment 'JAVA_HOME', java8Launcher.get().metadata.installationPath.asFile.absolutePath
+    }
+}
+
+tasks.register('buildNative') {
+    group = 'build'
+    description = 'Builds all native x64 Release libraries into natives/x64/Release.'
+    dependsOn 'buildInjectorNative', 'buildAgentNative'
+}
+
+tasks.register('copyNativeLibraries', Sync) {
+    group = 'build'
+    description = 'Synchronizes the built DLLs into the generated JAR resources.'
+    dependsOn 'buildNative'
+    onlyIf { isWindows }
+    from(nativeOutput)
+    include 'jvmrtdp-injector.dll', 'jvmrtdp-agent.dll'
+    into(generatedNativeResources.map { it.dir('natives/windows-x86_64') })
+}
+
+sourceSets {
+    main {
+        resources.srcDir(generatedNativeResources)
+    }
+}
+
+tasks.named('processResources') {
+    dependsOn 'copyNativeLibraries'
+}
+
+tasks.named('clean') {
+    delete layout.projectDirectory.dir('natives')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
 }
 
 jar {
+    archiveBaseName = 'JVMRTDP'
     manifest {
         attributes(
-                'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump'
+                'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump',
+                'Implementation-Title': 'JVMRTDP',
+                'Implementation-Version': project.version
         )
     }
 }

@@ -1,42 +1,59 @@
-.gradle
+# Gradle / Java outputs
+.gradle/
 build/
-!gradle/wrapper/gradle-wrapper.jar
-!**/src/main/**/build/
-!**/src/test/**/build/
+out/
+bin/
+*.class
 
-### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
+# Generated native binaries and symbols
+/natives/
+*.dll
+*.exe
+*.exp
+*.ilk
+*.iobj
+*.ipdb
+*.lib
+*.obj
+*.pch
+*.pdb
+*.tlog
+
+# Visual Studio local and intermediate files
+CPPProjects/**/.vs/
+CPPProjects/**/x64/
+CPPProjects/**/Win32/
+CPPProjects/**/Debug/
+CPPProjects/**/Release/
+CPPProjects/**/*.suo
+CPPProjects/**/*.user
+CPPProjects/**/*.VC.db
+CPPProjects/**/*.VC.opendb
+
+# IntelliJ IDEA
+.idea/
 *.iws
 *.iml
 *.ipr
-out/
-!**/src/main/**/out/
-!**/src/test/**/out/
 
-### Eclipse ###
-.apt_generated
+# Eclipse / STS
+.apt_generated/
 .classpath
 .factorypath
 .project
-.settings
+.settings/
 .springBeans
-.sts4-cache
-bin/
-!**/src/main/**/bin/
-!**/src/test/**/bin/
+.sts4-cache/
 
-### NetBeans ###
+# NetBeans
 /nbproject/private/
 /nbbuild/
 /dist/
 /nbdist/
 /.nb-gradle/
 
-### VS Code ###
+# VS Code and OS metadata
 .vscode/
-
-### Mac OS ###
 .DS_Store
+Thumbs.db
+Desktop.ini

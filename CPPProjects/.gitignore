@@ -1,2 +1,10 @@
-/JVMRTDP/.vs/
-/Injector/.vs/
+# Visual Studio per-user state (root .gitignore contains the full rules too).
+**/.vs/
+**/*.suo
+**/*.user
+**/*.VC.db
+**/*.VC.opendb
+**/x64/
+**/Win32/
+**/Debug/
+**/Release/
