@@ -1,6 +1,6 @@
 package nhcm.jvmrtdp;
 
-import nhcm.jvmrtdp.localside.ControllerShell;
+import nhcm.jvmrtdp.controllerside.ControllerShell;
 
 public class JVMRuntimeDump {
     private JVMRuntimeDump() {
@@ -20,6 +20,9 @@ public class JVMRuntimeDump {
             } else if (("help".equalsIgnoreCase(args[0]) || "--help".equalsIgnoreCase(args[0]))
                     && args.length == 1) {
                 printUsage();
+            } else if (("version".equalsIgnoreCase(args[0]) || "--version".equalsIgnoreCase(args[0])
+                    || "-V".equals(args[0])) && args.length == 1) {
+                System.out.println(BuildInfo.displayVersion());
             } else {
                 printUsage();
                 System.exit(2);
@@ -47,5 +50,6 @@ public class JVMRuntimeDump {
         System.out.println("  java -jar JVMRTDP.jar");
         System.out.println("  java -jar JVMRTDP.jar list");
         System.out.println("  java -jar JVMRTDP.jar inject <pid>");
+        System.out.println("  java -jar JVMRTDP.jar --version");
     }
 }

@@ -557,6 +557,69 @@ jstring JNICALL NativeCallStaticMethod(JNIEnv* env, jclass, jstring classNameVal
     return env->NewStringUTF(result.c_str());
 }
 
+jclass JNICALL NativeFindLoadedClass(JNIEnv* env, jclass, jstring classNameValue) {
+    const std::string className = JStringToUtf8(env, classNameValue);
+    if (className.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class name must not be empty");
+        return nullptr;
+    }
+    return FindLoadedClass(env, className);
+}
+
+jobjectArray JNICALL NativeListLoadedClassNames(JNIEnv* env, jclass) {
+    jint count = 0;
+    jclass* classes = nullptr;
+    const jvmtiError error = gJvmti->GetLoadedClasses(&count, &classes);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJava(env, "java/lang/IllegalStateException", "GetLoadedClasses failed: " + JvmtiErrorText(error));
+        return nullptr;
+    }
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray result = stringClass == nullptr ? nullptr : env->NewObjectArray(count, stringClass, nullptr);
+    for (jint index = 0; result != nullptr && index < count; ++index) {
+        char* signature = nullptr;
+        char* generic = nullptr;
+        if (gJvmti->GetClassSignature(classes[index], &signature, &generic) == JVMTI_ERROR_NONE
+            && signature != nullptr) {
+            std::string name(signature);
+            if (name.size() >= 2 && name.front() == 'L' && name.back() == ';') {
+                name = name.substr(1, name.size() - 2);
+            }
+            std::replace(name.begin(), name.end(), '/', '.');
+            jstring javaName = env->NewStringUTF(name.c_str());
+            if (javaName != nullptr) {
+                env->SetObjectArrayElement(result, index, javaName);
+                env->DeleteLocalRef(javaName);
+            }
+        }
+        if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
+        if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+        env->DeleteLocalRef(classes[index]);
+    }
+    if (classes != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(classes));
+    if (stringClass != nullptr) env->DeleteLocalRef(stringClass);
+    return result;
+}
+
+jobjectArray JNICALL NativeListLoadedClasses(JNIEnv* env, jclass) {
+    jint count = 0;
+    jclass* classes = nullptr;
+    const jvmtiError error = gJvmti->GetLoadedClasses(&count, &classes);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJava(env, "java/lang/IllegalStateException", "GetLoadedClasses failed: " + JvmtiErrorText(error));
+        return nullptr;
+    }
+    jclass classClass = env->FindClass("java/lang/Class");
+    jobjectArray result = classClass == nullptr ? nullptr : env->NewObjectArray(count, classClass, nullptr);
+    for (jint index = 0; result != nullptr && index < count; ++index) {
+        env->SetObjectArrayElement(result, index, classes[index]);
+        env->DeleteLocalRef(classes[index]);
+    }
+    if (classes != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(classes));
+    if (classClass != nullptr) env->DeleteLocalRef(classClass);
+    return result;
+}
+
 JNINativeMethod kMethods[] = {
     {const_cast<char*>("nativeVersion"), const_cast<char*>("()Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeVersion)},
@@ -572,6 +635,13 @@ JNINativeMethod kMethods[] = {
     {const_cast<char*>("nativeCallStaticMethod"),
      const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCallStaticMethod)},
+    {const_cast<char*>("nativeFindLoadedClass"),
+     const_cast<char*>("(Ljava/lang/String;)Ljava/lang/Class;"),
+     reinterpret_cast<void*>(&NativeFindLoadedClass)},
+    {const_cast<char*>("nativeListLoadedClassNames"), const_cast<char*>("()[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeListLoadedClassNames)},
+    {const_cast<char*>("nativeListLoadedClasses"), const_cast<char*>("()[Ljava/lang/Class;"),
+     reinterpret_cast<void*>(&NativeListLoadedClasses)},
 };
 
 } // namespace

@@ -62,6 +62,7 @@ public class AgentServer implements AutoCloseable {
             return;
         }
         closeQuietly(serverChannel);
+        handle.close();
         onClosed.run();
     }
 

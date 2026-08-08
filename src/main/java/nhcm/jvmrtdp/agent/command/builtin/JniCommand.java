@@ -6,7 +6,7 @@ import nhcm.jvmrtdp.protocol.CommandReply;
 
 import java.util.List;
 
-public final class JniCommand implements RemoteCommand {
+public class JniCommand implements RemoteCommand {
     @Override
     public String name() {
         return "jni";

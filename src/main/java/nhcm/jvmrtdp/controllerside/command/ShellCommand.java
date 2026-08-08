@@ -1,4 +1,4 @@
-package nhcm.jvmrtdp.localside.command;
+package nhcm.jvmrtdp.controllerside.command;
 
 import java.util.Arrays;
 import java.util.Collections;

@@ -122,6 +122,43 @@ std::wstring BaseName(const std::wstring& path) {
     return separator == std::wstring::npos ? path : path.substr(separator + 1);
 }
 
+struct WindowTitleSearch final {
+    DWORD pid;
+    HWND foreground;
+    std::wstring title;
+    int score;
+};
+
+BOOL CALLBACK FindProcessWindowTitle(HWND window, LPARAM parameter) noexcept {
+    auto* search = reinterpret_cast<WindowTitleSearch*>(parameter);
+    DWORD windowPid = 0;
+    GetWindowThreadProcessId(window, &windowPid);
+    if (windowPid != search->pid || !IsWindowVisible(window)) return TRUE;
+    const int length = GetWindowTextLengthW(window);
+    if (length <= 0 || length > 32767) return TRUE;
+    std::wstring title(static_cast<std::size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(window, &title[0], length + 1);
+    if (copied <= 0) return TRUE;
+    title.resize(static_cast<std::size_t>(copied));
+
+    int score = 1;
+    if (window == search->foreground) score += 8;
+    if (GetWindow(window, GW_OWNER) == nullptr) score += 4;
+    if ((GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) == 0) score += 2;
+    if (score > search->score
+        || (score == search->score && title.size() > search->title.size())) {
+        search->title = title;
+        search->score = score;
+    }
+    return TRUE;
+}
+
+std::wstring ProcessWindowTitle(DWORD pid) {
+    WindowTitleSearch search{pid, GetForegroundWindow(), {}, -1};
+    EnumWindows(&FindProcessWindowTitle, reinterpret_cast<LPARAM>(&search));
+    return search.title;
+}
+
 std::wstring ProcessCommandLine(HANDLE process) {
     // ProcessCommandLineInformation (60) is available on supported Windows 10/11.
     // Resolve it dynamically because it is intentionally not part of the Win32 API surface.
@@ -152,21 +189,21 @@ std::wstring ProcessCommandLine(HANDLE process) {
 
 std::wstring JavaLaunchIdentity(const std::wstring& executableName, const std::wstring& commandLine) {
     if (_wcsicmp(executableName.c_str(), L"java.exe") != 0
-        && _wcsicmp(executableName.c_str(), L"javaw.exe") != 0) return executableName;
+        && _wcsicmp(executableName.c_str(), L"javaw.exe") != 0) return L"<embedded JVM>";
     int argumentCount = 0;
     wchar_t** arguments = CommandLineToArgvW(commandLine.c_str(), &argumentCount);
-    if (arguments == nullptr) return executableName;
+    if (arguments == nullptr) return L"<unknown>";
 
-    std::wstring result = executableName;
+    std::wstring result;
     for (int index = 1; index < argumentCount; ++index) {
         const std::wstring argument(arguments[index]);
         if (_wcsicmp(argument.c_str(), L"-jar") == 0 && index + 1 < argumentCount) {
-            result.append(L" -jar ").append(BaseName(arguments[index + 1]));
+            result.append(L"-jar ").append(BaseName(arguments[index + 1]));
             break;
         }
         if ((_wcsicmp(argument.c_str(), L"-m") == 0
                 || _wcsicmp(argument.c_str(), L"--module") == 0) && index + 1 < argumentCount) {
-            result.append(L" ").append(arguments[index + 1]);
+            result.append(arguments[index + 1]);
             break;
         }
         if ((_wcsicmp(argument.c_str(), L"-cp") == 0
@@ -179,11 +216,11 @@ std::wstring JavaLaunchIdentity(const std::wstring& executableName, const std::w
             continue;
         }
         if (!argument.empty() && argument.front() == L'-') continue;
-        result.append(L" ").append(argument);
+        result.append(argument);
         break;
     }
     LocalFree(arguments);
-    return result;
+    return result.empty() ? L"<unknown>" : result;
 }
 
 std::wstring FullPath(const std::wstring& path) {
@@ -296,6 +333,39 @@ jstring JNICALL NativeProcessDisplayName(JNIEnv* env, jclass, jlong pid) noexcep
         ? executableName : JavaLaunchIdentity(executableName, commandLine);
     return env->NewString(
         reinterpret_cast<const jchar*>(displayName.data()), static_cast<jsize>(displayName.size()));
+}
+
+jstring JNICALL NativeProcessExecutableName(JNIEnv* env, jclass, jlong pid) noexcept {
+    if (pid <= 0 || pid > UINT32_MAX) return env->NewStringUTF("");
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)));
+    if (!process) return env->NewStringUTF("");
+    std::wstring path(32768, L'\0');
+    DWORD length = static_cast<DWORD>(path.size());
+    if (!QueryFullProcessImageNameW(process.get(), 0, &path[0], &length)) return env->NewStringUTF("");
+    path.resize(length);
+    const std::wstring name = BaseName(path);
+    return env->NewString(reinterpret_cast<const jchar*>(name.data()), static_cast<jsize>(name.size()));
+}
+
+jstring JNICALL NativeProcessWindowTitle(JNIEnv* env, jclass, jlong pid) noexcept {
+    if (pid <= 0 || pid > UINT32_MAX) return env->NewStringUTF("");
+    const std::wstring title = ProcessWindowTitle(static_cast<DWORD>(pid));
+    if (title.empty()) return env->NewStringUTF("");
+    return env->NewString(reinterpret_cast<const jchar*>(title.data()), static_cast<jsize>(title.size()));
+}
+
+jlong JNICALL NativeProcessStartTimeMillis(JNIEnv*, jclass, jlong pid) noexcept {
+    if (pid <= 0 || pid > UINT32_MAX) return 0;
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)));
+    if (!process) return 0;
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(process.get(), &creation, &exit, &kernel, &user)) return 0;
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart = creation.dwLowDateTime;
+    ticks.HighPart = creation.dwHighDateTime;
+    constexpr unsigned long long kEpochDifference100ns = 116444736000000000ULL;
+    if (ticks.QuadPart < kEpochDifference100ns) return 0;
+    return static_cast<jlong>((ticks.QuadPart - kEpochDifference100ns) / 10000ULL);
 }
 
 void JNICALL NativeInject(JNIEnv* env, jclass, jlong pidValue, jstring dllPathValue,
@@ -420,6 +490,12 @@ JNINativeMethod kMethods[] = {
      reinterpret_cast<void*>(&NativeProcessArchitecture)},
     {const_cast<char*>("nativeProcessDisplayName"), const_cast<char*>("(J)Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeProcessDisplayName)},
+    {const_cast<char*>("nativeProcessExecutableName"), const_cast<char*>("(J)Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeProcessExecutableName)},
+    {const_cast<char*>("nativeProcessWindowTitle"), const_cast<char*>("(J)Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeProcessWindowTitle)},
+    {const_cast<char*>("nativeProcessStartTimeMillis"), const_cast<char*>("(J)J"),
+     reinterpret_cast<void*>(&NativeProcessStartTimeMillis)},
     {const_cast<char*>("nativeInject"), const_cast<char*>("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V"),
      reinterpret_cast<void*>(&NativeInject)},
 };

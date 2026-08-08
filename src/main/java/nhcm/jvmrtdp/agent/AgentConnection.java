@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.agent;
 
+import nhcm.jvmrtdp.BuildInfo;
 import nhcm.jvmrtdp.agent.command.CommandRegistry;
 import nhcm.jvmrtdp.attach.AgentOptions;
 import nhcm.jvmrtdp.handles.JRDHandle;
@@ -80,15 +81,11 @@ public class AgentConnection implements AutoCloseable {
             return false;
         }
 
-        String agentVersion = AgentConnection.class.getPackage().getImplementationVersion();
-        if (agentVersion == null) {
-            agentVersion = "development";
-        }
         HelloAckMessage ack = new HelloAckMessage(
                 handle.id(),
                 handle.processId(),
                 handle.displayName(),
-                agentVersion,
+                BuildInfo.VERSION,
                 handle.nativeRuntime().available(),
                 handle.nativeRuntime().describe());
         frameCodec.write(channel, new Frame(MessageType.HELLO_ACK, 0, messageCodec.encodeHelloAck(ack)));

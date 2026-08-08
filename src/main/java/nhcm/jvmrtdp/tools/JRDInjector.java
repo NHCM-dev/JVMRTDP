@@ -3,6 +3,7 @@ package nhcm.jvmrtdp.tools;
 import nhcm.jvmrtdp.JVMProcess;
 import nhcm.jvmrtdp.attach.AgentJarLocator;
 import nhcm.jvmrtdp.attach.AgentOptions;
+import nhcm.jvmrtdp.attach.AgentJarStager;
 import nhcm.jvmrtdp.attach.EndpointFactory;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.nativebridge.InjectorNative;
@@ -10,6 +11,7 @@ import nhcm.jvmrtdp.throwble.InjectionException;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -29,7 +31,7 @@ public class JRDInjector {
         List<JVMProcess> processes = new ArrayList<JVMProcess>();
         for (long pid : nativeBridge.listJvmProcessIds()) {
             if (pid != controllerPid) {
-                processes.add(new JVMProcess(pid, nativeBridge.processDisplayName(pid), this));
+                processes.add(process(pid));
             }
         }
         Collections.sort(processes, new Comparator<JVMProcess>() {
@@ -42,7 +44,7 @@ public class JRDInjector {
     }
 
     public JVMProcess getProcess(long pid) {
-        return new JVMProcess(pid, nativeBridge.processDisplayName(pid), this);
+        return process(pid);
     }
 
     public boolean isProcessAlive(long pid) {
@@ -51,6 +53,17 @@ public class JRDInjector {
 
     public String processArchitecture(long pid) {
         return nativeBridge.processArchitecture(pid);
+    }
+
+    private JVMProcess process(long pid) {
+        long startedAt = nativeBridge.processStartTimeMillis(pid);
+        return new JVMProcess(
+                pid,
+                nativeBridge.processExecutableName(pid),
+                nativeBridge.processWindowTitle(pid),
+                nativeBridge.processDisplayName(pid),
+                startedAt <= 0 ? null : Instant.ofEpochMilli(startedAt),
+                this);
     }
 
     public ServerHandle inject(JVMProcess process) {
@@ -76,7 +89,8 @@ public class JRDInjector {
 
         AgentOptions options = EndpointFactory.create(process.pid());
         Path injectorDll = DLLSupport.loadDllFromJar(DLLSupport.INJECTOR_RESOURCE);
-        nativeBridge.inject(process.pid(), injectorDll, normalizedJar, options.encode(), timeout);
+        Path stagedAgentJar = AgentJarStager.stage(normalizedJar);
+        nativeBridge.inject(process.pid(), injectorDll, stagedAgentJar, options.encode(), timeout);
         return ServerHandle.connect(process, options, timeout);
     }
 }

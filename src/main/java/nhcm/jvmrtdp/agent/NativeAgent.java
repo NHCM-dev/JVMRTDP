@@ -35,6 +35,21 @@ public class NativeAgent {
         return nativeCallStaticMethod(className, methodName, descriptor, arguments);
     }
 
+    public static Class<?> findLoadedClass(String className) {
+        requireAvailable();
+        return nativeFindLoadedClass(className);
+    }
+
+    public static String[] listLoadedClassNames() {
+        requireAvailable();
+        return nativeListLoadedClassNames();
+    }
+
+    public static Class<?>[] listLoadedClasses() {
+        requireAvailable();
+        return nativeListLoadedClasses();
+    }
+
     private static RuntimeInfo initialize() {
         try {
             DLLSupport.loadDllFromJar(DLLSupport.AGENT_RESOURCE);
@@ -58,6 +73,12 @@ public class NativeAgent {
 
     private static native String nativeCallStaticMethod(
             String className, String methodName, String descriptor, String[] arguments);
+
+    private static native Class<?> nativeFindLoadedClass(String className);
+
+    private static native String[] nativeListLoadedClassNames();
+
+    private static native Class<?>[] nativeListLoadedClasses();
 
     private static void requireAvailable() {
         if (!RUNTIME_INFO.available()) {

@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.Locale;
 
 /** Small, dependency-free command line parser shared by both sides. */
-public final class CommandLine {
+public class CommandLine {
     private final String name;
     private final List<String> arguments;
 

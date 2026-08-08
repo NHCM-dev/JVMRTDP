@@ -39,10 +39,6 @@ public abstract class RemoteHandle {
         return reply.output();
     }
 
-    protected final UnsupportedOperationException unsupported(String operation) {
-        return new UnsupportedOperationException(operation + " is not implemented by the target agent yet");
-    }
-
     @Override
     public final int hashCode() {
         return Objects.hash(server.sessionId(), remoteId, getClass());

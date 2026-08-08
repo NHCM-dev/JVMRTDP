@@ -1,4 +1,4 @@
-package nhcm.jvmrtdp.localside.command;
+package nhcm.jvmrtdp.controllerside.command;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-public final class ShellCommandRegistry<C> {
+public class ShellCommandRegistry<C> {
     private final Map<String, ShellCommand<C>> byName = new LinkedHashMap<String, ShellCommand<C>>();
     private final List<ShellCommand<C>> commands = new ArrayList<ShellCommand<C>>();
 

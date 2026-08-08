@@ -48,6 +48,18 @@ public class InjectorNative {
         return nativeProcessDisplayName(pid);
     }
 
+    public String processExecutableName(long pid) {
+        return nativeProcessExecutableName(pid);
+    }
+
+    public String processWindowTitle(long pid) {
+        return nativeProcessWindowTitle(pid);
+    }
+
+    public long processStartTimeMillis(long pid) {
+        return nativeProcessStartTimeMillis(pid);
+    }
+
     public void inject(long pid, Path injectorDll, Path agentJar, String options, Duration timeout) {
         nativeInject(
                 pid,
@@ -66,6 +78,12 @@ public class InjectorNative {
     private static native String nativeProcessArchitecture(long pid);
 
     private static native String nativeProcessDisplayName(long pid);
+
+    private static native String nativeProcessExecutableName(long pid);
+
+    private static native String nativeProcessWindowTitle(long pid);
+
+    private static native long nativeProcessStartTimeMillis(long pid);
 
     private static native void nativeInject(
             long pid, String injectorDll, String agentJar, String options, long timeoutMillis);

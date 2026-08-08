@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.handles;
 
+import nhcm.jvmrtdp.BuildInfo;
 import nhcm.jvmrtdp.JVMProcess;
 import nhcm.jvmrtdp.attach.AgentOptions;
 import nhcm.jvmrtdp.handles.jvm.RemoteJavaVM;
@@ -15,6 +16,8 @@ import nhcm.jvmrtdp.protocol.RemoteError;
 import nhcm.jvmrtdp.throwble.InjectionException;
 import nhcm.jvmrtdp.throwble.RemoteCommandException;
 import nhcm.jvmrtdp.utils.ProcessIds;
+import nhcm.jvmrtdp.command.CommandLine;
+import nhcm.jvmrtdp.protocol.BatchCodec;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -23,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.util.Map;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -121,6 +125,10 @@ public class ServerHandle implements AutoCloseable {
         return target.targetDisplayName();
     }
 
+    public String agentVersion() {
+        return target.agentVersion();
+    }
+
     public boolean nativeAvailable() {
         return target.nativeAvailable();
     }
@@ -131,6 +139,21 @@ public class ServerHandle implements AutoCloseable {
 
     public RemoteJavaVM javaVM() {
         return javaVM;
+    }
+
+    public RemoteBatch batch() {
+        return new RemoteBatch(this);
+    }
+
+    public List<CommandReply> executeBatch(List<String> commands) {
+        String encoded = BatchCodec.encodeRequests(commands);
+        CommandReply reply = execute(CommandLine.of("batch", encoded));
+        if (!reply.successful()) throw new IllegalStateException(reply.output());
+        List<CommandReply> replies = BatchCodec.decodeReplies(reply.output());
+        if (replies.size() != commands.size()) {
+            throw new IllegalStateException("Target returned an incomplete batch response");
+        }
+        return replies;
     }
 
     public CommandReply execute(String commandLine) {
@@ -186,12 +209,8 @@ public class ServerHandle implements AutoCloseable {
     }
 
     private HelloAckMessage handshake(AgentOptions options) throws IOException {
-        String version = ServerHandle.class.getPackage().getImplementationVersion();
-        if (version == null) {
-            version = "development";
-        }
         write(new Frame(MessageType.HELLO, 0, messageCodec.encodeHello(new HelloMessage(
-                options.token(), ProcessIds.current(), version))));
+                options.token(), ProcessIds.current(), BuildInfo.VERSION))));
         Frame response = frameCodec.read(channel);
         if (response.type() == MessageType.ERROR) {
             RemoteError error = messageCodec.decodeRemoteError(response.payload());

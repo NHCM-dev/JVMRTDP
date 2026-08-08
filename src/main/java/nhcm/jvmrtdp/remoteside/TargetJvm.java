@@ -8,7 +8,7 @@ import java.util.Objects;
  * Target-side JNI/JVMTI facade. Native pointers and references never cross the
  * transport; only bounded byte arrays and strings are returned to the controller.
  */
-public final class TargetJvm {
+public class TargetJvm {
     public byte[] getClassBytes(String className) {
         return NativeAgent.getClassBytes(requireName(className, "className"));
     }

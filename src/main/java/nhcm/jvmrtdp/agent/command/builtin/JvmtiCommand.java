@@ -7,7 +7,7 @@ import nhcm.jvmrtdp.protocol.CommandReply;
 import java.util.Base64;
 import java.util.List;
 
-public final class JvmtiCommand implements RemoteCommand {
+public class JvmtiCommand implements RemoteCommand {
     @Override
     public String name() {
         return "jvmti";
