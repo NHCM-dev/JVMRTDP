@@ -145,7 +145,6 @@ tasks.named('test') {
 
 jar {
     archiveBaseName = 'JVMRTDP'
-    archiveVersion = ''
     manifest {
         attributes(
                 'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump',
