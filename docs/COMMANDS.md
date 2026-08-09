@@ -823,6 +823,32 @@ public final class Hook implements JvmtiEventHandler, JvmtiClassFileTransformer 
 }
 ```
 
+也可以实现 `JvmtiCategorizedEventHandler`，分别覆盖 `onVmEvent`、`onThreadEvent`、
+`onClassEvent`、`onExecutionEvent`、`onMethodEvent`、`onFieldEvent`、`onExceptionEvent`、
+`onMonitorEvent`、`onNativeCodeEvent`、`onHeapEvent`、`onGarbageCollectionEvent` 和
+`onResourceEvent`，不需要在单一 `onEvent` 中自行分派。
+
+`method_entry` 和 `method_exit` 会产生 `JvmtiMethodEvent`。它额外提供 receiver、静态/native
+标记、按 descriptor 和 JVM slot 排列的 `JvmtiMethodArgument`、异常 pop 标记以及装箱后的返回值：
+
+```java
+public final class MethodHook implements JvmtiCategorizedEventHandler {
+    @Override
+    public void onMethodEvent(JvmtiMethodEvent event) {
+        System.out.println(event.className() + "." + event.methodName());
+        for (JvmtiMethodArgument argument : event.arguments()) {
+            System.out.println(argument.slot() + " " + argument.descriptor()
+                    + " " + (argument.available() ? argument.value() : argument.error()));
+        }
+    }
+}
+```
+
+参数值不依赖 `LocalVariableTable`；缺少 `-g` 调试信息时只有参数名为 null。`long`/`double`
+占两个 slot，实例方法 slot 0 为 receiver。native/opaque frame、缺少
+`can_access_local_variables` 或 VM 无法物化栈帧时，每个参数的 `available()` 为 false，
+`error()` 保存对应 JVMTI 错误。
+
 注册与管理：
 
 ```text
@@ -854,12 +880,20 @@ secondary subject 和 text 等事件附加参数。`JvmtiClassFileEvent` 另外�
 当前 class bytes。
 
 动态注入在 JVMTI live phase 建立环境；实际可用事件取决于 `jvmti capabilities`。JVM 不允许 live phase 获取的启动期
-capability 会明确返回 `JVMTI_ERROR_MUST_POSSESS_CAPABILITY`，而不是静默伪装成功。
+capability 会明确指出所需 capability。要获得 MethodEntry/MethodExit 等 OnLoad-only capability，使用启动模式并把
+JVMRTDP JAR 放入 system class path：
+
+```text
+java -agentpath:C:\path\jvmrtdp-agent.dll -cp JVMRTDP.jar;application.jar application.Main
+```
+
+原生 agent 在 `Agent_OnLoad` 请求该 VM 当时提供的全部 JVMTI 1.2 capability，并在 `VMInit` 绑定 Java dispatcher。
 
 ### 其他 JVMTI 操作
 
 ```text
 jvmti capabilities
+jvmti capability-status
 jvmti events
 jvmti retransform <class>
 jvmti redefine <class> <class-file>

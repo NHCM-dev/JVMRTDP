@@ -3,9 +3,13 @@ package nhcm.jvmrtdp.remoteside;
 import nhcm.jvmrtdp.agent.NativeAgent;
 import nhcm.jvmrtdp.api.jvmti.JvmtiClassFileEvent;
 import nhcm.jvmrtdp.api.jvmti.JvmtiClassFileTransformer;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEvent;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventHandler;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
+import nhcm.jvmrtdp.api.jvmti.JvmtiMethodArgument;
+import nhcm.jvmrtdp.api.jvmti.JvmtiMethodEvent;
 import nhcm.jvmrtdp.protocol.TextWireCodec;
 
 import java.util.ArrayList;
@@ -115,17 +119,65 @@ public class JvmtiCallbackDispatcher {
             String methodDescriptor, long location, Object subject, long value,
             String relatedClassName, String relatedMethodName, String relatedMethodDescriptor,
             long relatedLocation, String memberName, String memberDescriptor,
-            Object secondarySubject, String text) {
+            Object secondarySubject, String text, Object receiver, String receiverError, Object[] methodArguments,
+            String[] methodArgumentNames, int[] methodArgumentSlots, String[] methodArgumentErrors,
+            int methodFlags, Object returnValue) {
         final JvmtiEventType type;
         try {
             type = JvmtiEventType.parse(eventName);
         } catch (RuntimeException ignored) {
             return;
         }
-        final JvmtiEvent event = new JvmtiEvent(type, thread, className, methodName, methodDescriptor,
-                location, subject, value, relatedClassName, relatedMethodName, relatedMethodDescriptor,
-                relatedLocation, memberName, memberDescriptor, secondarySubject, text);
+        final JvmtiEvent event;
+        if (type == JvmtiEventType.METHOD_ENTRY || type == JvmtiEventType.METHOD_EXIT) {
+            List<String> descriptors = parameterDescriptors(methodDescriptor);
+            int count = methodArguments == null ? descriptors.size() : methodArguments.length;
+            List<JvmtiMethodArgument> arguments = new ArrayList<JvmtiMethodArgument>(count);
+            for (int index = 0; index < count; ++index) {
+                Object argument = methodArguments != null && index < methodArguments.length
+                        ? methodArguments[index] : null;
+                String name = methodArgumentNames != null && index < methodArgumentNames.length
+                        ? methodArgumentNames[index] : null;
+                int slot = methodArgumentSlots != null && index < methodArgumentSlots.length
+                        ? methodArgumentSlots[index] : -1;
+                String error = methodArgumentErrors != null && index < methodArgumentErrors.length
+                        ? methodArgumentErrors[index] : "argument metadata was not supplied";
+                String descriptor = index < descriptors.size() ? descriptors.get(index) : "?";
+                arguments.add(new JvmtiMethodArgument(index, slot, name, descriptor, argument, error));
+            }
+            event = new JvmtiMethodEvent(type, thread, className, methodName, methodDescriptor,
+                    location, subject, value, relatedClassName, relatedMethodName,
+                    relatedMethodDescriptor, relatedLocation, memberName, memberDescriptor,
+                    secondarySubject, text, receiver, (methodFlags & 8) != 0,
+                    receiverError, arguments, (methodFlags & 1) != 0,
+                    (methodFlags & 2) != 0, (methodFlags & 4) != 0, returnValue);
+        } else {
+            event = new JvmtiEvent(type, thread, className, methodName, methodDescriptor,
+                    location, subject, value, relatedClassName, relatedMethodName,
+                    relatedMethodDescriptor, relatedLocation, memberName, memberDescriptor,
+                    secondarySubject, text);
+        }
         dispatch(event);
+    }
+
+    private static List<String> parameterDescriptors(String descriptor) {
+        if (descriptor == null || descriptor.length() < 3 || descriptor.charAt(0) != '(') {
+            return Collections.emptyList();
+        }
+        List<String> result = new ArrayList<String>();
+        int position = 1;
+        while (position < descriptor.length() && descriptor.charAt(position) != ')') {
+            int start = position;
+            while (position < descriptor.length() && descriptor.charAt(position) == '[') position++;
+            if (position >= descriptor.length()) return Collections.emptyList();
+            if (descriptor.charAt(position++) == 'L') {
+                int semicolon = descriptor.indexOf(';', position);
+                if (semicolon < 0) return Collections.emptyList();
+                position = semicolon + 1;
+            }
+            result.add(descriptor.substring(start, position));
+        }
+        return result;
     }
 
     private static void dispatch(final JvmtiEvent event) {
@@ -201,12 +253,27 @@ public class JvmtiCallbackDispatcher {
         }
         if (count.getAndIncrement() == 0) {
             try {
+                requireCapability(event);
                 NativeAgent.setEventNotification(event.wireName(), true);
             } catch (RuntimeException failure) {
                 count.decrementAndGet();
                 throw failure;
             }
         }
+    }
+
+    private static void requireCapability(JvmtiEventType event) {
+        JvmtiCapability required = event.requiredCapability();
+        if (required == null) return;
+        for (JvmtiCapabilityStatus status : NativeAgent.capabilityStatuses()) {
+            if (status.capability() != required) continue;
+            if (status.enabled()) return;
+            throw new IllegalStateException("JVMTI event " + event.wireName() + " requires "
+                    + required.wireName() + "; this VM did not grant it"
+                    + (status.potential() ? "" : " in the current phase. Start the JVM with -agentpath "
+                            + "to acquire OnLoad-only capabilities"));
+        }
+        throw new IllegalStateException("JVMTI did not report capability " + required.wireName());
     }
 
     private static synchronized void release(JvmtiEventType event) {

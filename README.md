@@ -20,7 +20,8 @@ JVMRTDP 是面向 Windows x64 的目标 JVM 诊断与对象操作工具。控制
 - 单类或按包批量 dump；class bytes 始终写入文件。
 - 将单个 Java 源文件、源码目录/项目、多段方法或 JAR 分块部署到目标 JVM，并调用其中的方法。
 - 支持 child、目标类同 ClassLoader、system 与 bootstrap class path 四种装载语义。
-- 覆盖 JVMTI 1.2 的全部非 reserved 事件回调；Java handler 可接收线程、类、方法、位置、对象、字段和事件附加值。
+- 覆盖 JVMTI 1.2 的全部非 reserved 事件回调；callback 可按 VM、线程、类、执行、方法、字段、异常、monitor、native code、heap/GC 和资源分类。
+- `JvmtiMethodEvent` 可读取 receiver、完整参数 slot/descriptor/值、参数名（有调试表时）、返回值和异常 pop 状态，并逐参数报告不可读取原因。
 - 支持同步/异步 Java 回调、ClassFileLoadHook 字节码转换链、回调统计、断点、字段 watch、重转换/重定义、线程/栈、tag、对象大小和 GC 操作。
 - Context 栈、书签、不会污染栈的临时 `->` 引用链、UTF-8 输出捕获、批处理和 `.jrd` 流程脚本。
 - Prompt 每次显示前都会尝试刷新当前对象的类型、null 状态和 `toString()` 值。
@@ -235,6 +236,6 @@ try (ServerHandle server = jvmrtdp.inject(pid)) {
 - 私有成员访问仍可能被 SecurityManager、模块边界或 JVM 实现限制。
 - 只列出当前已经加载的类；搜索和 package 浏览不会主动加载新业务类。
 - 当前原生注入器只构建 Windows x64 版本。
-- 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。某些 VM 的字段 watch、早期 VM 事件等启动期能力只能在以 `-agentpath` 启动时获得，调用不可用能力会返回明确的 JVMTI capability 错误。
+- 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。`jvmti capability-status` 会完整显示每个 JVMTI 1.2 capability 的 enabled/potential 状态。MethodEntry/MethodExit 等启动期能力可通过 `-agentpath` 模式在 `Agent_OnLoad` 获取；不可用能力会返回包含 capability 名称和启动建议的明确错误。
 
 完整语法和行为细节见 [命令手册](docs/COMMANDS.md)，脚本控制流见 [脚本语言手册](docs/SCRIPTING.md)。

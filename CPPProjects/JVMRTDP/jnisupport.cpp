@@ -24,20 +24,48 @@ namespace {
 
 constexpr std::string_view kBindingClass = "nhcm/jvmrtdp/agent/NativeAgent";
 constexpr jint kAccStatic = 0x0008;
+constexpr jint kAccNative = 0x0100;
+constexpr jint kMethodFlagStatic = 1;
+constexpr jint kMethodFlagNative = 2;
+constexpr jint kMethodFlagPoppedByException = 4;
+constexpr jint kMethodFlagReceiverAvailable = 8;
 
 JavaVM* gJavaVm = nullptr;
 jvmtiEnv* gJvmti = nullptr;
 bool gCanRetransform = false;
 std::atomic<bool> gClassFileHookEnabled{false};
+std::atomic<bool> gLoadedAsJvmtiAgent{false};
+std::atomic<bool> gCallbacksInstalled{false};
+std::atomic<bool> gCapabilitiesRequested{false};
 std::recursive_mutex gRetransformMutex;
 std::recursive_mutex gEventMutex;
 thread_local jclass tRequestedClass = nullptr;
 thread_local std::vector<unsigned char>* tRequestedBytes = nullptr;
 thread_local bool tInJavaCallback = false;
+thread_local bool tCapturingMethodEvent = false;
 thread_local int tTemporaryClassFileHookDepth = 0;
 jclass gDispatcherClass = nullptr;
 jmethodID gDispatchMethod = nullptr;
 jmethodID gTransformMethod = nullptr;
+jclass gObjectClass = nullptr;
+
+struct BoxingType {
+    const char* className;
+    const char* descriptor;
+    jclass klass = nullptr;
+    jmethodID valueOf = nullptr;
+};
+
+BoxingType gBoxingTypes[] = {
+    {"java/lang/Boolean", "(Z)Ljava/lang/Boolean;"},
+    {"java/lang/Byte", "(B)Ljava/lang/Byte;"},
+    {"java/lang/Character", "(C)Ljava/lang/Character;"},
+    {"java/lang/Short", "(S)Ljava/lang/Short;"},
+    {"java/lang/Integer", "(I)Ljava/lang/Integer;"},
+    {"java/lang/Long", "(J)Ljava/lang/Long;"},
+    {"java/lang/Float", "(F)Ljava/lang/Float;"},
+    {"java/lang/Double", "(D)Ljava/lang/Double;"},
+};
 
 struct QueuedEvent {
     std::string name;
@@ -58,6 +86,9 @@ std::atomic<bool> gWorkerStopping{false};
 std::thread* gEventWorker = nullptr;
 std::atomic<jlong> gNativeQueued{0};
 std::atomic<jlong> gNativeDropped{0};
+
+jobjectArray NewStringArray(JNIEnv* env, const std::vector<std::string>& values);
+bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent);
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) return {};
@@ -95,6 +126,33 @@ std::string ConsumeJavaException(JNIEnv* env) {
     if (throwableClass != nullptr) env->DeleteLocalRef(throwableClass);
     env->DeleteLocalRef(throwable);
     return result;
+}
+
+bool CacheCallbackTypes(JNIEnv* env) {
+    jclass objectClass = env->FindClass("java/lang/Object");
+    if (objectClass == nullptr) return false;
+    gObjectClass = static_cast<jclass>(env->NewGlobalRef(objectClass));
+    env->DeleteLocalRef(objectClass);
+    if (gObjectClass == nullptr) return false;
+    for (BoxingType& boxing : gBoxingTypes) {
+        jclass local = env->FindClass(boxing.className);
+        if (local == nullptr) return false;
+        boxing.klass = static_cast<jclass>(env->NewGlobalRef(local));
+        boxing.valueOf = env->GetStaticMethodID(local, "valueOf", boxing.descriptor);
+        env->DeleteLocalRef(local);
+        if (boxing.klass == nullptr || boxing.valueOf == nullptr) return false;
+    }
+    return true;
+}
+
+void ReleaseCallbackTypes(JNIEnv* env) {
+    if (gObjectClass != nullptr) env->DeleteGlobalRef(gObjectClass);
+    gObjectClass = nullptr;
+    for (BoxingType& boxing : gBoxingTypes) {
+        if (boxing.klass != nullptr) env->DeleteGlobalRef(boxing.klass);
+        boxing.klass = nullptr;
+        boxing.valueOf = nullptr;
+    }
 }
 
 std::string JvmtiErrorText(jvmtiError error) {
@@ -388,7 +446,11 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
         jmethodID method, jlocation location, jobject subject, jlong value,
         jmethodID relatedMethod = nullptr, jlocation relatedLocation = 0,
         const char* memberName = nullptr, const char* memberDescriptor = nullptr,
-        jobject secondarySubject = nullptr, const char* text = nullptr) {
+        jobject secondarySubject = nullptr, const char* text = nullptr,
+        jobject receiver = nullptr, const char* receiverError = nullptr,
+        jobjectArray methodArguments = nullptr, jobjectArray methodArgumentNames = nullptr,
+        jintArray methodArgumentSlots = nullptr, jobjectArray methodArgumentErrors = nullptr,
+        jint methodFlags = 0, jobject returnValue = nullptr) {
     if (env == nullptr || gDispatcherClass == nullptr || gDispatchMethod == nullptr || tInJavaCallback) return;
     const MethodDetails details = DescribeMethod(env, method);
     const std::string className = eventClass == nullptr ? details.className : BinaryClassName(eventClass);
@@ -403,6 +465,8 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
     jstring javaMemberName = memberName == nullptr ? nullptr : env->NewStringUTF(memberName);
     jstring javaMemberDescriptor = memberDescriptor == nullptr ? nullptr : env->NewStringUTF(memberDescriptor);
     jstring javaText = text == nullptr ? nullptr : env->NewStringUTF(text);
+    jstring javaReceiverError = receiverError == nullptr || *receiverError == '\0'
+        ? nullptr : env->NewStringUTF(receiverError);
     if (javaEvent != nullptr) {
         tInJavaCallback = true;
         env->CallStaticVoidMethod(gDispatcherClass, gDispatchMethod,
@@ -410,7 +474,8 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
             static_cast<jlong>(location), subject, value,
             javaRelatedClass, javaRelatedMethod, javaRelatedDescriptor,
             static_cast<jlong>(relatedLocation), javaMemberName, javaMemberDescriptor,
-            secondarySubject, javaText);
+            secondarySubject, javaText, receiver, javaReceiverError, methodArguments,
+            methodArgumentNames, methodArgumentSlots, methodArgumentErrors, methodFlags, returnValue);
         tInJavaCallback = false;
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -424,6 +489,7 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
     if (javaMemberName != nullptr) env->DeleteLocalRef(javaMemberName);
     if (javaMemberDescriptor != nullptr) env->DeleteLocalRef(javaMemberDescriptor);
     if (javaText != nullptr) env->DeleteLocalRef(javaText);
+    if (javaReceiverError != nullptr) env->DeleteLocalRef(javaReceiverError);
 }
 
 void QueueEvent(QueuedEvent event) noexcept {
@@ -505,6 +571,204 @@ jlong ReturnValueBits(const MethodDetails& method, jvalue value, jobject* subjec
     return ValueBits(kind, value, subject);
 }
 
+std::size_t BoxingIndex(char kind) {
+    switch (kind) {
+    case 'Z': return 0;
+    case 'B': return 1;
+    case 'C': return 2;
+    case 'S': return 3;
+    case 'I': return 4;
+    case 'J': return 5;
+    case 'F': return 6;
+    case 'D': return 7;
+    default: return static_cast<std::size_t>(-1);
+    }
+}
+
+jobject BoxValue(JNIEnv* env, char kind, jvalue value) {
+    if (kind == 'L' || kind == '[') return value.l;
+    const std::size_t index = BoxingIndex(kind);
+    if (index >= sizeof(gBoxingTypes) / sizeof(gBoxingTypes[0])) return nullptr;
+    const BoxingType& boxing = gBoxingTypes[index];
+    if (boxing.klass == nullptr || boxing.valueOf == nullptr) return nullptr;
+    switch (kind) {
+    case 'Z': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.z);
+    case 'B': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.b);
+    case 'C': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.c);
+    case 'S': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.s);
+    case 'I': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.i);
+    case 'J': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.j);
+    case 'F': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.f);
+    case 'D': return env->CallStaticObjectMethod(boxing.klass, boxing.valueOf, value.d);
+    default: return nullptr;
+    }
+}
+
+struct MethodCapture {
+    jobject receiver = nullptr;
+    std::string receiverError;
+    std::vector<jobject> arguments;
+    std::vector<std::string> argumentNames;
+    std::vector<jint> argumentSlots;
+    std::vector<std::string> argumentErrors;
+    jint flags = 0;
+};
+
+void ReadParameterNames(jmethodID method, const std::vector<std::string>& descriptors,
+        const std::vector<jint>& slots, std::vector<std::string>& names) {
+    names.assign(descriptors.size(), {});
+    jint count = 0;
+    jvmtiLocalVariableEntry* table = nullptr;
+    if (gJvmti->GetLocalVariableTable(method, &count, &table) != JVMTI_ERROR_NONE) return;
+    std::vector<jlocation> bestStart(descriptors.size(), (std::numeric_limits<jlocation>::max)());
+    for (jint tableIndex = 0; tableIndex < count; ++tableIndex) {
+        const jvmtiLocalVariableEntry& entry = table[tableIndex];
+        for (std::size_t argumentIndex = 0; argumentIndex < descriptors.size(); ++argumentIndex) {
+            if (entry.slot == slots[argumentIndex] && entry.name != nullptr && entry.signature != nullptr
+                && descriptors[argumentIndex] == entry.signature
+                && entry.start_location < bestStart[argumentIndex]) {
+                names[argumentIndex] = entry.name;
+                bestStart[argumentIndex] = entry.start_location;
+            }
+        }
+        if (entry.name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(entry.name));
+        if (entry.signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(entry.signature));
+        if (entry.generic_signature != nullptr) {
+            gJvmti->Deallocate(reinterpret_cast<unsigned char*>(entry.generic_signature));
+        }
+    }
+    if (table != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table));
+}
+
+MethodCapture CaptureMethodArguments(JNIEnv* env, jthread thread, jmethodID method,
+        const MethodDetails& details) {
+    MethodCapture capture;
+    jint modifiers = 0;
+    const jvmtiError modifiersError = gJvmti->GetMethodModifiers(method, &modifiers);
+    const bool isStatic = modifiersError == JVMTI_ERROR_NONE && (modifiers & kAccStatic) != 0;
+    const bool isNative = modifiersError == JVMTI_ERROR_NONE && (modifiers & kAccNative) != 0;
+    if (isStatic) capture.flags |= kMethodFlagStatic;
+    if (isNative) capture.flags |= kMethodFlagNative;
+
+    if (isStatic) {
+        capture.flags |= kMethodFlagReceiverAvailable;
+    } else if (modifiersError != JVMTI_ERROR_NONE) {
+        capture.receiverError = "GetMethodModifiers failed: " + JvmtiErrorText(modifiersError);
+    } else {
+        const jvmtiError receiverError = gJvmti->GetLocalInstance(thread, 0, &capture.receiver);
+        if (receiverError == JVMTI_ERROR_NONE) capture.flags |= kMethodFlagReceiverAvailable;
+        else capture.receiverError = "GetLocalInstance failed: " + JvmtiErrorText(receiverError);
+    }
+
+    std::vector<std::string> descriptors;
+    std::string returnType;
+    if (!ParseMethodDescriptor(details.descriptor, descriptors, returnType)) return capture;
+    capture.arguments.resize(descriptors.size(), nullptr);
+    capture.argumentSlots.resize(descriptors.size());
+    capture.argumentErrors.resize(descriptors.size());
+    jint slot = isStatic ? 0 : 1;
+    for (std::size_t index = 0; index < descriptors.size(); ++index) {
+        capture.argumentSlots[index] = slot;
+        const char kind = descriptors[index].front();
+        jvalue value{};
+        jvmtiError error = JVMTI_ERROR_TYPE_MISMATCH;
+        switch (kind) {
+        case 'Z':
+        case 'B':
+        case 'C':
+        case 'S':
+        case 'I': {
+            jint integer = 0;
+            error = gJvmti->GetLocalInt(thread, 0, slot, &integer);
+            if (kind == 'Z') value.z = static_cast<jboolean>(integer);
+            else if (kind == 'B') value.b = static_cast<jbyte>(integer);
+            else if (kind == 'C') value.c = static_cast<jchar>(integer);
+            else if (kind == 'S') value.s = static_cast<jshort>(integer);
+            else value.i = integer;
+            break;
+        }
+        case 'J': error = gJvmti->GetLocalLong(thread, 0, slot, &value.j); break;
+        case 'F': error = gJvmti->GetLocalFloat(thread, 0, slot, &value.f); break;
+        case 'D': error = gJvmti->GetLocalDouble(thread, 0, slot, &value.d); break;
+        case 'L':
+        case '[': error = gJvmti->GetLocalObject(thread, 0, slot, &value.l); break;
+        default: break;
+        }
+        if (error == JVMTI_ERROR_NONE) {
+            capture.arguments[index] = BoxValue(env, kind, value);
+            if (env->ExceptionCheck()) {
+                capture.argumentErrors[index] = "boxing argument raised a Java exception";
+                env->ExceptionClear();
+                capture.arguments[index] = nullptr;
+            } else if (kind != 'L' && kind != '[' && capture.arguments[index] == nullptr) {
+                capture.argumentErrors[index] = "primitive boxing support is unavailable";
+            }
+        } else {
+            capture.argumentErrors[index] = "local slot " + std::to_string(slot)
+                + " could not be read: " + JvmtiErrorText(error);
+        }
+        slot += kind == 'J' || kind == 'D' ? 2 : 1;
+    }
+    ReadParameterNames(method, descriptors, capture.argumentSlots, capture.argumentNames);
+    return capture;
+}
+
+jobjectArray NewNullableStringArray(JNIEnv* env, const std::vector<std::string>& values) {
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (stringClass == nullptr) return nullptr;
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(values.size()), stringClass, nullptr);
+    for (jsize index = 0; result != nullptr && index < static_cast<jsize>(values.size()); ++index) {
+        const std::string& text = values[static_cast<std::size_t>(index)];
+        if (text.empty()) continue;
+        jstring value = env->NewStringUTF(text.c_str());
+        if (value != nullptr) {
+            env->SetObjectArrayElement(result, index, value);
+            env->DeleteLocalRef(value);
+        }
+    }
+    env->DeleteLocalRef(stringClass);
+    return result;
+}
+
+void DispatchMethodEvent(JNIEnv* env, const char* eventName, jthread thread, jmethodID method,
+        bool poppedByException, jobject legacySubject, jlong legacyValue, jobject returnValue) {
+    const MethodDetails details = DescribeMethod(env, method);
+    MethodCapture capture = CaptureMethodArguments(env, thread, method, details);
+    if (poppedByException) capture.flags |= kMethodFlagPoppedByException;
+    jmethodID frameMethod = nullptr;
+    jlocation frameLocation = 0;
+    if (gJvmti->GetFrameLocation(thread, 0, &frameMethod, &frameLocation) != JVMTI_ERROR_NONE
+        || frameMethod != method) {
+        frameLocation = 0;
+    }
+    jobjectArray arguments = gObjectClass == nullptr ? nullptr : env->NewObjectArray(
+        static_cast<jsize>(capture.arguments.size()), gObjectClass, nullptr);
+    for (jsize index = 0; arguments != nullptr
+            && index < static_cast<jsize>(capture.arguments.size()); ++index) {
+        env->SetObjectArrayElement(arguments, index, capture.arguments[static_cast<std::size_t>(index)]);
+    }
+    jobjectArray names = NewNullableStringArray(env, capture.argumentNames);
+    jobjectArray errors = NewNullableStringArray(env, capture.argumentErrors);
+    jintArray slots = env->NewIntArray(static_cast<jsize>(capture.argumentSlots.size()));
+    if (slots != nullptr && !capture.argumentSlots.empty()) {
+        env->SetIntArrayRegion(slots, 0, static_cast<jsize>(capture.argumentSlots.size()),
+            capture.argumentSlots.data());
+    }
+    DispatchEvent(env, eventName, thread, nullptr, method,
+        poppedByException ? static_cast<jlocation>(-1) : frameLocation, legacySubject, legacyValue,
+        nullptr, 0, nullptr, nullptr, nullptr, nullptr, capture.receiver,
+        capture.receiverError.empty() ? nullptr : capture.receiverError.c_str(),
+        arguments, names, slots, errors, capture.flags, returnValue);
+    if (arguments != nullptr) env->DeleteLocalRef(arguments);
+    if (names != nullptr) env->DeleteLocalRef(names);
+    if (errors != nullptr) env->DeleteLocalRef(errors);
+    if (slots != nullptr) env->DeleteLocalRef(slots);
+    if (capture.receiver != nullptr) env->DeleteLocalRef(capture.receiver);
+    for (jobject argument : capture.arguments) {
+        if (argument != nullptr) env->DeleteLocalRef(argument);
+    }
+}
+
 struct FieldDetails {
     std::string name;
     std::string descriptor;
@@ -527,6 +791,9 @@ FieldDetails DescribeField(jclass klass, jfieldID field) {
 }
 
 void JNICALL VmInit(jvmtiEnv*, JNIEnv* env, jthread thread) {
+    if (gLoadedAsJvmtiAgent.load() && gDispatcherClass == nullptr) {
+        InitializeJavaBridge(gJavaVm, env, true);
+    }
     DispatchEvent(env, "vm_init", thread, nullptr, nullptr, 0, nullptr, 0);
 }
 
@@ -586,16 +853,42 @@ void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID
 }
 
 void JNICALL MethodEntry(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method) {
-    DispatchEvent(env, "method_entry", thread, nullptr, method, 0, nullptr, 0);
+    if (tInJavaCallback || tCapturingMethodEvent) return;
+    tCapturingMethodEvent = true;
+    try {
+        DispatchMethodEvent(env, "method_entry", thread, method, false, nullptr, 0, nullptr);
+    } catch (...) {
+        gNativeDropped.fetch_add(1);
+    }
+    tCapturingMethodEvent = false;
 }
 
 void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
         jboolean poppedByException, jvalue returnValue) {
+    if (tInJavaCallback || tCapturingMethodEvent) return;
+    tCapturingMethodEvent = true;
+    try {
     const MethodDetails details = DescribeMethod(env, method);
     jobject subject = nullptr;
     const jlong bits = poppedByException == JNI_TRUE ? 0 : ReturnValueBits(details, returnValue, &subject);
-    DispatchEvent(env, "method_exit", thread, nullptr, method,
-        poppedByException == JNI_TRUE ? static_cast<jlocation>(-1) : 0, subject, bits);
+    const std::size_t end = details.descriptor.rfind(')');
+    const char returnKind = end == std::string::npos || end + 1 >= details.descriptor.size()
+        ? 'V' : details.descriptor[end + 1];
+    jobject boxedReturn = poppedByException == JNI_TRUE || returnKind == 'V'
+        ? nullptr : BoxValue(env, returnKind, returnValue);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        boxedReturn = nullptr;
+    }
+    DispatchMethodEvent(env, "method_exit", thread, method, poppedByException == JNI_TRUE,
+        subject, bits, boxedReturn);
+    if (boxedReturn != nullptr && returnKind != 'L' && returnKind != '[') {
+        env->DeleteLocalRef(boxedReturn);
+    }
+    } catch (...) {
+        gNativeDropped.fetch_add(1);
+    }
+    tCapturingMethodEvent = false;
 }
 
 void JNICALL Exception(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -1379,6 +1672,63 @@ jstring JNICALL NativeCapabilities(JNIEnv* env, jclass) {
     return env->NewStringUTF(output.str().c_str());
 }
 
+jobjectArray JNICALL NativeCapabilityStatuses(JNIEnv* env, jclass) {
+    jvmtiCapabilities enabled{};
+    jvmtiCapabilities potential{};
+    jvmtiError error = gJvmti->GetCapabilities(&enabled);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetPotentialCapabilities(&potential);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Get JVMTI capability status", error);
+        return nullptr;
+    }
+    std::vector<std::string> rows;
+#define JVMRTDP_CAPABILITY_STATUS(field) rows.emplace_back(std::string(#field) + "|" \
+        + (enabled.field ? "1" : "0") + "|" + (potential.field ? "1" : "0"))
+    JVMRTDP_CAPABILITY_STATUS(can_tag_objects);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_field_modification_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_field_access_events);
+    JVMRTDP_CAPABILITY_STATUS(can_get_bytecodes);
+    JVMRTDP_CAPABILITY_STATUS(can_get_synthetic_attribute);
+    JVMRTDP_CAPABILITY_STATUS(can_get_owned_monitor_info);
+    JVMRTDP_CAPABILITY_STATUS(can_get_current_contended_monitor);
+    JVMRTDP_CAPABILITY_STATUS(can_get_monitor_info);
+    JVMRTDP_CAPABILITY_STATUS(can_pop_frame);
+    JVMRTDP_CAPABILITY_STATUS(can_redefine_classes);
+    JVMRTDP_CAPABILITY_STATUS(can_signal_thread);
+    JVMRTDP_CAPABILITY_STATUS(can_get_source_file_name);
+    JVMRTDP_CAPABILITY_STATUS(can_get_line_numbers);
+    JVMRTDP_CAPABILITY_STATUS(can_get_source_debug_extension);
+    JVMRTDP_CAPABILITY_STATUS(can_access_local_variables);
+    JVMRTDP_CAPABILITY_STATUS(can_maintain_original_method_order);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_single_step_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_frame_pop_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_breakpoint_events);
+    JVMRTDP_CAPABILITY_STATUS(can_suspend);
+    JVMRTDP_CAPABILITY_STATUS(can_redefine_any_class);
+    JVMRTDP_CAPABILITY_STATUS(can_get_current_thread_cpu_time);
+    JVMRTDP_CAPABILITY_STATUS(can_get_thread_cpu_time);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_method_entry_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_method_exit_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_all_class_hook_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_compiled_method_load_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_exception_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_monitor_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_vm_object_alloc_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_native_method_bind_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_garbage_collection_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_object_free_events);
+    JVMRTDP_CAPABILITY_STATUS(can_force_early_return);
+    JVMRTDP_CAPABILITY_STATUS(can_get_owned_monitor_stack_depth_info);
+    JVMRTDP_CAPABILITY_STATUS(can_get_constant_pool);
+    JVMRTDP_CAPABILITY_STATUS(can_set_native_method_prefix);
+    JVMRTDP_CAPABILITY_STATUS(can_retransform_classes);
+    JVMRTDP_CAPABILITY_STATUS(can_retransform_any_class);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_resource_exhaustion_heap_events);
+    JVMRTDP_CAPABILITY_STATUS(can_generate_resource_exhaustion_threads_events);
+#undef JVMRTDP_CAPABILITY_STATUS
+    return NewStringArray(env, rows);
+}
+
 jobjectArray JNICALL NativeGetAllThreads(JNIEnv* env, jclass) {
     jint count = 0;
     jthread* threads = nullptr;
@@ -1532,6 +1882,8 @@ JNINativeMethod kMethods[] = {
      reinterpret_cast<void*>(&NativeRedefineClass)},
     {const_cast<char*>("nativeCapabilities"), const_cast<char*>("()Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCapabilities)},
+    {const_cast<char*>("nativeCapabilityStatuses"), const_cast<char*>("()[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeCapabilityStatuses)},
     {const_cast<char*>("nativeGetAllThreads"), const_cast<char*>("()[Ljava/lang/Thread;"),
      reinterpret_cast<void*>(&NativeGetAllThreads)},
     {const_cast<char*>("nativeGetThreadState"), const_cast<char*>("(Ljava/lang/Thread;)I"),
@@ -1552,27 +1904,21 @@ JNINativeMethod kMethods[] = {
      reinterpret_cast<void*>(&NativeSystemProperties)},
 };
 
-} // namespace
-
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) != JNI_OK || env == nullptr) {
-        return JNI_ERR;
-    }
-    if (vm->GetEnv(reinterpret_cast<void**>(&gJvmti), JVMTI_VERSION_1_2) != JNI_OK || gJvmti == nullptr) {
-        return JNI_ERR;
-    }
-
+bool RequestAllCapabilities() {
+    if (gCapabilitiesRequested.load()) return true;
     jvmtiCapabilities potential{};
-    if (gJvmti->GetPotentialCapabilities(&potential) == JVMTI_ERROR_NONE) {
-        // This bridge intentionally exposes the JVMTI environment. Request every capability
-        // still available in the live phase; unsupported capabilities remain unset.
-        gJvmti->AddCapabilities(&potential);
-    }
+    if (gJvmti == nullptr || gJvmti->GetPotentialCapabilities(&potential) != JVMTI_ERROR_NONE
+        || gJvmti->AddCapabilities(&potential) != JVMTI_ERROR_NONE) return false;
+    gCapabilitiesRequested.store(true);
     jvmtiCapabilities capabilities{};
     if (gJvmti->GetCapabilities(&capabilities) == JVMTI_ERROR_NONE) {
         gCanRetransform = capabilities.can_retransform_classes != 0;
     }
+    return true;
+}
+
+bool InstallJvmtiCallbacks() {
+    if (gCallbacksInstalled.load()) return true;
     jvmtiEventCallbacks callbacks{};
     callbacks.VMInit = &VmInit;
     callbacks.VMDeath = &VmDeath;
@@ -1605,35 +1951,116 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     callbacks.ObjectFree = &ObjectFree;
     callbacks.VMObjectAlloc = &VmObjectAlloc;
     callbacks.ResourceExhausted = &ResourceExhausted;
-    if (gJvmti->SetEventCallbacks(&callbacks, sizeof(callbacks)) != JVMTI_ERROR_NONE) {
-        return JNI_ERR;
+    if (gJvmti == nullptr || gJvmti->SetEventCallbacks(&callbacks, sizeof(callbacks)) != JVMTI_ERROR_NONE) {
+        return false;
     }
+    gCallbacksInstalled.store(true);
+    return true;
+}
 
-    jclass bindingClass = env->FindClass(kBindingClass.data());
-    if (bindingClass == nullptr) return JNI_ERR;
-    const jint result = env->RegisterNatives(
+void SetPreloadedAgentProperty(JNIEnv* env) {
+    jclass systemClass = env->FindClass("java/lang/System");
+    jmethodID setProperty = systemClass == nullptr ? nullptr : env->GetStaticMethodID(systemClass,
+        "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    jstring key = setProperty == nullptr ? nullptr : env->NewStringUTF("jvmrtdp.native.preloaded");
+    jstring value = key == nullptr ? nullptr : env->NewStringUTF("true");
+    jobject previous = value == nullptr ? nullptr
+        : env->CallStaticObjectMethod(systemClass, setProperty, key, value);
+    if (previous != nullptr) env->DeleteLocalRef(previous);
+    if (key != nullptr) env->DeleteLocalRef(key);
+    if (value != nullptr) env->DeleteLocalRef(value);
+    if (systemClass != nullptr) env->DeleteLocalRef(systemClass);
+}
+
+jclass LoadSystemClass(JNIEnv* env, const char* binaryName) {
+    jclass loaderClass = env->FindClass("java/lang/ClassLoader");
+    jmethodID getSystem = loaderClass == nullptr ? nullptr : env->GetStaticMethodID(
+        loaderClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+    jmethodID loadClass = loaderClass == nullptr ? nullptr : env->GetMethodID(
+        loaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jobject loader = getSystem == nullptr ? nullptr
+        : env->CallStaticObjectMethod(loaderClass, getSystem);
+    jstring name = loader == nullptr || loadClass == nullptr ? nullptr : env->NewStringUTF(binaryName);
+    jclass result = name == nullptr ? nullptr : static_cast<jclass>(
+        env->CallObjectMethod(loader, loadClass, name));
+    if (name != nullptr) env->DeleteLocalRef(name);
+    if (loader != nullptr) env->DeleteLocalRef(loader);
+    if (loaderClass != nullptr) env->DeleteLocalRef(loaderClass);
+    return result;
+}
+
+bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
+    if (gDispatcherClass != nullptr && gDispatchMethod != nullptr && gTransformMethod != nullptr) return true;
+    if (vm == nullptr || env == nullptr) return false;
+    jclass bindingClass = preloadedAgent
+        ? LoadSystemClass(env, "nhcm.jvmrtdp.agent.NativeAgent")
+        : env->FindClass(kBindingClass.data());
+    if (bindingClass == nullptr) {
+        if (preloadedAgent && env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    if (preloadedAgent) SetPreloadedAgentProperty(env);
+    if (env->ExceptionCheck() || !CacheCallbackTypes(env)) {
+        if (preloadedAgent && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(bindingClass);
+        return false;
+    }
+    const jint registration = env->RegisterNatives(
         bindingClass, kMethods, static_cast<jint>(sizeof(kMethods) / sizeof(kMethods[0])));
     env->DeleteLocalRef(bindingClass);
-    if (result != JNI_OK) return JNI_ERR;
+    if (registration != JNI_OK) return false;
     gJavaVm = vm;
 
-    jclass dispatcher = env->FindClass("nhcm/jvmrtdp/remoteside/JvmtiCallbackDispatcher");
-    if (dispatcher == nullptr) return JNI_ERR;
+    jclass dispatcher = preloadedAgent
+        ? LoadSystemClass(env, "nhcm.jvmrtdp.remoteside.JvmtiCallbackDispatcher")
+        : env->FindClass("nhcm/jvmrtdp/remoteside/JvmtiCallbackDispatcher");
+    if (dispatcher == nullptr) return false;
     gDispatcherClass = static_cast<jclass>(env->NewGlobalRef(dispatcher));
     gDispatchMethod = env->GetStaticMethodID(dispatcher, "dispatch",
         "(Ljava/lang/String;Ljava/lang/Thread;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
         "JLjava/lang/Object;JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
-        "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/String;)V");
+        "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/String;"
+        "Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;[I"
+        "[Ljava/lang/String;ILjava/lang/Object;)V");
     gTransformMethod = env->GetStaticMethodID(dispatcher, "transform",
         "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;Ljava/security/ProtectionDomain;[B)[B");
     env->DeleteLocalRef(dispatcher);
-    if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) return JNI_ERR;
-    gWorkerStopping.store(false);
-    try {
-        gEventWorker = new std::thread(&EventWorkerMain);
-    } catch (...) {
+    if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) return false;
+    if (gEventWorker == nullptr) {
+        gWorkerStopping.store(false);
+        try {
+            gEventWorker = new std::thread(&EventWorkerMain);
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char*, void*) {
+    if (vm == nullptr || vm->GetEnv(reinterpret_cast<void**>(&gJvmti), JVMTI_VERSION_1_2) != JNI_OK
+        || gJvmti == nullptr) return JNI_ERR;
+    gJavaVm = vm;
+    gLoadedAsJvmtiAgent.store(true);
+    if (!RequestAllCapabilities() || !InstallJvmtiCallbacks()) return JNI_ERR;
+    if (gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, nullptr)
+        != JVMTI_ERROR_NONE) return JNI_ERR;
+    return JNI_OK;
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) != JNI_OK || env == nullptr) {
         return JNI_ERR;
     }
+    if (gJvmti == nullptr
+        && (vm->GetEnv(reinterpret_cast<void**>(&gJvmti), JVMTI_VERSION_1_2) != JNI_OK || gJvmti == nullptr)) {
+        return JNI_ERR;
+    }
+    if (!RequestAllCapabilities() || !InstallJvmtiCallbacks()
+        || !InitializeJavaBridge(vm, env, false)) return JNI_ERR;
     return JNI_VERSION_1_8;
 }
 
@@ -1655,13 +2082,17 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     }
     JNIEnv* env = nullptr;
     if (vm != nullptr && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) == JNI_OK
-        && env != nullptr && gDispatcherClass != nullptr) {
-        env->DeleteGlobalRef(gDispatcherClass);
+        && env != nullptr) {
+        if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
+        ReleaseCallbackTypes(env);
     }
     gDispatcherClass = nullptr;
     gDispatchMethod = nullptr;
     gTransformMethod = nullptr;
     gClassFileHookEnabled.store(false);
+    gCallbacksInstalled.store(false);
+    gCapabilitiesRequested.store(false);
+    gLoadedAsJvmtiAgent.store(false);
     gCanRetransform = false;
     gJvmti = nullptr;
     gJavaVm = nullptr;

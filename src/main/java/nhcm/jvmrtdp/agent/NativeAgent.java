@@ -1,6 +1,12 @@
 package nhcm.jvmrtdp.agent;
 
 import nhcm.jvmrtdp.tools.DLLSupport;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class NativeAgent {
     public static final String BINDING_CLASS = "nhcm/jvmrtdp/agent/NativeAgent";
@@ -122,6 +128,19 @@ public class NativeAgent {
         return nativeCapabilities();
     }
 
+    /** Complete enabled/potential state for every JVMTI 1.2 capability bit. */
+    public static List<JvmtiCapabilityStatus> capabilityStatuses() {
+        requireAvailable();
+        List<JvmtiCapabilityStatus> result = new ArrayList<JvmtiCapabilityStatus>();
+        for (String row : nativeCapabilityStatuses()) {
+            String[] fields = row.split("\\|", -1);
+            if (fields.length != 3) throw new IllegalStateException("Invalid native capability row: " + row);
+            result.add(new JvmtiCapabilityStatus(JvmtiCapability.parse(fields[0]),
+                    "1".equals(fields[1]), "1".equals(fields[2])));
+        }
+        return Collections.unmodifiableList(result);
+    }
+
     public static Thread[] getAllThreads() {
         requireAvailable();
         return nativeGetAllThreads();
@@ -182,7 +201,9 @@ public class NativeAgent {
 
     private static RuntimeInfo initialize() {
         try {
-            DLLSupport.loadDllFromJar(DLLSupport.AGENT_RESOURCE);
+            if (!Boolean.getBoolean("jvmrtdp.native.preloaded")) {
+                DLLSupport.loadDllFromJar(DLLSupport.AGENT_RESOURCE);
+            }
             return new RuntimeInfo(true, nativeVersion(), nativeJvmtiVersion(), "");
         } catch (RuntimeException exception) {
             return new RuntimeInfo(false, "unavailable", 0, exception.toString());
@@ -231,6 +252,8 @@ public class NativeAgent {
     private static native void nativeRedefineClass(Class<?> type, byte[] classBytes);
 
     private static native String nativeCapabilities();
+
+    private static native String[] nativeCapabilityStatuses();
 
     private static native Thread[] nativeGetAllThreads();
 

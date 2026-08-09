@@ -1009,7 +1009,7 @@ public class InteractiveCli {
 
     private static class JvmtiShellCommand extends ShellCommand<TargetSession> {
         private JvmtiShellCommand() {
-            super("jvmti", "jvmti capabilities | events | retransform <class> | redefine <class> <class-file> | "
+            super("jvmti", "jvmti capabilities | capability-status | events | retransform <class> | redefine <class> <class-file> | "
                             + "breakpoint <set|clear> <class> <method> <descriptor> <location> | "
                             + "watch <access|modification> <set|clear> <class> <field> <descriptor> | "
                             + "threads [prefix] [limit] | thread <state|stack|suspend|resume|interrupt|frame-pop> <object> [depth|max] | "
@@ -1023,6 +1023,14 @@ public class InteractiveCli {
             String operation = lower(arguments.get(0));
             if ("capabilities".equals(operation) && arguments.size() == 1) {
                 for (String capability : session.jvmti().capabilities()) session.output().println(capability);
+                return true;
+            }
+            if ("capability-status".equals(operation) && arguments.size() == 1) {
+                for (nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus status
+                        : session.jvmti().capabilityStatuses()) {
+                    session.output().printf("%s enabled=%s potential=%s%n",
+                            status.capability().wireName(), status.enabled(), status.potential());
+                }
                 return true;
             }
             if ("events".equals(operation) && arguments.size() == 1) {

@@ -2,6 +2,7 @@ package nhcm.jvmrtdp.agent.command.builtin;
 
 import nhcm.jvmrtdp.agent.NativeAgent;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
 import nhcm.jvmrtdp.agent.command.RemoteCommand;
 import nhcm.jvmrtdp.handles.JRDHandle;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -22,7 +23,7 @@ public class JvmtiCommand implements RemoteCommand {
 
     @Override
     public String usage() {
-        return "jvmti <bytes|capabilities|events|retransform|redefine|breakpoint|watch|threads|"
+        return "jvmti <bytes|capabilities|capability-status|events|retransform|redefine|breakpoint|watch|threads|"
                 + "thread.state|thread.stack|thread.suspend|thread.resume|thread.interrupt|thread.frame-pop|"
                 + "object.size|tag.get|tag.set|gc|properties> ...";
     }
@@ -42,6 +43,14 @@ public class JvmtiCommand implements RemoteCommand {
         }
         if ("capabilities".equals(operation) && arguments.size() == 1) {
             return success(NativeAgent.capabilities());
+        }
+        if ("capability-status".equals(operation) && arguments.size() == 1) {
+            List<String> rows = new ArrayList<String>();
+            for (JvmtiCapabilityStatus status : NativeAgent.capabilityStatuses()) {
+                rows.add(TextWireCodec.encode(status.capability().wireName(),
+                        Boolean.toString(status.enabled()), Boolean.toString(status.potential())));
+            }
+            return success(join(rows));
         }
         if ("events".equals(operation) && arguments.size() == 1) {
             List<String> names = new ArrayList<String>();

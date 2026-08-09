@@ -59,6 +59,7 @@ public class JvmtiEvent {
     }
 
     public JvmtiEventType type() { return type; }
+    public JvmtiEventCategory category() { return type.category(); }
     public Instant timestamp() { return timestamp; }
     public Thread thread() { return thread; }
     public String className() { return className; }

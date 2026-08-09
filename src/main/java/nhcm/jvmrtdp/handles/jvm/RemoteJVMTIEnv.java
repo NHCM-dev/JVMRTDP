@@ -8,6 +8,8 @@ import nhcm.jvmrtdp.handles.java.RemoteObject;
 import nhcm.jvmrtdp.protocol.CodeBundleCodec;
 import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 import nhcm.jvmrtdp.protocol.TextWireCodec;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -51,6 +53,16 @@ public class RemoteJVMTIEnv extends RemoteHandle {
 
     public List<String> capabilities() {
         return lines(executeForOutput(CommandLine.of("jvmti", "capabilities")));
+    }
+
+    public List<JvmtiCapabilityStatus> capabilityStatuses() {
+        List<JvmtiCapabilityStatus> result = new ArrayList<JvmtiCapabilityStatus>();
+        for (String row : lines(executeForOutput(CommandLine.of("jvmti", "capability-status")))) {
+            List<String> fields = TextWireCodec.decode(row, 3);
+            result.add(new JvmtiCapabilityStatus(JvmtiCapability.parse(fields.get(0)),
+                    Boolean.parseBoolean(fields.get(1)), Boolean.parseBoolean(fields.get(2))));
+        }
+        return Collections.unmodifiableList(result);
     }
 
     public void retransformClass(String className) {
