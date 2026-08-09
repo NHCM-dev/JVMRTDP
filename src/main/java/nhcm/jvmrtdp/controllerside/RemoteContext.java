@@ -22,6 +22,7 @@ public class RemoteContext implements AutoCloseable {
     private final Set<RemoteObject> retainedObjects =
             Collections.newSetFromMap(new IdentityHashMap<RemoteObject, Boolean>());
     private Value current;
+    private int temporaryScopeDepth;
 
     public void select(RemoteClass value) {
         select(Value.of(value));
@@ -138,6 +139,9 @@ public class RemoteContext implements AutoCloseable {
         current = null;
         history.clear();
         bookmarks.clear();
+        // A -> chain owns only a temporary navigation view. Handles reachable before the
+        // chain must remain alive so its snapshot can be restored when the chain finishes.
+        if (temporaryScopeDepth > 0) return;
         for (RemoteObject object : retainedObjects) {
             try {
                 object.close();
@@ -145,6 +149,17 @@ public class RemoteContext implements AutoCloseable {
             }
         }
         retainedObjects.clear();
+    }
+
+    /**
+     * Opens a temporary navigation scope. Closing it restores current context, stack and
+     * bookmarks exactly as they were, while keeping any newly observed handles tracked for
+     * release with this session.
+     */
+    public TemporaryScope temporaryScope() {
+        temporaryScopeDepth++;
+        return new TemporaryScope(current, new ArrayDeque<Value>(history),
+                new LinkedHashMap<String, Value>(bookmarks));
     }
 
     public void save(String name) {
@@ -197,6 +212,10 @@ public class RemoteContext implements AutoCloseable {
     }
 
     private void select(Value value) {
+        if (temporaryScopeDepth > 0) {
+            current = value;
+            return;
+        }
         if (current != null && current != value) pushHistory(current);
         current = value;
     }
@@ -221,6 +240,31 @@ public class RemoteContext implements AutoCloseable {
     private Value requireCurrent() {
         if (current == null) throw new IllegalStateException("No context selected; use 'context class <name>' first");
         return current;
+    }
+
+    public final class TemporaryScope implements AutoCloseable {
+        private final Value savedCurrent;
+        private final Deque<Value> savedHistory;
+        private final Map<String, Value> savedBookmarks;
+        private boolean closed;
+
+        private TemporaryScope(Value savedCurrent, Deque<Value> savedHistory, Map<String, Value> savedBookmarks) {
+            this.savedCurrent = savedCurrent;
+            this.savedHistory = savedHistory;
+            this.savedBookmarks = savedBookmarks;
+        }
+
+        @Override
+        public void close() {
+            if (closed) return;
+            closed = true;
+            current = savedCurrent;
+            history.clear();
+            history.addAll(savedHistory);
+            bookmarks.clear();
+            bookmarks.putAll(savedBookmarks);
+            temporaryScopeDepth--;
+        }
     }
 
     private static class Value {

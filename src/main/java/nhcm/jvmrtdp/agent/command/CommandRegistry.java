@@ -9,6 +9,7 @@ import nhcm.jvmrtdp.agent.command.builtin.JniCommand;
 import nhcm.jvmrtdp.agent.command.builtin.JvmtiCommand;
 import nhcm.jvmrtdp.agent.command.builtin.ObjectCommand;
 import nhcm.jvmrtdp.agent.command.builtin.BatchCommand;
+import nhcm.jvmrtdp.agent.command.builtin.CodeCommand;
 import nhcm.jvmrtdp.command.CommandLine;
 import nhcm.jvmrtdp.handles.JRDHandle;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -30,6 +31,7 @@ public class CommandRegistry {
         register(new JvmtiCommand());
         register(new JniCommand());
         register(new ObjectCommand());
+        register(new CodeCommand());
         register(new BatchCommand(this::execute));
         register(new HelpCommand(this::commands));
     }

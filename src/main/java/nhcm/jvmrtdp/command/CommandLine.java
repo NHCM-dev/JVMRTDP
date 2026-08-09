@@ -32,17 +32,31 @@ public class CommandLine {
         StringBuilder current = new StringBuilder();
         boolean quoted = false;
         boolean tokenStarted = false;
+        int expressionDepth = 0;
 
         for (int index = 0; index < line.length(); index++) {
             char value = line.charAt(index);
             if (value == '"') {
                 quoted = !quoted;
+                if (expressionDepth > 0) current.append(value);
                 tokenStarted = true;
             } else if (value == '\\' && index + 1 < line.length()
                     && (line.charAt(index + 1) == '"' || line.charAt(index + 1) == '\\')) {
+                if (expressionDepth > 0) current.append(value);
                 current.append(line.charAt(++index));
                 tokenStarted = true;
-            } else if (Character.isWhitespace(value) && !quoted) {
+            } else if (!quoted && value == '{') {
+                expressionDepth++;
+                current.append(value);
+                tokenStarted = true;
+            } else if (!quoted && value == '}') {
+                if (expressionDepth == 0) {
+                    throw new IllegalArgumentException("Unexpected } in command line");
+                }
+                expressionDepth--;
+                current.append(value);
+                tokenStarted = true;
+            } else if (Character.isWhitespace(value) && !quoted && expressionDepth == 0) {
                 if (tokenStarted) {
                     tokens.add(current.toString());
                     current.setLength(0);
@@ -55,6 +69,9 @@ public class CommandLine {
         }
         if (quoted) {
             throw new IllegalArgumentException("Unclosed quote in command line");
+        }
+        if (expressionDepth != 0) {
+            throw new IllegalArgumentException("Unclosed { in command line");
         }
         if (tokenStarted) {
             tokens.add(current.toString());

@@ -31,6 +31,16 @@ public class TargetObjectService implements AutoCloseable {
     private final TargetObjectRegistry objects = new TargetObjectRegistry();
     private final TargetSearchService search = new TargetSearchService();
 
+    /** Stores a value produced by another target-side service in the session object registry. */
+    public RemoteObjectDescriptor storeExternal(Object value) {
+        return objects.store(value);
+    }
+
+    /** Resolves an argument handle for another target-side service. */
+    public Object resolveExternal(long objectId) {
+        return objects.resolve(objectId);
+    }
+
     public Class<?> findClass(String className) {
         return NativeAgent.findLoadedClass(className);
     }
@@ -51,6 +61,7 @@ public class TargetObjectService implements AutoCloseable {
             return objects.store(Character.valueOf(value.charAt(0)));
         }
         if ("bytes".equals(kind)) return objects.store(Base64.getDecoder().decode(value));
+        if ("class".equals(kind)) return objects.store(findClass(value));
         if (kind.startsWith("enum:")) {
             Class<?> enumClass = findClass(kind.substring("enum:".length()));
             if (!enumClass.isEnum()) throw new IllegalArgumentException(enumClass.getName() + " is not an enum");

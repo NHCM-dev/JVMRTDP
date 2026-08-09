@@ -6,7 +6,7 @@ import java.io.PrintStream;
 import java.util.Objects;
 
 /** Renders the controller banner without introducing terminal-specific dependencies. */
-public final class StartupBanner {
+public class StartupBanner {
     private static final String[] ART = {
             "     _ __     ____  __ ____ _____ ____  ____  ",
             "    | |\\ \\   / /  \\/  |  _ \\_   _|  _ \\|  _ \\ ",

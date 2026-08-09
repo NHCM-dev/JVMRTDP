@@ -145,6 +145,29 @@ public class RemoteJNIEnv extends RemoteHandle {
         } else {
             throw new IllegalArgumentException("Unsupported local value type: " + value.getClass().getName());
         }
+        return remoteValue(kind, text);
+    }
+
+    /** Creates the target JVM's java.lang.Class object for a loaded class name. */
+    public RemoteObject classValue(String className) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Class literal name must not be empty");
+        }
+        return remoteValue("class", className);
+    }
+
+    /** Creates a target enum constant without loading the enum type in the controller JVM. */
+    public RemoteObject enumValue(String className, String constant) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Enum class name must not be empty");
+        }
+        if (constant == null || constant.trim().isEmpty()) {
+            throw new IllegalArgumentException("Enum constant must not be empty");
+        }
+        return remoteValue("enum:" + className, constant);
+    }
+
+    private RemoteObject remoteValue(String kind, String text) {
         String encoded = Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(text.getBytes(StandardCharsets.UTF_8));
         return object(executeForOutput(CommandLine.of("object", "value", kind, encoded)));

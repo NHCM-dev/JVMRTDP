@@ -17,6 +17,11 @@ import nhcm.jvmrtdp.handles.java.RemoteObject;
 import nhcm.jvmrtdp.handles.java.RemoteObjectDebugInfo;
 import nhcm.jvmrtdp.handles.java.RemotePackage;
 import nhcm.jvmrtdp.handles.jvm.RemoteRuntimeStats;
+import nhcm.jvmrtdp.handles.jvm.RemoteCodeDeployment;
+import nhcm.jvmrtdp.handles.jvm.RemoteJVMTIEnv;
+import nhcm.jvmrtdp.handles.jvm.RemoteJvmtiThread;
+import nhcm.jvmrtdp.handles.jvm.JvmtiCallbackRegistration;
+import nhcm.jvmrtdp.handles.jvm.JvmtiCallbackStatistics;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -28,6 +33,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
@@ -39,12 +45,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
 /** Context-oriented command prompt for one authenticated target JVM session. */
 public class InteractiveCli {
     private static final int DEFAULT_EXPANSION_LIMIT = 32;
+    private static final PrintStream DISCARD_OUTPUT = new PrintStream(new OutputStream() {
+        @Override
+        public void write(int value) {
+            // Intermediate -> steps resolve a temporary receiver and stay quiet.
+        }
+    });
 
     private final BufferedReader input;
     private final PrintStream output;
@@ -84,7 +97,7 @@ public class InteractiveCli {
         }
     }
 
-    /** Executes one command or an unquoted {@code ->} pipeline. */
+    /** Executes one command or an unquoted {@code ->} temporary reference chain. */
     boolean execute(TargetSession session, String rawLine) {
         try {
             return executePipeline(session, rawLine);
@@ -95,8 +108,22 @@ public class InteractiveCli {
     }
 
     private boolean executePipeline(TargetSession session, String rawLine) throws Exception {
-        for (String segment : splitPipeline(rawLine)) {
-            if (!executeSingle(session, segment)) return false;
+        List<String> segments = splitPipeline(rawLine);
+        if (segments.size() == 1) return executeSingle(session, segments.get(0));
+
+        try (RemoteContext.TemporaryScope ignored = session.context().temporaryScope()) {
+            for (int index = 0; index < segments.size(); index++) {
+                final String segment = segments.get(index);
+                boolean keepGoing = index == segments.size() - 1
+                        ? executeSingle(session, segment)
+                        : session.withOutput(DISCARD_OUTPUT, new TargetSession.OutputAction<Boolean>() {
+                            @Override
+                            public Boolean run() throws Exception {
+                                return Boolean.valueOf(executeSingle(session, segment));
+                            }
+                        }).booleanValue();
+                if (!keepGoing) return false;
+            }
         }
         return true;
     }
@@ -119,6 +146,7 @@ public class InteractiveCli {
         commands.register(new ValueCommand());
         commands.register(new FieldCommand());
         commands.register(new ReadCommand());
+        commands.register(new ResolveCommand());
         commands.register(new InvokeCommand());
         commands.register(new StaticCommand());
         commands.register(new ConstructCommand());
@@ -133,6 +161,8 @@ public class InteractiveCli {
         commands.register(new ScriptCommand());
         commands.register(new BatchFileCommand());
         commands.register(new DumpClassCommand());
+        commands.register(new DeployCodeCommand());
+        commands.register(new JvmtiShellCommand());
         commands.register(new VersionCommand());
         commands.register(new ForwardCommand("ping", "ping", "Checks target responsiveness.", false));
         commands.register(new ForwardCommand("info", "info", "Shows target JVM and agent information.", false));
@@ -336,6 +366,23 @@ public class InteractiveCli {
             String fieldName = arguments.get(arguments.size() - 1);
             try (RemoteObject value = readStatic(type, FieldSelection.parse(fieldName))) {
                 printReadObject(session, value);
+            }
+            return true;
+        }
+    }
+
+    private static class ResolveCommand extends ShellCommand<TargetSession> {
+        private ResolveCommand() {
+            super("resolve", "resolve <literal|reference|{value-expression}>",
+                    "Evaluates and prints one value without changing the current context or stack.",
+                    "ref", "eval");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) {
+            if (arguments.size() != 1) return InteractiveCli.usage(session, this);
+            try (RemoteArgumentList value = RemoteArgumentList.resolve(session, arguments)) {
+                printReadObject(session, value.only());
             }
             return true;
         }
@@ -798,6 +845,298 @@ public class InteractiveCli {
         }
     }
 
+    private static class DeployCodeCommand extends ShellCommand<TargetSession> {
+        private DeployCodeCommand() {
+            super("code", "code source <name> <file|dir> [options] | code methods <name> <class> <file> "
+                            + "[options] | code jar <name> <jar> [options] | code list | code close <id> | "
+                            + "code run <id> <class> <method> <descriptor> <static|this|object-ref> [args ...] | "
+                            + "code callback <add|remove|list|stats> ...",
+                    "Compiles and deploys Java source/method fragments, loads JARs and manages Java JVMTI handlers.");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) throws Exception {
+            if (arguments.isEmpty()) return InteractiveCli.usage(session, this);
+            String operation = lower(arguments.get(0));
+            if ("source".equals(operation) && arguments.size() >= 3) {
+                DeploymentOptions options = DeploymentOptions.parse(arguments, 3);
+                RemoteCodeDeployment deployment = session.jvmti().deploySources(arguments.get(1),
+                        Paths.get(arguments.get(2)), options.classpath, options.compilerOptions,
+                        options.anchorClass, options.mode);
+                printDeployment(session, deployment);
+                return true;
+            }
+            if ("methods".equals(operation) && arguments.size() >= 4) {
+                DeploymentOptions options = DeploymentOptions.parse(arguments, 4);
+                String methods = new String(Files.readAllBytes(Paths.get(arguments.get(3))), StandardCharsets.UTF_8);
+                RemoteCodeDeployment deployment = session.jvmti().deployMethods(arguments.get(1), arguments.get(2),
+                        methods, options.classpath, options.compilerOptions, options.anchorClass, options.mode);
+                printDeployment(session, deployment);
+                return true;
+            }
+            if ("jar".equals(operation) && arguments.size() >= 3) {
+                DeploymentOptions options = DeploymentOptions.parse(arguments, 3);
+                RemoteCodeDeployment deployment = session.jvmti().addJar(arguments.get(1),
+                        Paths.get(arguments.get(2)), options.scope, options.anchorClass);
+                printDeployment(session, deployment);
+                return true;
+            }
+            if ("list".equals(operation) && arguments.size() == 1) {
+                List<RemoteCodeDeployment> deployments = session.jvmti().deployments();
+                if (deployments.isEmpty()) session.output().println("No code deployments.");
+                for (RemoteCodeDeployment deployment : deployments) printDeployment(session, deployment);
+                return true;
+            }
+            if ("close".equals(operation) && arguments.size() == 2) {
+                RemoteCodeDeployment deployment = findDeployment(session, arguments.get(1));
+                deployment.close();
+                session.output().println("closed " + arguments.get(1));
+                return true;
+            }
+            if ("run".equals(operation) && arguments.size() >= 6) {
+                RemoteCodeDeployment deployment = findDeployment(session, arguments.get(1));
+                boolean isStatic = "static".equalsIgnoreCase(arguments.get(5));
+                int expressionStart = isStatic ? 6 : 5;
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, arguments.subList(expressionStart, arguments.size()))) {
+                    RemoteObject[] resolved = values.values();
+                    RemoteObject receiver = isStatic ? null : resolved[0];
+                    RemoteObject[] methodArguments = isStatic ? resolved
+                            : Arrays.copyOfRange(resolved, 1, resolved.length);
+                    selectInvocationResult(session, deployment.execute(arguments.get(2), arguments.get(3),
+                            arguments.get(4), receiver, methodArguments));
+                }
+                return true;
+            }
+            if ("callback".equals(operation)) return callback(session, arguments.subList(1, arguments.size()));
+            return InteractiveCli.usage(session, this);
+        }
+
+        private static boolean callback(TargetSession session, List<String> arguments) {
+            if (arguments.isEmpty()) throw new IllegalArgumentException("code callback requires an operation");
+            String operation = lower(arguments.get(0));
+            if ("add".equals(operation) && (arguments.size() == 4 || arguments.size() == 5)) {
+                RemoteCodeDeployment deployment = findDeployment(session, arguments.get(1));
+                boolean sync = arguments.size() == 5 && "sync".equalsIgnoreCase(arguments.get(4));
+                if (arguments.size() == 5 && !sync && !"async".equalsIgnoreCase(arguments.get(4))) {
+                    throw new IllegalArgumentException("Callback delivery must be sync or async");
+                }
+                session.output().println("callback=" + deployment.registerCallback(
+                        arguments.get(2), arguments.get(3), sync).id());
+                return true;
+            }
+            if ("remove".equals(operation) && arguments.size() == 2) {
+                session.output().println(session.jvmti().unregisterCallback(arguments.get(1)) ? "removed" : "not found");
+                return true;
+            }
+            if ("list".equals(operation) && arguments.size() == 1) {
+                List<JvmtiCallbackRegistration> callbacks = session.jvmti().callbacks();
+                if (callbacks.isEmpty()) session.output().println("No callbacks.");
+                for (JvmtiCallbackRegistration callback : callbacks) {
+                    session.output().printf("%s handler=%s events=%s delivery=%s delivered=%d failed=%d%s%n",
+                            callback.id(), callback.handlerClass(), callback.events(), callback.delivery(),
+                            callback.delivered(), callback.failed(), callback.lastFailure().isEmpty()
+                                    ? "" : " lastFailure=" + callback.lastFailure());
+                }
+                return true;
+            }
+            if ("stats".equals(operation) && arguments.size() == 1) {
+                JvmtiCallbackStatistics stats = session.jvmti().callbackStatistics();
+                session.output().printf("registrations=%d delivered=%d failed=%d nativeQueued=%d "
+                                + "nativeDropped=%d nativeQueueDepth=%d%s%n",
+                        stats.registrations(), stats.delivered(), stats.failed(), stats.nativeQueued(),
+                        stats.nativeDropped(), stats.nativeQueueDepth(), stats.lastFailure().isEmpty()
+                                ? "" : " lastFailure=" + stats.lastFailure());
+                return true;
+            }
+            throw new IllegalArgumentException("Usage: code callback add <deployment> <handler-class> "
+                    + "<event,event,...> [sync|async] | remove <id> | list | stats");
+        }
+
+        private static RemoteCodeDeployment findDeployment(TargetSession session, String id) {
+            for (RemoteCodeDeployment deployment : session.jvmti().deployments()) {
+                if (deployment.id().equals(id)) return deployment;
+            }
+            throw new IllegalArgumentException("Unknown code deployment: " + id);
+        }
+
+        private static void printDeployment(TargetSession session, RemoteCodeDeployment deployment) {
+            session.output().printf("deployment=%s name=%s mode=%s classes=%d loader=%s targetLoader=%s%n",
+                    deployment.id(), deployment.name(), deployment.mode(), deployment.definedClassCount(),
+                    deployment.loader(), deployment.targetLoader());
+        }
+
+        private static class DeploymentOptions {
+            private String anchorClass = "";
+            private RemoteJVMTIEnv.DefinitionMode mode = RemoteJVMTIEnv.DefinitionMode.CHILD;
+            private RemoteJVMTIEnv.JarScope scope = RemoteJVMTIEnv.JarScope.CHILD;
+            private final List<Path> classpath = new ArrayList<Path>();
+            private final List<String> compilerOptions = new ArrayList<String>();
+
+            private static DeploymentOptions parse(List<String> arguments, int start) {
+                DeploymentOptions result = new DeploymentOptions();
+                int index = start;
+                while (index < arguments.size()) {
+                    String option = lower(arguments.get(index++));
+                    if ("--anchor".equals(option) && index < arguments.size()) {
+                        result.anchorClass = arguments.get(index++);
+                    } else if ("--same-loader".equals(option)) {
+                        result.mode = RemoteJVMTIEnv.DefinitionMode.SAME_LOADER;
+                    } else if ("--child".equals(option)) {
+                        result.mode = RemoteJVMTIEnv.DefinitionMode.CHILD;
+                        result.scope = RemoteJVMTIEnv.JarScope.CHILD;
+                    } else if ("--scope".equals(option) && index < arguments.size()) {
+                        result.scope = RemoteJVMTIEnv.JarScope.valueOf(
+                                arguments.get(index++).toUpperCase(Locale.ROOT));
+                    } else if ("--classpath".equals(option) && index < arguments.size()) {
+                        String[] paths = arguments.get(index++).split(
+                                java.util.regex.Pattern.quote(java.io.File.pathSeparator));
+                        for (String path : paths) if (!path.isEmpty()) result.classpath.add(Paths.get(path));
+                    } else if ("--javac".equals(option) && index < arguments.size()) {
+                        result.compilerOptions.add(arguments.get(index++));
+                    } else if (("--release".equals(option) || "-source".equals(option) || "-target".equals(option))
+                            && index < arguments.size()) {
+                        result.compilerOptions.add(option);
+                        result.compilerOptions.add(arguments.get(index++));
+                    } else {
+                        throw new IllegalArgumentException("Unknown/incomplete code option: " + option);
+                    }
+                }
+                return result;
+            }
+        }
+    }
+
+    private static class JvmtiShellCommand extends ShellCommand<TargetSession> {
+        private JvmtiShellCommand() {
+            super("jvmti", "jvmti capabilities | events | retransform <class> | redefine <class> <class-file> | "
+                            + "breakpoint <set|clear> <class> <method> <descriptor> <location> | "
+                            + "watch <access|modification> <set|clear> <class> <field> <descriptor> | "
+                            + "threads [prefix] [limit] | thread <state|stack|suspend|resume|interrupt|frame-pop> <object> [depth|max] | "
+                            + "size <object> | tag <object> [value] | gc | properties",
+                    "Runs JVMTI class, thread, heap/tag, GC and runtime operations.");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) throws Exception {
+            if (arguments.isEmpty()) return InteractiveCli.usage(session, this);
+            String operation = lower(arguments.get(0));
+            if ("capabilities".equals(operation) && arguments.size() == 1) {
+                for (String capability : session.jvmti().capabilities()) session.output().println(capability);
+                return true;
+            }
+            if ("events".equals(operation) && arguments.size() == 1) {
+                for (nhcm.jvmrtdp.api.jvmti.JvmtiEventType event
+                        : nhcm.jvmrtdp.api.jvmti.JvmtiEventType.values()) {
+                    session.output().println(event.wireName());
+                }
+                return true;
+            }
+            if ("retransform".equals(operation) && arguments.size() == 2) {
+                session.jvmti().retransformClass(arguments.get(1));
+                session.output().println("ok");
+                return true;
+            }
+            if ("redefine".equals(operation) && arguments.size() == 3) {
+                session.jvmti().redefineClass(arguments.get(1), Files.readAllBytes(Paths.get(arguments.get(2))));
+                session.output().println("ok");
+                return true;
+            }
+            if ("breakpoint".equals(operation) && arguments.size() == 6) {
+                session.jvmti().setBreakpoint(arguments.get(2), arguments.get(3), arguments.get(4),
+                        Long.parseLong(arguments.get(5)), setOrClear(arguments.get(1)));
+                session.output().println("ok");
+                return true;
+            }
+            if ("watch".equals(operation) && arguments.size() == 6) {
+                boolean modification;
+                if ("access".equalsIgnoreCase(arguments.get(1))) modification = false;
+                else if ("modification".equalsIgnoreCase(arguments.get(1))) modification = true;
+                else throw new IllegalArgumentException("Watch kind must be access or modification");
+                session.jvmti().setFieldWatch(arguments.get(3), arguments.get(4), arguments.get(5),
+                        modification, setOrClear(arguments.get(2)));
+                session.output().println("ok");
+                return true;
+            }
+            if ("threads".equals(operation) && arguments.size() <= 3) {
+                String prefix = arguments.size() >= 2 ? arguments.get(1) : "thread";
+                int limit = arguments.size() == 3 ? integer(arguments.get(2), "limit") : 128;
+                List<RemoteJvmtiThread> threads = session.jvmti().threads();
+                int kept = Math.min(limit, threads.size());
+                for (int index = 0; index < threads.size(); index++) {
+                    RemoteJvmtiThread thread = threads.get(index);
+                    if (index < kept) {
+                        String variable = prefix + index;
+                        session.workspace().defineObject(variable, thread.object());
+                        session.output().printf("$%s state=0x%08x %s%n",
+                                variable, thread.capturedState(), thread.object().displayValue());
+                    } else {
+                        thread.close();
+                    }
+                }
+                session.output().printf("Saved %d of %d thread handle(s)%n", kept, threads.size());
+                return true;
+            }
+            if ("thread".equals(operation) && arguments.size() >= 3 && arguments.size() <= 4) {
+                String action = lower(arguments.get(1));
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(2)))) {
+                    RemoteObject thread = value.only();
+                    if ("state".equals(action) && arguments.size() == 3) {
+                        session.output().printf("0x%08x%n", session.jvmti().threadState(thread));
+                    } else if ("stack".equals(action)) {
+                        int max = arguments.size() == 4 ? integer(arguments.get(3), "max frames") : 64;
+                        for (String frame : session.jvmti().stackTrace(thread, max)) session.output().println(frame);
+                    } else if ("suspend".equals(action) && arguments.size() == 3) {
+                        session.jvmti().suspendThread(thread);
+                        session.output().println("ok");
+                    } else if ("resume".equals(action) && arguments.size() == 3) {
+                        session.jvmti().resumeThread(thread);
+                        session.output().println("ok");
+                    } else if ("interrupt".equals(action) && arguments.size() == 3) {
+                        session.jvmti().interruptThread(thread);
+                        session.output().println("ok");
+                    } else if ("frame-pop".equals(action) && arguments.size() == 4) {
+                        session.jvmti().notifyFramePop(thread, integer(arguments.get(3), "depth"));
+                        session.output().println("ok");
+                    } else return InteractiveCli.usage(session, this);
+                }
+                return true;
+            }
+            if (("size".equals(operation) || "tag".equals(operation))
+                    && (arguments.size() == 2 || arguments.size() == 3)) {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(1)))) {
+                    if ("size".equals(operation) && arguments.size() == 2) {
+                        session.output().println(session.jvmti().objectSize(value.only()));
+                    } else if ("tag".equals(operation) && arguments.size() == 2) {
+                        session.output().println(session.jvmti().getTag(value.only()));
+                    } else if ("tag".equals(operation)) {
+                        session.jvmti().setTag(value.only(), Long.parseLong(arguments.get(2)));
+                        session.output().println("ok");
+                    } else return InteractiveCli.usage(session, this);
+                }
+                return true;
+            }
+            if ("gc".equals(operation) && arguments.size() == 1) {
+                session.jvmti().forceGarbageCollection();
+                session.output().println("ok");
+                return true;
+            }
+            if ("properties".equals(operation) && arguments.size() == 1) {
+                for (String property : session.jvmti().systemProperties()) session.output().println(property);
+                return true;
+            }
+            return InteractiveCli.usage(session, this);
+        }
+
+        private static boolean setOrClear(String value) {
+            if ("set".equalsIgnoreCase(value) || "enable".equalsIgnoreCase(value)) return true;
+            if ("clear".equalsIgnoreCase(value) || "disable".equalsIgnoreCase(value)) return false;
+            throw new IllegalArgumentException("Operation must be set/enable or clear/disable");
+        }
+    }
+
     private static class DumpClassCommand extends ShellCommand<TargetSession> {
         private DumpClassCommand() {
             super("dumpclass", "dumpclass [class] <output.class> | dumpclass package <name|.> <dir> "
@@ -929,6 +1268,9 @@ public class InteractiveCli {
                 session.output().println("  invoke methodName (I)Ljava/lang/String; int:7");
                 session.output().println("  static invoke app.Tools run ()V");
                 session.output().println("  construct app.Model (Ljava/lang/String;)V string:name");
+                session.output().println("  invoke accept (Lapp/Model;)V {new app.Model ()V}");
+                session.output().println("  set service {static app.Services create ()Lapp/Service;}");
+                session.output().println("  resolve {context -> field service -> invoke status ()Ljava/lang/String;}");
                 session.output().println("  set field name string:newName | set index 2 int:9");
                 session.output().println("Search (glob '*' matches any text; '?' matches one character):");
                 session.output().println("  find package java.* --limit 100");
@@ -942,8 +1284,9 @@ public class InteractiveCli {
                 session.output().println("  package com.example     # immediate children only");
                 session.output().println("  dumpclass com.example.Type build/dump/Type.class");
                 session.output().println("  dump package com.example build/dump --recursive --match *Service --limit 500");
-                session.output().println("Literals: null, true, int:1, long:2, double:3.5, char:x, string:text, $variable, this");
-                session.output().println("A quoted token may contain spaces. Unquoted -> chains commands using the resulting context.");
+                session.output().println("Literals: null, true, int:1, class:app.Type, enum:app.Mode:FAST, $variable, this");
+                session.output().println("{new ...}, {invoke ...}, {static ...} and {... -> ...} are nestable value expressions.");
+                session.output().println("Top-level unquoted -> is temporary: current context, stack and bookmarks are restored afterward.");
                 return true;
             }
             if (arguments.size() == 1) {
@@ -1215,6 +1558,7 @@ public class InteractiveCli {
         StringBuilder current = new StringBuilder();
         boolean quoted = false;
         boolean escaped = false;
+        int expressionDepth = 0;
         for (int index = 0; index < source.length(); index++) {
             char value = source.charAt(index);
             if (escaped) {
@@ -1226,9 +1570,17 @@ public class InteractiveCli {
             } else if (value == '"') {
                 quoted = !quoted;
                 current.append(value);
-            } else if (!quoted && value == '-' && index + 1 < source.length() && source.charAt(index + 1) == '>') {
+            } else if (!quoted && value == '{') {
+                expressionDepth++;
+                current.append(value);
+            } else if (!quoted && value == '}') {
+                if (expressionDepth == 0) throw new IllegalArgumentException("Unexpected } in command line");
+                expressionDepth--;
+                current.append(value);
+            } else if (!quoted && expressionDepth == 0 && value == '-'
+                    && index + 1 < source.length() && source.charAt(index + 1) == '>') {
                 String segment = current.toString().trim();
-                if (segment.isEmpty()) throw new IllegalArgumentException("Pipeline contains an empty command");
+                if (segment.isEmpty()) throw new IllegalArgumentException("Reference chain contains an empty command");
                 result.add(segment);
                 current.setLength(0);
                 index++;
@@ -1236,8 +1588,11 @@ public class InteractiveCli {
                 current.append(value);
             }
         }
+        if (quoted) throw new IllegalArgumentException("Unclosed quote in command line");
+        if (expressionDepth != 0) throw new IllegalArgumentException("Unclosed { in command line");
         String segment = current.toString().trim();
         if (!segment.isEmpty()) result.add(segment);
+        else if (!result.isEmpty()) throw new IllegalArgumentException("Reference chain contains an empty command");
         if (result.isEmpty()) result.add("");
         return result;
     }

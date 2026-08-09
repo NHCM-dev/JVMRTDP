@@ -4,12 +4,20 @@
 #include <jvmti.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <deque>
 #include <iomanip>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -20,9 +28,36 @@ constexpr jint kAccStatic = 0x0008;
 JavaVM* gJavaVm = nullptr;
 jvmtiEnv* gJvmti = nullptr;
 bool gCanRetransform = false;
-std::mutex gRetransformMutex;
+std::atomic<bool> gClassFileHookEnabled{false};
+std::recursive_mutex gRetransformMutex;
+std::recursive_mutex gEventMutex;
 thread_local jclass tRequestedClass = nullptr;
 thread_local std::vector<unsigned char>* tRequestedBytes = nullptr;
+thread_local bool tInJavaCallback = false;
+thread_local int tTemporaryClassFileHookDepth = 0;
+jclass gDispatcherClass = nullptr;
+jmethodID gDispatchMethod = nullptr;
+jmethodID gTransformMethod = nullptr;
+
+struct QueuedEvent {
+    std::string name;
+    std::string text;
+    jmethodID method = nullptr;
+    jmethodID relatedMethod = nullptr;
+    jlocation location = 0;
+    jlocation relatedLocation = 0;
+    jlong value = 0;
+};
+
+std::mutex gQueueMutex;
+std::condition_variable gQueueChanged;
+std::deque<QueuedEvent> gEventQueue;
+std::atomic<bool> gWorkerStopping{false};
+// Raw by design: JNI_OnUnload joins/deletes it, while process shutdown may skip JNI_OnUnload.
+// A global joinable std::thread would call std::terminate from the DLL's CRT teardown.
+std::thread* gEventWorker = nullptr;
+std::atomic<jlong> gNativeQueued{0};
+std::atomic<jlong> gNativeDropped{0};
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) return {};
@@ -300,13 +335,408 @@ bool ParseArgument(JNIEnv* env, const std::string& descriptor, const std::string
     return failure.empty();
 }
 
-void JNICALL ClassFileLoadHook(jvmtiEnv*, JNIEnv* env, jclass classBeingRedefined,
-        jobject, const char*, jobject, jint classDataLength, const unsigned char* classData,
-        jint*, unsigned char**) {
+std::string BinaryClassName(jclass klass) {
+    if (klass == nullptr || gJvmti == nullptr) return {};
+    char* signature = nullptr;
+    char* generic = nullptr;
+    std::string result;
+    if (gJvmti->GetClassSignature(klass, &signature, &generic) == JVMTI_ERROR_NONE
+        && signature != nullptr) {
+        result = signature;
+        if (result.size() >= 2 && result.front() == 'L' && result.back() == ';') {
+            result = result.substr(1, result.size() - 2);
+        }
+        std::replace(result.begin(), result.end(), '/', '.');
+    }
+    if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    return result;
+}
+
+struct MethodDetails {
+    std::string className;
+    std::string name;
+    std::string descriptor;
+};
+
+MethodDetails DescribeMethod(JNIEnv* env, jmethodID method) {
+    MethodDetails result;
+    if (method == nullptr || gJvmti == nullptr) return result;
+    char* name = nullptr;
+    char* signature = nullptr;
+    char* generic = nullptr;
+    if (gJvmti->GetMethodName(method, &name, &signature, &generic) == JVMTI_ERROR_NONE) {
+        if (name != nullptr) result.name = name;
+        if (signature != nullptr) result.descriptor = signature;
+    }
+    jclass declaringClass = nullptr;
+    if (gJvmti->GetMethodDeclaringClass(method, &declaringClass) == JVMTI_ERROR_NONE) {
+        result.className = BinaryClassName(declaringClass);
+    }
+    if (declaringClass != nullptr && env != nullptr) env->DeleteLocalRef(declaringClass);
+    if (name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+    if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    return result;
+}
+
+jstring NewOptionalString(JNIEnv* env, const std::string& value) {
+    return value.empty() ? nullptr : env->NewStringUTF(value.c_str());
+}
+
+void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass eventClass,
+        jmethodID method, jlocation location, jobject subject, jlong value,
+        jmethodID relatedMethod = nullptr, jlocation relatedLocation = 0,
+        const char* memberName = nullptr, const char* memberDescriptor = nullptr,
+        jobject secondarySubject = nullptr, const char* text = nullptr) {
+    if (env == nullptr || gDispatcherClass == nullptr || gDispatchMethod == nullptr || tInJavaCallback) return;
+    const MethodDetails details = DescribeMethod(env, method);
+    const std::string className = eventClass == nullptr ? details.className : BinaryClassName(eventClass);
+    jstring javaEvent = env->NewStringUTF(eventName);
+    jstring javaClass = NewOptionalString(env, className);
+    jstring javaMethod = NewOptionalString(env, details.name);
+    jstring javaDescriptor = NewOptionalString(env, details.descriptor);
+    const MethodDetails related = DescribeMethod(env, relatedMethod);
+    jstring javaRelatedClass = NewOptionalString(env, related.className);
+    jstring javaRelatedMethod = NewOptionalString(env, related.name);
+    jstring javaRelatedDescriptor = NewOptionalString(env, related.descriptor);
+    jstring javaMemberName = memberName == nullptr ? nullptr : env->NewStringUTF(memberName);
+    jstring javaMemberDescriptor = memberDescriptor == nullptr ? nullptr : env->NewStringUTF(memberDescriptor);
+    jstring javaText = text == nullptr ? nullptr : env->NewStringUTF(text);
+    if (javaEvent != nullptr) {
+        tInJavaCallback = true;
+        env->CallStaticVoidMethod(gDispatcherClass, gDispatchMethod,
+            javaEvent, thread, javaClass, javaMethod, javaDescriptor,
+            static_cast<jlong>(location), subject, value,
+            javaRelatedClass, javaRelatedMethod, javaRelatedDescriptor,
+            static_cast<jlong>(relatedLocation), javaMemberName, javaMemberDescriptor,
+            secondarySubject, javaText);
+        tInJavaCallback = false;
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (javaEvent != nullptr) env->DeleteLocalRef(javaEvent);
+    if (javaClass != nullptr) env->DeleteLocalRef(javaClass);
+    if (javaMethod != nullptr) env->DeleteLocalRef(javaMethod);
+    if (javaDescriptor != nullptr) env->DeleteLocalRef(javaDescriptor);
+    if (javaRelatedClass != nullptr) env->DeleteLocalRef(javaRelatedClass);
+    if (javaRelatedMethod != nullptr) env->DeleteLocalRef(javaRelatedMethod);
+    if (javaRelatedDescriptor != nullptr) env->DeleteLocalRef(javaRelatedDescriptor);
+    if (javaMemberName != nullptr) env->DeleteLocalRef(javaMemberName);
+    if (javaMemberDescriptor != nullptr) env->DeleteLocalRef(javaMemberDescriptor);
+    if (javaText != nullptr) env->DeleteLocalRef(javaText);
+}
+
+void QueueEvent(QueuedEvent event) noexcept {
+    try {
+        {
+            std::lock_guard<std::mutex> guard(gQueueMutex);
+            if (gEventQueue.size() >= 65536) {
+                gNativeDropped.fetch_add(1);
+                return;
+            }
+            gEventQueue.push_back(std::move(event));
+            gNativeQueued.fetch_add(1);
+        }
+        gQueueChanged.notify_one();
+    } catch (...) {
+        gNativeDropped.fetch_add(1);
+    }
+}
+
+void QueueSimpleEvent(const char* name, jlong value = 0) noexcept {
+    try {
+        QueuedEvent event;
+        event.name = name == nullptr ? "" : name;
+        event.value = value;
+        QueueEvent(std::move(event));
+    } catch (...) {
+        gNativeDropped.fetch_add(1);
+    }
+}
+
+void EventWorkerMain() {
+    JNIEnv* env = nullptr;
+    if (gJavaVm == nullptr || gJavaVm->AttachCurrentThreadAsDaemon(
+            reinterpret_cast<void**>(&env), nullptr) != JNI_OK || env == nullptr) return;
+    while (true) {
+        QueuedEvent event;
+        {
+            std::unique_lock<std::mutex> lock(gQueueMutex);
+            gQueueChanged.wait(lock, [] { return gWorkerStopping.load() || !gEventQueue.empty(); });
+            if (gWorkerStopping.load() && gEventQueue.empty()) break;
+            event = std::move(gEventQueue.front());
+            gEventQueue.pop_front();
+        }
+        DispatchEvent(env, event.name.c_str(), nullptr, nullptr, event.method, event.location,
+            nullptr, event.value, event.relatedMethod, event.relatedLocation,
+            nullptr, nullptr, nullptr, event.text.empty() ? nullptr : event.text.c_str());
+    }
+    gJavaVm->DetachCurrentThread();
+}
+
+jlong ValueBits(char kind, jvalue value, jobject* subject) {
+    switch (kind) {
+    case 'L':
+    case '[': *subject = value.l; return 0;
+    case 'Z': return value.z;
+    case 'B': return value.b;
+    case 'C': return value.c;
+    case 'S': return value.s;
+    case 'I': return value.i;
+    case 'J': return value.j;
+    case 'F': {
+        jint bits = 0;
+        std::memcpy(&bits, &value.f, sizeof(bits));
+        return bits;
+    }
+    case 'D': {
+        jlong bits = 0;
+        std::memcpy(&bits, &value.d, sizeof(bits));
+        return bits;
+    }
+    default: return 0;
+    }
+}
+
+jlong ReturnValueBits(const MethodDetails& method, jvalue value, jobject* subject) {
+    const std::size_t end = method.descriptor.rfind(')');
+    const char kind = end == std::string::npos || end + 1 >= method.descriptor.size()
+        ? 'V' : method.descriptor[end + 1];
+    return ValueBits(kind, value, subject);
+}
+
+struct FieldDetails {
+    std::string name;
+    std::string descriptor;
+};
+
+FieldDetails DescribeField(jclass klass, jfieldID field) {
+    FieldDetails result;
+    if (klass == nullptr || field == nullptr || gJvmti == nullptr) return result;
+    char* name = nullptr;
+    char* signature = nullptr;
+    char* generic = nullptr;
+    if (gJvmti->GetFieldName(klass, field, &name, &signature, &generic) == JVMTI_ERROR_NONE) {
+        if (name != nullptr) result.name = name;
+        if (signature != nullptr) result.descriptor = signature;
+    }
+    if (name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+    if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    return result;
+}
+
+void JNICALL VmInit(jvmtiEnv*, JNIEnv* env, jthread thread) {
+    DispatchEvent(env, "vm_init", thread, nullptr, nullptr, 0, nullptr, 0);
+}
+
+void JNICALL VmStart(jvmtiEnv*, JNIEnv* env) {
+    DispatchEvent(env, "vm_start", nullptr, nullptr, nullptr, 0, nullptr, 0);
+}
+
+void JNICALL VmDeath(jvmtiEnv*, JNIEnv* env) {
+    DispatchEvent(env, "vm_death", nullptr, nullptr, nullptr, 0, nullptr, 0);
+}
+
+void JNICALL ThreadStart(jvmtiEnv*, JNIEnv* env, jthread thread) {
+    DispatchEvent(env, "thread_start", thread, nullptr, nullptr, 0, nullptr, 0);
+}
+
+void JNICALL ThreadEnd(jvmtiEnv*, JNIEnv* env, jthread thread) {
+    DispatchEvent(env, "thread_end", thread, nullptr, nullptr, 0, nullptr, 0);
+}
+
+void JNICALL ClassLoad(jvmtiEnv*, JNIEnv* env, jthread thread, jclass klass) {
+    DispatchEvent(env, "class_load", thread, klass, nullptr, 0, klass, 0);
+}
+
+void JNICALL ClassPrepare(jvmtiEnv*, JNIEnv* env, jthread thread, jclass klass) {
+    DispatchEvent(env, "class_prepare", thread, klass, nullptr, 0, klass, 0);
+}
+
+void JNICALL SingleStep(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
+    DispatchEvent(env, "single_step", thread, nullptr, method, location, nullptr, 0);
+}
+
+void JNICALL FramePop(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jboolean wasPoppedByException) {
+    DispatchEvent(env, "frame_pop", thread, nullptr, method, 0, nullptr,
+        wasPoppedByException == JNI_TRUE ? 1 : 0);
+}
+
+void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
+    DispatchEvent(env, "breakpoint", thread, nullptr, method, location, nullptr, 0);
+}
+
+void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jlocation location, jclass fieldClass, jobject object, jfieldID field) {
+    const FieldDetails details = DescribeField(fieldClass, field);
+    DispatchEvent(env, "field_access", thread, fieldClass, method, location, object, 0,
+        nullptr, 0, details.name.c_str(), details.descriptor.c_str());
+}
+
+void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jlocation location, jclass fieldClass, jobject object, jfieldID field,
+        char signatureType, jvalue newValue) {
+    const FieldDetails details = DescribeField(fieldClass, field);
+    jobject newObject = nullptr;
+    const jlong bits = ValueBits(signatureType, newValue, &newObject);
+    DispatchEvent(env, "field_modification", thread, fieldClass, method, location, object, bits,
+        nullptr, 0, details.name.c_str(), details.descriptor.c_str(), newObject);
+}
+
+void JNICALL MethodEntry(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method) {
+    DispatchEvent(env, "method_entry", thread, nullptr, method, 0, nullptr, 0);
+}
+
+void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jboolean poppedByException, jvalue returnValue) {
+    const MethodDetails details = DescribeMethod(env, method);
+    jobject subject = nullptr;
+    const jlong bits = poppedByException == JNI_TRUE ? 0 : ReturnValueBits(details, returnValue, &subject);
+    DispatchEvent(env, "method_exit", thread, nullptr, method,
+        poppedByException == JNI_TRUE ? static_cast<jlocation>(-1) : 0, subject, bits);
+}
+
+void JNICALL Exception(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jlocation location, jobject exception, jmethodID catchMethod, jlocation catchLocation) {
+    DispatchEvent(env, "exception", thread, nullptr, method, location, exception, 0,
+        catchMethod, catchLocation);
+}
+
+void JNICALL ExceptionCatch(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        jlocation location, jobject exception) {
+    DispatchEvent(env, "exception_catch", thread, nullptr, method, location, exception, 0);
+}
+
+void JNICALL MonitorContendedEnter(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object) {
+    DispatchEvent(env, "monitor_contended_enter", thread, nullptr, nullptr, 0, object, 0);
+}
+
+void JNICALL MonitorContendedEntered(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object) {
+    DispatchEvent(env, "monitor_contended_entered", thread, nullptr, nullptr, 0, object, 0);
+}
+
+void JNICALL MonitorWait(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object, jlong timeout) {
+    DispatchEvent(env, "monitor_wait", thread, nullptr, nullptr, 0, object, timeout);
+}
+
+void JNICALL MonitorWaited(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object, jboolean timedOut) {
+    DispatchEvent(env, "monitor_waited", thread, nullptr, nullptr, 0, object, timedOut == JNI_TRUE ? 1 : 0);
+}
+
+void JNICALL VmObjectAlloc(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object, jclass klass, jlong size) {
+    DispatchEvent(env, "vm_object_alloc", thread, klass, nullptr, 0, object, size);
+}
+
+void JNICALL NativeMethodBind(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
+        void* address, void**) {
+    DispatchEvent(env, "native_method_bind", thread, nullptr, method,
+        static_cast<jlocation>(reinterpret_cast<std::uintptr_t>(address)), nullptr, 0);
+}
+
+void JNICALL CompiledMethodLoad(jvmtiEnv*, jmethodID method, jint codeSize, const void* codeAddress,
+        jint mapLength, const jvmtiAddrLocationMap*, const void*) {
+    try {
+        QueuedEvent event;
+        event.name = "compiled_method_load";
+        event.method = method;
+        event.location = static_cast<jlocation>(reinterpret_cast<std::uintptr_t>(codeAddress));
+        event.relatedLocation = mapLength;
+        event.value = codeSize;
+        QueueEvent(std::move(event));
+    } catch (...) { gNativeDropped.fetch_add(1); }
+}
+
+void JNICALL CompiledMethodUnload(jvmtiEnv*, jmethodID method, const void* codeAddress) {
+    try {
+        QueuedEvent event;
+        event.name = "compiled_method_unload";
+        event.method = method;
+        event.location = static_cast<jlocation>(reinterpret_cast<std::uintptr_t>(codeAddress));
+        QueueEvent(std::move(event));
+    } catch (...) { gNativeDropped.fetch_add(1); }
+}
+
+void JNICALL DynamicCodeGenerated(jvmtiEnv*, const char* name, const void* address, jint length) {
+    try {
+        QueuedEvent event;
+        event.name = "dynamic_code_generated";
+        if (name != nullptr) event.text = name;
+        event.location = static_cast<jlocation>(reinterpret_cast<std::uintptr_t>(address));
+        event.value = length;
+        QueueEvent(std::move(event));
+    } catch (...) { gNativeDropped.fetch_add(1); }
+}
+
+void JNICALL DataDumpRequest(jvmtiEnv*) {
+    QueueSimpleEvent("data_dump_request");
+}
+
+void JNICALL ResourceExhausted(jvmtiEnv*, JNIEnv*, jint flags, const void*, const char* description) {
+    try {
+        QueuedEvent event;
+        event.name = "resource_exhausted";
+        if (description != nullptr) event.text = description;
+        event.value = flags;
+        QueueEvent(std::move(event));
+    } catch (...) { gNativeDropped.fetch_add(1); }
+}
+
+void JNICALL GarbageCollectionStart(jvmtiEnv*) {
+    QueueSimpleEvent("garbage_collection_start");
+}
+
+void JNICALL GarbageCollectionFinish(jvmtiEnv*) {
+    QueueSimpleEvent("garbage_collection_finish");
+}
+
+void JNICALL ObjectFree(jvmtiEnv*, jlong tag) {
+    QueueSimpleEvent("object_free", tag);
+}
+
+void JNICALL ClassFileLoadHook(jvmtiEnv* jvmti, JNIEnv* env, jclass classBeingRedefined,
+        jobject loader, const char* name, jobject protectionDomain, jint classDataLength,
+        const unsigned char* classData,
+        jint* newClassDataLength, unsigned char** newClassData) {
     if (tRequestedClass != nullptr && tRequestedBytes != nullptr && classBeingRedefined != nullptr
         && env->IsSameObject(tRequestedClass, classBeingRedefined)) {
         tRequestedBytes->assign(classData, classData + classDataLength);
     }
+    if (gDispatcherClass == nullptr || gTransformMethod == nullptr || classDataLength <= 0 || tInJavaCallback) return;
+    std::string binaryName = name == nullptr ? BinaryClassName(classBeingRedefined) : name;
+    std::replace(binaryName.begin(), binaryName.end(), '/', '.');
+    jstring javaName = NewOptionalString(env, binaryName);
+    jbyteArray original = env->NewByteArray(classDataLength);
+    if (original != nullptr) {
+        env->SetByteArrayRegion(original, 0, classDataLength, reinterpret_cast<const jbyte*>(classData));
+    }
+    tInJavaCallback = true;
+    jbyteArray replacement = original == nullptr ? nullptr : static_cast<jbyteArray>(env->CallStaticObjectMethod(
+        gDispatcherClass, gTransformMethod, loader, javaName, classBeingRedefined, protectionDomain, original));
+    tInJavaCallback = false;
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        replacement = nullptr;
+    }
+    if (replacement != nullptr) {
+        const jsize replacementLength = env->GetArrayLength(replacement);
+        unsigned char* allocated = nullptr;
+        if (replacementLength > 0 && jvmti->Allocate(replacementLength, &allocated) == JVMTI_ERROR_NONE) {
+            env->GetByteArrayRegion(replacement, 0, replacementLength, reinterpret_cast<jbyte*>(allocated));
+            if (!env->ExceptionCheck()) {
+                *newClassDataLength = replacementLength;
+                *newClassData = allocated;
+                allocated = nullptr;
+            } else {
+                env->ExceptionClear();
+            }
+        }
+        if (allocated != nullptr) jvmti->Deallocate(allocated);
+        env->DeleteLocalRef(replacement);
+    }
+    if (original != nullptr) env->DeleteLocalRef(original);
+    if (javaName != nullptr) env->DeleteLocalRef(javaName);
 }
 
 jstring JNICALL NativeVersion(JNIEnv* env, jclass) {
@@ -343,13 +773,23 @@ jbyteArray JNICALL NativeGetClassBytes(JNIEnv* env, jclass, jstring classNameVal
 
     std::vector<unsigned char> bytes;
     {
-        std::lock_guard<std::mutex> guard(gRetransformMutex);
+        std::lock_guard<std::recursive_mutex> guard(gRetransformMutex);
         tRequestedClass = klass;
         tRequestedBytes = &bytes;
-        error = gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr);
-        if (error == JVMTI_ERROR_NONE) error = gJvmti->RetransformClasses(1, &klass);
-        const jvmtiError disableError = gJvmti->SetEventNotificationMode(
-            JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr);
+        std::lock_guard<std::recursive_mutex> eventGuard(gEventMutex);
+        const bool ownsTemporaryEnable = !gClassFileHookEnabled.load()
+            && tTemporaryClassFileHookDepth == 0;
+        error = ownsTemporaryEnable
+            ? gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr)
+            : JVMTI_ERROR_NONE;
+        if (error == JVMTI_ERROR_NONE) {
+            ++tTemporaryClassFileHookDepth;
+            error = gJvmti->RetransformClasses(1, &klass);
+            --tTemporaryClassFileHookDepth;
+        }
+        const bool shouldDisable = ownsTemporaryEnable && !gClassFileHookEnabled.load();
+        const jvmtiError disableError = shouldDisable ? gJvmti->SetEventNotificationMode(
+            JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr) : JVMTI_ERROR_NONE;
         tRequestedClass = nullptr;
         tRequestedBytes = nullptr;
         if (error == JVMTI_ERROR_NONE) error = disableError;
@@ -620,6 +1060,431 @@ jobjectArray JNICALL NativeListLoadedClasses(JNIEnv* env, jclass) {
     return result;
 }
 
+void ThrowJvmti(JNIEnv* env, const char* operation, jvmtiError error) {
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            std::string(operation) + " failed: " + JvmtiErrorText(error));
+    }
+}
+
+jobjectArray NewStringArray(JNIEnv* env, const std::vector<std::string>& values) {
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (stringClass == nullptr) return nullptr;
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(values.size()), stringClass, nullptr);
+    for (jsize index = 0; result != nullptr && index < static_cast<jsize>(values.size()); ++index) {
+        jstring value = env->NewStringUTF(values[static_cast<std::size_t>(index)].c_str());
+        if (value != nullptr) {
+            env->SetObjectArrayElement(result, index, value);
+            env->DeleteLocalRef(value);
+        }
+    }
+    env->DeleteLocalRef(stringClass);
+    return result;
+}
+
+jclass JNICALL NativeDefineClass(JNIEnv* env, jclass, jstring classNameValue,
+        jbyteArray classBytes, jobject loader) {
+    std::string className = JStringToUtf8(env, classNameValue);
+    std::replace(className.begin(), className.end(), '.', '/');
+    if (className.empty() || classBytes == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class name and bytes are required");
+        return nullptr;
+    }
+    const jsize length = env->GetArrayLength(classBytes);
+    if (length < 4) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Invalid JVM class bytes");
+        return nullptr;
+    }
+    jbyte* bytes = env->GetByteArrayElements(classBytes, nullptr);
+    if (bytes == nullptr) return nullptr;
+    jclass result = env->DefineClass(className.c_str(), loader, bytes, length);
+    env->ReleaseByteArrayElements(classBytes, bytes, JNI_ABORT);
+    return result;
+}
+
+void JNICALL NativeAddToClassLoaderSearch(JNIEnv* env, jclass, jstring jarPathValue, jboolean bootstrap) {
+    const std::string jarPath = JStringToUtf8(env, jarPathValue);
+    if (jarPath.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "JAR path must not be empty");
+        return;
+    }
+    const jvmtiError error = bootstrap == JNI_TRUE
+        ? gJvmti->AddToBootstrapClassLoaderSearch(jarPath.c_str())
+        : gJvmti->AddToSystemClassLoaderSearch(jarPath.c_str());
+    ThrowJvmti(env, bootstrap == JNI_TRUE ? "AddToBootstrapClassLoaderSearch"
+        : "AddToSystemClassLoaderSearch", error);
+}
+
+bool ResolveEvent(const std::string& input, jvmtiEvent* event) {
+    std::string name = input;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    std::replace(name.begin(), name.end(), '-', '_');
+    static const std::unordered_map<std::string, jvmtiEvent> events = {
+        {"vm_init", JVMTI_EVENT_VM_INIT}, {"vm_death", JVMTI_EVENT_VM_DEATH},
+        {"thread_start", JVMTI_EVENT_THREAD_START}, {"thread_end", JVMTI_EVENT_THREAD_END},
+        {"class_load", JVMTI_EVENT_CLASS_LOAD}, {"class_prepare", JVMTI_EVENT_CLASS_PREPARE},
+        {"class_file_load_hook", JVMTI_EVENT_CLASS_FILE_LOAD_HOOK},
+        {"vm_start", JVMTI_EVENT_VM_START},
+        {"single_step", JVMTI_EVENT_SINGLE_STEP}, {"frame_pop", JVMTI_EVENT_FRAME_POP},
+        {"breakpoint", JVMTI_EVENT_BREAKPOINT}, {"field_access", JVMTI_EVENT_FIELD_ACCESS},
+        {"field_modification", JVMTI_EVENT_FIELD_MODIFICATION},
+        {"method_entry", JVMTI_EVENT_METHOD_ENTRY}, {"method_exit", JVMTI_EVENT_METHOD_EXIT},
+        {"exception", JVMTI_EVENT_EXCEPTION}, {"exception_catch", JVMTI_EVENT_EXCEPTION_CATCH},
+        {"native_method_bind", JVMTI_EVENT_NATIVE_METHOD_BIND},
+        {"compiled_method_load", JVMTI_EVENT_COMPILED_METHOD_LOAD},
+        {"compiled_method_unload", JVMTI_EVENT_COMPILED_METHOD_UNLOAD},
+        {"dynamic_code_generated", JVMTI_EVENT_DYNAMIC_CODE_GENERATED},
+        {"data_dump_request", JVMTI_EVENT_DATA_DUMP_REQUEST},
+        {"monitor_contended_enter", JVMTI_EVENT_MONITOR_CONTENDED_ENTER},
+        {"monitor_contended_entered", JVMTI_EVENT_MONITOR_CONTENDED_ENTERED},
+        {"monitor_wait", JVMTI_EVENT_MONITOR_WAIT}, {"monitor_waited", JVMTI_EVENT_MONITOR_WAITED},
+        {"vm_object_alloc", JVMTI_EVENT_VM_OBJECT_ALLOC},
+        {"garbage_collection_start", JVMTI_EVENT_GARBAGE_COLLECTION_START},
+        {"garbage_collection_finish", JVMTI_EVENT_GARBAGE_COLLECTION_FINISH},
+        {"object_free", JVMTI_EVENT_OBJECT_FREE},
+        {"resource_exhausted", JVMTI_EVENT_RESOURCE_EXHAUSTED},
+    };
+    const auto found = events.find(name);
+    if (found == events.end()) return false;
+    *event = found->second;
+    return true;
+}
+
+jmethodID ResolveMethod(JNIEnv* env, jclass klass, const std::string& expectedName,
+        const std::string& expectedDescriptor) {
+    jint count = 0;
+    jmethodID* methods = nullptr;
+    const jvmtiError error = gJvmti->GetClassMethods(klass, &count, &methods);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetClassMethods", error);
+        return nullptr;
+    }
+    jmethodID result = nullptr;
+    for (jint index = 0; index < count; ++index) {
+        char* name = nullptr;
+        char* descriptor = nullptr;
+        char* generic = nullptr;
+        if (gJvmti->GetMethodName(methods[index], &name, &descriptor, &generic) == JVMTI_ERROR_NONE
+            && name != nullptr && descriptor != nullptr && expectedName == name
+            && expectedDescriptor == descriptor) {
+            result = methods[index];
+        }
+        if (name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+        if (descriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
+        if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+        if (result != nullptr) break;
+    }
+    if (methods != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+    if (result == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "Method was not found: " + expectedName + expectedDescriptor);
+    }
+    return result;
+}
+
+jfieldID ResolveField(JNIEnv* env, jclass klass, const std::string& expectedName,
+        const std::string& expectedDescriptor) {
+    jint count = 0;
+    jfieldID* fields = nullptr;
+    const jvmtiError error = gJvmti->GetClassFields(klass, &count, &fields);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetClassFields", error);
+        return nullptr;
+    }
+    jfieldID result = nullptr;
+    for (jint index = 0; index < count; ++index) {
+        char* name = nullptr;
+        char* descriptor = nullptr;
+        char* generic = nullptr;
+        if (gJvmti->GetFieldName(klass, fields[index], &name, &descriptor, &generic) == JVMTI_ERROR_NONE
+            && name != nullptr && descriptor != nullptr && expectedName == name
+            && expectedDescriptor == descriptor) {
+            result = fields[index];
+        }
+        if (name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+        if (descriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
+        if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+        if (result != nullptr) break;
+    }
+    if (fields != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(fields));
+    if (result == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "Field was not found: " + expectedName + " " + expectedDescriptor);
+    }
+    return result;
+}
+
+void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameValue, jboolean enabled) {
+    const std::string eventName = JStringToUtf8(env, eventNameValue);
+    jvmtiEvent event{};
+    if (!ResolveEvent(eventName, &event)) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Unsupported JVMTI event: " + eventName);
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> guard(gEventMutex);
+    const jvmtiError error = gJvmti->SetEventNotificationMode(
+        enabled == JNI_TRUE ? JVMTI_ENABLE : JVMTI_DISABLE, event, nullptr);
+    if (error == JVMTI_ERROR_NONE && event == JVMTI_EVENT_CLASS_FILE_LOAD_HOOK) {
+        gClassFileHookEnabled.store(enabled == JNI_TRUE);
+    }
+    ThrowJvmti(env, "SetEventNotificationMode", error);
+}
+
+void JNICALL NativeSetBreakpoint(JNIEnv* env, jclass, jclass klass, jstring methodNameValue,
+        jstring descriptorValue, jlong location, jboolean enabled) {
+    if (klass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
+        return;
+    }
+    const std::string methodName = JStringToUtf8(env, methodNameValue);
+    const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    jmethodID method = ResolveMethod(env, klass, methodName, descriptor);
+    if (method == nullptr) return;
+    const jvmtiError error = enabled == JNI_TRUE
+        ? gJvmti->SetBreakpoint(method, static_cast<jlocation>(location))
+        : gJvmti->ClearBreakpoint(method, static_cast<jlocation>(location));
+    ThrowJvmti(env, enabled == JNI_TRUE ? "SetBreakpoint" : "ClearBreakpoint", error);
+}
+
+void JNICALL NativeSetFieldWatch(JNIEnv* env, jclass, jclass klass, jstring fieldNameValue,
+        jstring descriptorValue, jboolean modification, jboolean enabled) {
+    if (klass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
+        return;
+    }
+    const std::string fieldName = JStringToUtf8(env, fieldNameValue);
+    const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    jfieldID field = ResolveField(env, klass, fieldName, descriptor);
+    if (field == nullptr) return;
+    jvmtiError error;
+    const char* operation;
+    if (modification == JNI_TRUE && enabled == JNI_TRUE) {
+        error = gJvmti->SetFieldModificationWatch(klass, field);
+        operation = "SetFieldModificationWatch";
+    } else if (modification == JNI_TRUE) {
+        error = gJvmti->ClearFieldModificationWatch(klass, field);
+        operation = "ClearFieldModificationWatch";
+    } else if (enabled == JNI_TRUE) {
+        error = gJvmti->SetFieldAccessWatch(klass, field);
+        operation = "SetFieldAccessWatch";
+    } else {
+        error = gJvmti->ClearFieldAccessWatch(klass, field);
+        operation = "ClearFieldAccessWatch";
+    }
+    ThrowJvmti(env, operation, error);
+}
+
+void JNICALL NativeNotifyFramePop(JNIEnv* env, jclass, jthread thread, jint depth) {
+    if (thread == nullptr || depth < 0) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Thread is required and depth must not be negative");
+        return;
+    }
+    ThrowJvmti(env, "NotifyFramePop", gJvmti->NotifyFramePop(thread, depth));
+}
+
+jlongArray JNICALL NativeEventQueueStatistics(JNIEnv* env, jclass) {
+    jlong values[3] = {gNativeQueued.load(), gNativeDropped.load(), 0};
+    {
+        std::lock_guard<std::mutex> guard(gQueueMutex);
+        values[2] = static_cast<jlong>(gEventQueue.size());
+    }
+    jlongArray result = env->NewLongArray(3);
+    if (result != nullptr) env->SetLongArrayRegion(result, 0, 3, values);
+    return result;
+}
+
+void JNICALL NativeRetransformClass(JNIEnv* env, jclass, jclass klass) {
+    if (klass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
+        return;
+    }
+    ThrowJvmti(env, "RetransformClasses", gJvmti->RetransformClasses(1, &klass));
+}
+
+void JNICALL NativeRedefineClass(JNIEnv* env, jclass, jclass klass, jbyteArray classBytes) {
+    if (klass == nullptr || classBytes == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class and bytes are required");
+        return;
+    }
+    const jsize length = env->GetArrayLength(classBytes);
+    jbyte* bytes = env->GetByteArrayElements(classBytes, nullptr);
+    if (bytes == nullptr) return;
+    jvmtiClassDefinition definition{};
+    definition.klass = klass;
+    definition.class_byte_count = length;
+    definition.class_bytes = reinterpret_cast<unsigned char*>(bytes);
+    const jvmtiError error = gJvmti->RedefineClasses(1, &definition);
+    env->ReleaseByteArrayElements(classBytes, bytes, JNI_ABORT);
+    ThrowJvmti(env, "RedefineClasses", error);
+}
+
+jstring JNICALL NativeCapabilities(JNIEnv* env, jclass) {
+    jvmtiCapabilities capabilities{};
+    const jvmtiError error = gJvmti->GetCapabilities(&capabilities);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetCapabilities", error);
+        return nullptr;
+    }
+    std::vector<std::string> enabled;
+#define JVMRTDP_CAPABILITY(field) if (capabilities.field) enabled.emplace_back(#field)
+    JVMRTDP_CAPABILITY(can_tag_objects);
+    JVMRTDP_CAPABILITY(can_generate_field_modification_events);
+    JVMRTDP_CAPABILITY(can_generate_field_access_events);
+    JVMRTDP_CAPABILITY(can_get_bytecodes);
+    JVMRTDP_CAPABILITY(can_get_synthetic_attribute);
+    JVMRTDP_CAPABILITY(can_get_owned_monitor_info);
+    JVMRTDP_CAPABILITY(can_get_current_contended_monitor);
+    JVMRTDP_CAPABILITY(can_get_monitor_info);
+    JVMRTDP_CAPABILITY(can_pop_frame);
+    JVMRTDP_CAPABILITY(can_redefine_classes);
+    JVMRTDP_CAPABILITY(can_signal_thread);
+    JVMRTDP_CAPABILITY(can_get_source_file_name);
+    JVMRTDP_CAPABILITY(can_get_line_numbers);
+    JVMRTDP_CAPABILITY(can_get_source_debug_extension);
+    JVMRTDP_CAPABILITY(can_access_local_variables);
+    JVMRTDP_CAPABILITY(can_maintain_original_method_order);
+    JVMRTDP_CAPABILITY(can_generate_single_step_events);
+    JVMRTDP_CAPABILITY(can_generate_frame_pop_events);
+    JVMRTDP_CAPABILITY(can_generate_breakpoint_events);
+    JVMRTDP_CAPABILITY(can_suspend);
+    JVMRTDP_CAPABILITY(can_redefine_any_class);
+    JVMRTDP_CAPABILITY(can_get_current_thread_cpu_time);
+    JVMRTDP_CAPABILITY(can_get_thread_cpu_time);
+    JVMRTDP_CAPABILITY(can_generate_method_entry_events);
+    JVMRTDP_CAPABILITY(can_generate_method_exit_events);
+    JVMRTDP_CAPABILITY(can_generate_all_class_hook_events);
+    JVMRTDP_CAPABILITY(can_generate_compiled_method_load_events);
+    JVMRTDP_CAPABILITY(can_generate_exception_events);
+    JVMRTDP_CAPABILITY(can_generate_monitor_events);
+    JVMRTDP_CAPABILITY(can_generate_vm_object_alloc_events);
+    JVMRTDP_CAPABILITY(can_generate_native_method_bind_events);
+    JVMRTDP_CAPABILITY(can_generate_garbage_collection_events);
+    JVMRTDP_CAPABILITY(can_generate_object_free_events);
+    JVMRTDP_CAPABILITY(can_force_early_return);
+    JVMRTDP_CAPABILITY(can_get_owned_monitor_stack_depth_info);
+    JVMRTDP_CAPABILITY(can_get_constant_pool);
+    JVMRTDP_CAPABILITY(can_set_native_method_prefix);
+    JVMRTDP_CAPABILITY(can_retransform_classes);
+    JVMRTDP_CAPABILITY(can_retransform_any_class);
+    JVMRTDP_CAPABILITY(can_generate_resource_exhaustion_heap_events);
+    JVMRTDP_CAPABILITY(can_generate_resource_exhaustion_threads_events);
+#undef JVMRTDP_CAPABILITY
+    std::ostringstream output;
+    for (std::size_t index = 0; index < enabled.size(); ++index) {
+        if (index != 0) output << '\n';
+        output << enabled[index];
+    }
+    return env->NewStringUTF(output.str().c_str());
+}
+
+jobjectArray JNICALL NativeGetAllThreads(JNIEnv* env, jclass) {
+    jint count = 0;
+    jthread* threads = nullptr;
+    const jvmtiError error = gJvmti->GetAllThreads(&count, &threads);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetAllThreads", error);
+        return nullptr;
+    }
+    jclass threadClass = env->FindClass("java/lang/Thread");
+    jobjectArray result = threadClass == nullptr ? nullptr : env->NewObjectArray(count, threadClass, nullptr);
+    for (jint index = 0; result != nullptr && index < count; ++index) {
+        env->SetObjectArrayElement(result, index, threads[index]);
+        env->DeleteLocalRef(threads[index]);
+    }
+    if (threads != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(threads));
+    if (threadClass != nullptr) env->DeleteLocalRef(threadClass);
+    return result;
+}
+
+jint JNICALL NativeGetThreadState(JNIEnv* env, jclass, jthread thread) {
+    jint state = 0;
+    const jvmtiError error = gJvmti->GetThreadState(thread, &state);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetThreadState", error);
+        return 0;
+    }
+    return state;
+}
+
+jobjectArray JNICALL NativeGetStackTrace(JNIEnv* env, jclass, jthread thread, jint maxFrames) {
+    std::vector<jvmtiFrameInfo> frames(static_cast<std::size_t>(maxFrames));
+    jint count = 0;
+    const jvmtiError error = gJvmti->GetStackTrace(thread, 0, maxFrames, frames.data(), &count);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetStackTrace", error);
+        return nullptr;
+    }
+    std::vector<std::string> values;
+    values.reserve(static_cast<std::size_t>(count));
+    for (jint index = 0; index < count; ++index) {
+        const MethodDetails details = DescribeMethod(env, frames[static_cast<std::size_t>(index)].method);
+        values.push_back(details.className + "." + details.name + details.descriptor + "@"
+            + std::to_string(frames[static_cast<std::size_t>(index)].location));
+    }
+    return NewStringArray(env, values);
+}
+
+void JNICALL NativeThreadControl(JNIEnv* env, jclass, jthread thread, jint operation) {
+    jvmtiError error = JVMTI_ERROR_ILLEGAL_ARGUMENT;
+    const char* name = "ThreadControl";
+    if (operation == 1) { error = gJvmti->SuspendThread(thread); name = "SuspendThread"; }
+    else if (operation == 2) { error = gJvmti->ResumeThread(thread); name = "ResumeThread"; }
+    else if (operation == 3) { error = gJvmti->InterruptThread(thread); name = "InterruptThread"; }
+    ThrowJvmti(env, name, error);
+}
+
+jlong JNICALL NativeGetObjectSize(JNIEnv* env, jclass, jobject object) {
+    jlong size = 0;
+    const jvmtiError error = gJvmti->GetObjectSize(object, &size);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetObjectSize", error);
+        return 0;
+    }
+    return size;
+}
+
+jlong JNICALL NativeGetTag(JNIEnv* env, jclass, jobject object) {
+    jlong tag = 0;
+    const jvmtiError error = gJvmti->GetTag(object, &tag);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetTag", error);
+        return 0;
+    }
+    return tag;
+}
+
+void JNICALL NativeSetTag(JNIEnv* env, jclass, jobject object, jlong tag) {
+    ThrowJvmti(env, "SetTag", gJvmti->SetTag(object, tag));
+}
+
+void JNICALL NativeForceGarbageCollection(JNIEnv* env, jclass) {
+    ThrowJvmti(env, "ForceGarbageCollection", gJvmti->ForceGarbageCollection());
+}
+
+jobjectArray JNICALL NativeSystemProperties(JNIEnv* env, jclass) {
+    jint count = 0;
+    char** properties = nullptr;
+    const jvmtiError error = gJvmti->GetSystemProperties(&count, &properties);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetSystemProperties", error);
+        return nullptr;
+    }
+    std::vector<std::string> values;
+    values.reserve(static_cast<std::size_t>(count));
+    for (jint index = 0; index < count; ++index) {
+        char* value = nullptr;
+        const jvmtiError valueError = gJvmti->GetSystemProperty(properties[index], &value);
+        values.push_back(std::string(properties[index]) + "="
+            + (valueError == JVMTI_ERROR_NONE && value != nullptr ? value : ""));
+        if (value != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(value));
+        gJvmti->Deallocate(reinterpret_cast<unsigned char*>(properties[index]));
+    }
+    if (properties != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(properties));
+    return NewStringArray(env, values);
+}
+
 JNINativeMethod kMethods[] = {
     {const_cast<char*>("nativeVersion"), const_cast<char*>("()Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeVersion)},
@@ -642,6 +1507,49 @@ JNINativeMethod kMethods[] = {
      reinterpret_cast<void*>(&NativeListLoadedClassNames)},
     {const_cast<char*>("nativeListLoadedClasses"), const_cast<char*>("()[Ljava/lang/Class;"),
      reinterpret_cast<void*>(&NativeListLoadedClasses)},
+    {const_cast<char*>("nativeDefineClass"),
+     const_cast<char*>("(Ljava/lang/String;[BLjava/lang/ClassLoader;)Ljava/lang/Class;"),
+     reinterpret_cast<void*>(&NativeDefineClass)},
+    {const_cast<char*>("nativeAddToClassLoaderSearch"),
+     const_cast<char*>("(Ljava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeAddToClassLoaderSearch)},
+    {const_cast<char*>("nativeSetEventNotification"),
+     const_cast<char*>("(Ljava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeSetEventNotification)},
+    {const_cast<char*>("nativeSetBreakpoint"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZ)V"),
+     reinterpret_cast<void*>(&NativeSetBreakpoint)},
+    {const_cast<char*>("nativeSetFieldWatch"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZ)V"),
+     reinterpret_cast<void*>(&NativeSetFieldWatch)},
+    {const_cast<char*>("nativeNotifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
+     reinterpret_cast<void*>(&NativeNotifyFramePop)},
+    {const_cast<char*>("nativeEventQueueStatistics"), const_cast<char*>("()[J"),
+     reinterpret_cast<void*>(&NativeEventQueueStatistics)},
+    {const_cast<char*>("nativeRetransformClass"), const_cast<char*>("(Ljava/lang/Class;)V"),
+     reinterpret_cast<void*>(&NativeRetransformClass)},
+    {const_cast<char*>("nativeRedefineClass"), const_cast<char*>("(Ljava/lang/Class;[B)V"),
+     reinterpret_cast<void*>(&NativeRedefineClass)},
+    {const_cast<char*>("nativeCapabilities"), const_cast<char*>("()Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeCapabilities)},
+    {const_cast<char*>("nativeGetAllThreads"), const_cast<char*>("()[Ljava/lang/Thread;"),
+     reinterpret_cast<void*>(&NativeGetAllThreads)},
+    {const_cast<char*>("nativeGetThreadState"), const_cast<char*>("(Ljava/lang/Thread;)I"),
+     reinterpret_cast<void*>(&NativeGetThreadState)},
+    {const_cast<char*>("nativeGetStackTrace"), const_cast<char*>("(Ljava/lang/Thread;I)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeGetStackTrace)},
+    {const_cast<char*>("nativeThreadControl"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
+     reinterpret_cast<void*>(&NativeThreadControl)},
+    {const_cast<char*>("nativeGetObjectSize"), const_cast<char*>("(Ljava/lang/Object;)J"),
+     reinterpret_cast<void*>(&NativeGetObjectSize)},
+    {const_cast<char*>("nativeGetTag"), const_cast<char*>("(Ljava/lang/Object;)J"),
+     reinterpret_cast<void*>(&NativeGetTag)},
+    {const_cast<char*>("nativeSetTag"), const_cast<char*>("(Ljava/lang/Object;J)V"),
+     reinterpret_cast<void*>(&NativeSetTag)},
+    {const_cast<char*>("nativeForceGarbageCollection"), const_cast<char*>("()V"),
+     reinterpret_cast<void*>(&NativeForceGarbageCollection)},
+    {const_cast<char*>("nativeSystemProperties"), const_cast<char*>("()[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeSystemProperties)},
 };
 
 } // namespace
@@ -655,11 +1563,48 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         return JNI_ERR;
     }
 
+    jvmtiCapabilities potential{};
+    if (gJvmti->GetPotentialCapabilities(&potential) == JVMTI_ERROR_NONE) {
+        // This bridge intentionally exposes the JVMTI environment. Request every capability
+        // still available in the live phase; unsupported capabilities remain unset.
+        gJvmti->AddCapabilities(&potential);
+    }
     jvmtiCapabilities capabilities{};
-    capabilities.can_retransform_classes = 1;
-    gCanRetransform = gJvmti->AddCapabilities(&capabilities) == JVMTI_ERROR_NONE;
+    if (gJvmti->GetCapabilities(&capabilities) == JVMTI_ERROR_NONE) {
+        gCanRetransform = capabilities.can_retransform_classes != 0;
+    }
     jvmtiEventCallbacks callbacks{};
+    callbacks.VMInit = &VmInit;
+    callbacks.VMDeath = &VmDeath;
+    callbacks.ThreadStart = &ThreadStart;
+    callbacks.ThreadEnd = &ThreadEnd;
     callbacks.ClassFileLoadHook = &ClassFileLoadHook;
+    callbacks.ClassLoad = &ClassLoad;
+    callbacks.ClassPrepare = &ClassPrepare;
+    callbacks.VMStart = &VmStart;
+    callbacks.Exception = &Exception;
+    callbacks.ExceptionCatch = &ExceptionCatch;
+    callbacks.SingleStep = &SingleStep;
+    callbacks.FramePop = &FramePop;
+    callbacks.Breakpoint = &Breakpoint;
+    callbacks.FieldAccess = &FieldAccess;
+    callbacks.FieldModification = &FieldModification;
+    callbacks.MethodEntry = &MethodEntry;
+    callbacks.MethodExit = &MethodExit;
+    callbacks.NativeMethodBind = &NativeMethodBind;
+    callbacks.CompiledMethodLoad = &CompiledMethodLoad;
+    callbacks.CompiledMethodUnload = &CompiledMethodUnload;
+    callbacks.DynamicCodeGenerated = &DynamicCodeGenerated;
+    callbacks.DataDumpRequest = &DataDumpRequest;
+    callbacks.MonitorContendedEnter = &MonitorContendedEnter;
+    callbacks.MonitorContendedEntered = &MonitorContendedEntered;
+    callbacks.MonitorWait = &MonitorWait;
+    callbacks.MonitorWaited = &MonitorWaited;
+    callbacks.GarbageCollectionStart = &GarbageCollectionStart;
+    callbacks.GarbageCollectionFinish = &GarbageCollectionFinish;
+    callbacks.ObjectFree = &ObjectFree;
+    callbacks.VMObjectAlloc = &VmObjectAlloc;
+    callbacks.ResourceExhausted = &ResourceExhausted;
     if (gJvmti->SetEventCallbacks(&callbacks, sizeof(callbacks)) != JVMTI_ERROR_NONE) {
         return JNI_ERR;
     }
@@ -671,10 +1616,52 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     env->DeleteLocalRef(bindingClass);
     if (result != JNI_OK) return JNI_ERR;
     gJavaVm = vm;
+
+    jclass dispatcher = env->FindClass("nhcm/jvmrtdp/remoteside/JvmtiCallbackDispatcher");
+    if (dispatcher == nullptr) return JNI_ERR;
+    gDispatcherClass = static_cast<jclass>(env->NewGlobalRef(dispatcher));
+    gDispatchMethod = env->GetStaticMethodID(dispatcher, "dispatch",
+        "(Ljava/lang/String;Ljava/lang/Thread;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+        "JLjava/lang/Object;JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
+        "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/String;)V");
+    gTransformMethod = env->GetStaticMethodID(dispatcher, "transform",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;Ljava/security/ProtectionDomain;[B)[B");
+    env->DeleteLocalRef(dispatcher);
+    if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) return JNI_ERR;
+    gWorkerStopping.store(false);
+    try {
+        gEventWorker = new std::thread(&EventWorkerMain);
+    } catch (...) {
+        return JNI_ERR;
+    }
     return JNI_VERSION_1_8;
 }
 
-extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
+extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
+    if (gJvmti != nullptr) {
+        jvmtiEventCallbacks callbacks{};
+        gJvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
+    }
+    gWorkerStopping.store(true);
+    {
+        std::lock_guard<std::mutex> guard(gQueueMutex);
+        gEventQueue.clear();
+    }
+    gQueueChanged.notify_all();
+    if (gEventWorker != nullptr) {
+        if (gEventWorker->joinable()) gEventWorker->join();
+        delete gEventWorker;
+        gEventWorker = nullptr;
+    }
+    JNIEnv* env = nullptr;
+    if (vm != nullptr && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) == JNI_OK
+        && env != nullptr && gDispatcherClass != nullptr) {
+        env->DeleteGlobalRef(gDispatcherClass);
+    }
+    gDispatcherClass = nullptr;
+    gDispatchMethod = nullptr;
+    gTransformMethod = nullptr;
+    gClassFileHookEnabled.store(false);
     gCanRetransform = false;
     gJvmti = nullptr;
     gJavaVm = nullptr;

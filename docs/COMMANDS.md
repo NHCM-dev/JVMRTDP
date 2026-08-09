@@ -21,11 +21,17 @@
 set title "string:hello world"
 ```
 
-双引号和反斜杠可用 `\"`、`\\` 转义。未加引号的 `->` 是 pipeline 分隔符：
+双引号和反斜杠可用 `\"`、`\\` 转义。花括号把包含空格的值表达式组成一个参数，表达式可以嵌套。
+
+命令顶层未加引号、且不在 `{...}` 内的 `->` 是临时引用链分隔符：
 
 ```text
 context class com.example.App -> static field INSTANCE -> field service -> value
 ```
+
+每个中间段解析出的 context 只供下一段使用，中间输出被抑制；链结束或抛错时，进入链前的 current
+context、完整 context 栈和书签都会恢复。因此 `->` 不会留下导航状态。链内 `invoke`、`set` 等对目标
+程序造成的副作用不会回滚。
 
 ## 2. Context 改变规则
 
@@ -38,6 +44,7 @@ context class com.example.App -> static field INSTANCE -> field service -> value
 | `construct ...` | 是 | 新对象成为 context |
 | `array get n` | 是 | 数组元素成为 context |
 | `read ...` | 否 | 只打印，临时 handle 随即释放 |
+| `resolve ...` | 否 | 求值并打印字面量、引用或 `{...}` 表达式 |
 | `value` / `debug` / `stats` | 否 | 只输出 |
 | `set ...` / `static set ...` | 否 | 修改对象，但接收者 context 不变 |
 | `find` / `class` / `package` | 否 | 只列出元数据 |
@@ -324,7 +331,8 @@ context pick <index>
 
 ## 8. 字面量和对象参数
 
-方法、构造器和 set 命令支持：
+`invoke`、`construct`、`set`、`static invoke/set`、`array set`、`context value` 和 `code run`
+使用同一套参数语法：
 
 ```text
 null
@@ -334,6 +342,8 @@ float:1.5 | double:2.5
 char:x
 string:text | str:text
 bytes:<base64>
+class:<loaded-class>             # 目标 JVM 中的 java.lang.Class 对象
+enum:<enum-class>:<constant>     # 目标 JVM 中的枚举常量
 123             # 自动 int
 123L            # 自动 long
 1.5             # 自动 double
@@ -348,6 +358,51 @@ $name | @name   # 脚本 workspace 中的命名对象
 ```text
 invoke rename (Ljava/lang/String;)V "string:new display name"
 ```
+
+### 复合值表达式
+
+`{...}` 在参数位置即时解析出一个远程对象，不会选择为 current context，也不会压入 context 栈。
+表达式生成的临时 handle 在外层命令完成后释放。支持以下原子形式：
+
+```text
+{new <class> <descriptor|auto> [arguments ...]}
+{construct <class> <descriptor|auto> [arguments ...]}
+{invoke <receiver> [declaring.Class::]<method> <descriptor> [arguments ...]}
+{call <receiver> [declaring.Class::]<method> <descriptor> [arguments ...]}
+{static <class> <method> <descriptor> [arguments ...]}
+{static invoke <class> <method> <descriptor> [arguments ...]}
+{field <receiver> [declaring.Class::]<field[index]>}
+{static-field <class> [declaring.Class::]<field[index]>}
+{index <array-receiver> <index>}
+```
+
+`receiver` 可以是 `this`/`context`、`$name`/`@name`，也可以是另一段 `{...}`。参数同样可以递归嵌套：
+
+```text
+invoke install (Lcom/example/Service;)V {new com.example.Service (Lcom/example/Config;)V {static com.example.Config load ()Lcom/example/Config;}}
+set service {invoke $factory create (Ljava/lang/String;)Lcom/example/Service; string:main}
+static set com.example.Registry DEFAULT {new com.example.Service auto string:main}
+```
+
+表达式内部也支持一次性 `->` 引用链。根可以是任意对象表达式，或 `type <class>`；后续步骤支持
+`field`、`invoke`/`call`、`index`、`as`、`runtime`，类型根还支持 `construct`。类型接收者上的
+`field`/`invoke` 自动执行静态操作：
+
+```text
+{context -> field service -> invoke status ()Ljava/lang/String;}
+{type com.example.Registry -> field DEFAULT -> field owner}
+{type com.example.Service -> construct (Ljava/lang/String;)V string:main -> invoke start ()Lcom/example/Service;}
+```
+
+复合表达式必须产生非 `void` 对象；`void` 调用不能作为参数。需要单独查看表达式结果时使用：
+
+```text
+resolve <literal|reference|{value-expression}>
+ref {static com.example.Services create ()Lcom/example/Service;}
+eval {context -> field service -> field name}
+```
+
+`resolve`、`ref`、`eval` 等价，均只打印值和类型，不改变 context 或栈。
 
 ## 9. 查看当前值
 
@@ -414,6 +469,8 @@ set field status string:ready
 set com.example.Parent::count int:7
 set owner this
 set index 2 int:9
+set owner {new com.example.Owner ()V}
+set service {static com.example.Services create ()Lcom/example/Service;}
 ```
 
 字段写入后 context 保持为接收者。
@@ -435,6 +492,7 @@ static invoke reset ()V
 static set ENABLED true
 
 static invoke com.example.Tools parse (Ljava/lang/String;)I string:42
+static invoke com.example.Tools use (Lcom/example/Config;)V {static-field com.example.Config DEFAULT}
 ```
 
 `static field` 的结果会成为 context；`static set` 不改变 context。
@@ -451,6 +509,7 @@ invoke [declaring.Class::]<method> <descriptor> [arguments ...]
 invoke size ()I
 invoke rename (Ljava/lang/String;)V string:Ada
 invoke calculate (IF)J int:3 float:1.5
+invoke install (Lcom/example/Service;)V {new com.example.Service auto string:main}
 ```
 
 默认使用 Java 虚分派。指定声明类时调用该类的精确实现：
@@ -475,6 +534,7 @@ construct com.example.User (Ljava/lang/String;I)V string:Ada int:37
 context class com.example.User
 construct (Ljava/lang/String;)V string:Ada
 construct auto string:Ada int:37
+construct com.example.Controller (Lcom/example/Config;)V {static com.example.Config load ()Lcom/example/Config;}
 ```
 
 `auto` 根据参数运行时类型选择构造器；没有匹配或存在歧义时失败。需要稳定结果时应提供 descriptor。
@@ -641,7 +701,7 @@ export build/out/fields.txt class fields
 export append build/out/history.log stats
 ```
 
-导出 pipeline 时把整个 pipeline 放在一个引号参数中，否则外层会先执行 `->`：
+导出临时引用链的输出时，把整条链放在一个引号参数中；否则 `export` 外层会先执行 `->`：
 
 ```text
 export build/out/status.txt "context class com.example.App -> static field INSTANCE -> read status"
@@ -689,7 +749,134 @@ dump package . build/default-package --match *Main*
 
 别名：`dump`。
 
-## 21. 批处理与脚本
+## 21. Java 代码部署与 JVMTI
+
+### 部署源码、项目或方法片段
+
+```text
+code source <name> <file.java|source-directory> [options]
+code methods <name> <binary-class-name> <methods-file> [options]
+```
+
+`source` 会在控制端使用 JDK compiler 编译一个 `.java` 文件，或递归编译目录中的全部 `.java` 文件；因此目录可以是一个
+简单源码项目的 source root。`methods` 文件只写字段/方法声明，JVMRTDP 会生成指定类的 package 和 class 外壳。
+
+```text
+code source hooks D:\hooks\src --classpath D:\app\api.jar --release 8
+code methods utilities demo.InjectedMethods D:\hooks\methods.java --anchor com.example.App --same-loader
+```
+
+通用选项：
+
+- `--anchor <loaded-class>`：使用该已加载类的 ClassLoader 作为目标 loader；默认 system loader。
+- `--child`：在独立的 child-first loader 中定义，默认且最容易关闭。
+- `--same-loader`：通过 JNI `DefineClass` 直接定义到 anchor 的 loader；定义后 JVM 无法卸载或撤销。
+- `--classpath <paths>`：控制端 javac class path，多个路径使用本机 path separator。
+- `--javac <option>`：追加一个 javac token，可重复。
+- `--release <n>`、`-source <n>`、`-target <n>`：编译目标版本；默认 Java 8。
+
+编译结果与 JAR 使用 512 KiB 分块传输，目标端校验声明长度和 SHA-256；单次 bundle/JAR 上限为 256 MiB，
+不受单条命令 8 MiB 字符串上限约束。
+
+### 部署 JAR / AddToClassLoaderSearch
+
+```text
+code jar <name> <file.jar> [--scope child|system|bootstrap] [--anchor <loaded-class>]
+```
+
+- `child`：为 JAR 建立独立 loader，可通过 `code close` 关闭。
+- `system`：调用 JVMTI `AddToSystemClassLoaderSearch`。
+- `bootstrap`：调用 JVMTI `AddToBootstrapClassLoaderSearch`。
+
+system/bootstrap search path 无 JVMTI 撤销 API；关闭 deployment 只释放 JVMRTDP 的记录，已经加入的路径持续到目标 JVM 退出。
+
+### 调用与生命周期
+
+```text
+code list
+code run <deployment-id> <class> <method> <descriptor> static [arguments ...]
+code run <deployment-id> <class> <method> <descriptor> <receiver> [arguments ...]
+code close <deployment-id>
+```
+
+`code run` 的参数使用第 8 节的完整远程参数语法（包括 `{new ...}`、`{invoke ...}`、`{static ...}`
+等复合表达式）。结果成为当前 context。
+关闭 deployment 会自动注销属于它的 callback；child loader 会关闭，same-loader/system/bootstrap 的 JVM 级变更无法回滚。
+
+### Java JVMTI callback 与 transformer
+
+部署代码可以实现以下接口：
+
+```java
+import nhcm.jvmrtdp.api.jvmti.*;
+
+public final class Hook implements JvmtiEventHandler, JvmtiClassFileTransformer {
+    public void onEvent(JvmtiEvent event) {
+        System.out.println(event.type() + " " + event.className()
+                + " " + event.methodName() + event.methodDescriptor());
+    }
+
+    public byte[] transform(JvmtiClassFileEvent event) {
+        // null 表示保留当前 bytes；也可以返回完整的 CA FE BA BE class 文件。
+        return null;
+    }
+}
+```
+
+注册与管理：
+
+```text
+code callback add <deployment-id> <handler-class> <event,event,...> [sync|async]
+code callback remove <callback-id>
+code callback list
+code callback stats
+```
+
+handler 必须有无参数构造器。`sync` 在产生事件的线程上调用；`async` 使用有界队列，适合只观察事件。
+ClassFile transformer 为保证能返回替换 bytes 始终同步执行，并按照 callback 注册顺序串联。统计包含 Java handler 的
+delivered/failed，以及无 `JNIEnv` 原生事件转发队列的 queued/dropped/depth。
+
+完整事件名：
+
+```text
+vm_init, vm_death, vm_start, thread_start, thread_end,
+class_file_load_hook, class_load, class_prepare,
+single_step, frame_pop, breakpoint, field_access, field_modification,
+method_entry, method_exit, exception, exception_catch, native_method_bind,
+compiled_method_load, compiled_method_unload, dynamic_code_generated, data_dump_request,
+monitor_wait, monitor_waited, monitor_contended_enter, monitor_contended_entered,
+resource_exhausted, garbage_collection_start, garbage_collection_finish,
+object_free, vm_object_alloc
+```
+
+`JvmtiEvent` 提供 type/timestamp/thread/class/method/descriptor/location/subject/value，以及 related method、field member、
+secondary subject 和 text 等事件附加参数。`JvmtiClassFileEvent` 另外提供 loader、重定义中的 Class、ProtectionDomain 和
+当前 class bytes。
+
+动态注入在 JVMTI live phase 建立环境；实际可用事件取决于 `jvmti capabilities`。JVM 不允许 live phase 获取的启动期
+capability 会明确返回 `JVMTI_ERROR_MUST_POSSESS_CAPABILITY`，而不是静默伪装成功。
+
+### 其他 JVMTI 操作
+
+```text
+jvmti capabilities
+jvmti events
+jvmti retransform <class>
+jvmti redefine <class> <class-file>
+jvmti breakpoint <set|clear> <class> <method> <descriptor> <location>
+jvmti watch <access|modification> <set|clear> <class> <field> <descriptor>
+jvmti threads [variable-prefix] [limit]
+jvmti thread <state|stack|suspend|resume|interrupt|frame-pop> <thread-object> [depth|max]
+jvmti size <object>
+jvmti tag <object> [new-value]
+jvmti gc
+jvmti properties
+```
+
+`jvmti threads` 把保留的线程保存为 `$prefix0`、`$prefix1`……远程对象。挂起线程可能冻结应用；JVMRTDP 拒绝挂起
+当前命令处理线程。断点、field watch、single-step、frame-pop 等操作也要求对应 capability。
+
+## 22. 批处理与脚本
 
 ### 批处理
 
@@ -697,7 +884,7 @@ dump package . build/default-package --match *Main*
 batch <commands.txt>
 ```
 
-UTF-8 文件每个非空、非 `#` 注释行是一条交互命令。行间共享 context，行内可以使用 pipeline。
+UTF-8 文件每个非空、非 `#` 注释行是一条交互命令。行间共享 context，行内可以使用临时 `->` 引用链。
 遇到会话关闭命令或异常时停止。
 
 ### 流程脚本
@@ -709,7 +896,7 @@ script <file.jrd>
 支持命名 handle、`if`、`ifnull`、`switch`、`goto`、`print`、`export`、`release` 和
 `command` 嵌入交互命令。完整语法见 [SCRIPTING.md](SCRIPTING.md)。
 
-## 22. 连接诊断
+## 23. 连接诊断
 
 ```text
 ping
@@ -725,7 +912,7 @@ version
 - `echo`：验证命令参数编码和传输。
 - `version`：比较控制端、目标 Agent 和协议版本。
 
-## 23. JVM descriptor 速查
+## 24. JVM descriptor 速查
 
 | Java 类型 | descriptor |
 |---|---|
@@ -752,7 +939,7 @@ version
 
 可以先用 `class methods` 或 `find method` 获取准确 descriptor，再用于 `invoke`。
 
-## 24. 常见错误
+## 25. 常见错误
 
 - `No context selected`：先使用 `context class ...` 或 `context static field ...`。
 - `Current context is a class, not an object`：该命令需要实例接收者。

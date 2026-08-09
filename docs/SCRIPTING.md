@@ -83,7 +83,7 @@ Workspace 对象变量和交互 context 是两套不同的引用机制，但共�
 - handle 指令（`construct`、`call`、`get`、`set`）主要使用 `$variable`；
 - `command ...` 执行完整的交互式 context 命令；
 - `context` 关键字在 `print`、`if`、`ifnull`、`export` 中指当前交互 context；
-- `command` 改变的 context 会被后续脚本指令看到；
+- 普通 `command` 改变的 context 会被后续脚本指令看到；含顶层 `->` 的命令使用临时引用链，结束后恢复原 context、栈和书签；
 - 脚本创建的 `$object` 可以作为后续交互命令参数。
 
 ```text
@@ -456,10 +456,18 @@ command set enabled true
 command value --deep 20
 ```
 
-支持 pipeline：
+支持临时 `->` 引用链；链内的中间 context 仅供下一段使用，整行结束后不会改变脚本看到的 context 或栈：
 
 ```text
 command context class com.example.App -> static field INSTANCE -> field service -> read status
+```
+
+交互命令的参数也支持可嵌套 `{...}` 值表达式，因此无需预先创建 workspace 变量就能直接构造或调用：
+
+```text
+command invoke install (Lcom/example/Service;)V {new com.example.Service ()V}
+command set service {static com.example.Services create ()Lcom/example/Service;}
+command resolve {context -> field service -> invoke status ()Ljava/lang/String;}
 ```
 
 `command` 可以调用 `find`、`dump`、`export`、`stats` 等全部公开目标命令。

@@ -18,7 +18,11 @@ JVMRTDP 是面向 Windows x64 的目标 JVM 诊断与对象操作工具。控制
 - 按 package、class、interface、enum、annotation、extends、implements、field、method 检索。
 - 检索支持 `*`、`?` 通配符和结果数量限制。
 - 单类或按包批量 dump；class bytes 始终写入文件。
-- Context 栈、书签、链式 `->` 命令、UTF-8 输出捕获、批处理和 `.jrd` 流程脚本。
+- 将单个 Java 源文件、源码目录/项目、多段方法或 JAR 分块部署到目标 JVM，并调用其中的方法。
+- 支持 child、目标类同 ClassLoader、system 与 bootstrap class path 四种装载语义。
+- 覆盖 JVMTI 1.2 的全部非 reserved 事件回调；Java handler 可接收线程、类、方法、位置、对象、字段和事件附加值。
+- 支持同步/异步 Java 回调、ClassFileLoadHook 字节码转换链、回调统计、断点、字段 watch、重转换/重定义、线程/栈、tag、对象大小和 GC 操作。
+- Context 栈、书签、不会污染栈的临时 `->` 引用链、UTF-8 输出捕获、批处理和 `.jrd` 流程脚本。
 - Prompt 每次显示前都会尝试刷新当前对象的类型、null 状态和 `toString()` 值。
 - Gradle 版本是唯一版本来源；构建时生成 `BuildInfo.java`，CLI、Agent 握手和 manifest 共同引用。
 - 目标 JVM 使用暂存的 Agent JAR，退出控制端后不会继续锁定项目中的原始 JAR。
@@ -97,11 +101,26 @@ invoke status ()Ljava/lang/String;
 value
 ```
 
-未加引号的 `->` 可以把多条命令串联起来；前一条命令产生的新 context 会成为后一条命令的接收者：
+未加引号的 `->` 是一次性引用链：前一段解析出的对象只作为后一段的临时接收者。整条链结束或失败后，
+进入链前的 current context、context 栈和书签都会恢复，中间步骤的输出也不会逐段打印：
 
 ```text
 context class com.example.App -> static field INSTANCE -> field service -> invoke status ()Ljava/lang/String; -> value
 ```
+
+链中的 `invoke`、`set` 等目标程序副作用不会回滚；临时性只针对控制端的 context 导航状态。
+
+所有接受对象参数的命令都支持 `{...}` 值表达式，可以直接构造、调用、读取并嵌套：
+
+```text
+invoke install (Lcom/example/Service;)V {new com.example.Service (Ljava/lang/String;)V string:main}
+set service {static com.example.Services create ()Lcom/example/Service;}
+construct com.example.Controller (Lcom/example/Config;)V {static-field com.example.Config DEFAULT}
+resolve {context -> field service -> invoke status ()Ljava/lang/String;}
+```
+
+`resolve`（别名 `ref`、`eval`）只求值和打印，不改变 context。另有 `class:com.example.Type` 与
+`enum:com.example.Mode:FAST`，用于把目标 JVM 中的 `Class` 对象或枚举常量直接作为参数。
 
 读取字段有两种明确语义：
 
@@ -178,7 +197,7 @@ CPPProjects/JVMRTDP                        目标端 JNI/JVMTI 原生桥
 - `JVMRTDP` / `JRDInjector`：发现 JVM 并建立注入会话。
 - `ServerHandle` / `RemoteJavaVM`：会话和 JVM 根 handle。
 - `RemoteJNIEnv`：类、对象、字段、方法、数组、集合、检索和统计操作。
-- `RemoteJVMTIEnv`：读取并写出 class bytes。
+- `RemoteJVMTIEnv`：JVMTI 操作、Java/JAR 部署、目标代码调用和 callback 生命周期。
 - `RemoteClass` / `RemoteClassInfo`：类元数据、成员与构造器。
 - `RemoteObject` / `RemoteObjectView`：远程对象强引用和指定类型视图。
 - `RemoteField` / `RemoteMethod` / `RemoteConstructor`：成员操作。
@@ -216,5 +235,6 @@ try (ServerHandle server = jvmrtdp.inject(pid)) {
 - 私有成员访问仍可能被 SecurityManager、模块边界或 JVM 实现限制。
 - 只列出当前已经加载的类；搜索和 package 浏览不会主动加载新业务类。
 - 当前原生注入器只构建 Windows x64 版本。
+- 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。某些 VM 的字段 watch、早期 VM 事件等启动期能力只能在以 `-agentpath` 启动时获得，调用不可用能力会返回明确的 JVMTI capability 错误。
 
 完整语法和行为细节见 [命令手册](docs/COMMANDS.md)，脚本控制流见 [脚本语言手册](docs/SCRIPTING.md)。

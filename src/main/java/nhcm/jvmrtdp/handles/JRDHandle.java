@@ -8,6 +8,7 @@ import java.util.Objects;
 import java.util.UUID;
 import nhcm.jvmrtdp.utils.ProcessIds;
 import nhcm.jvmrtdp.remoteside.TargetJvm;
+import nhcm.jvmrtdp.remoteside.TargetCodeService;
 import nhcm.jvmrtdp.remoteside.TargetObjectService;
 
 /**
@@ -20,6 +21,7 @@ public class JRDHandle implements AutoCloseable {
     private final NativeAgent.RuntimeInfo nativeRuntime;
     private final TargetJvm targetJvm;
     private final TargetObjectService targetObjects;
+    private final TargetCodeService targetCode;
 
     public JRDHandle(UUID id) {
         this.id = Objects.requireNonNull(id, "id");
@@ -28,6 +30,7 @@ public class JRDHandle implements AutoCloseable {
         this.nativeRuntime = NativeAgent.runtimeInfo();
         this.targetJvm = new TargetJvm();
         this.targetObjects = new TargetObjectService();
+        this.targetCode = new TargetCodeService(targetObjects);
     }
 
     public UUID id() {
@@ -60,9 +63,20 @@ public class JRDHandle implements AutoCloseable {
         return targetObjects;
     }
 
+    public TargetCodeService targetCode() {
+        if (!nativeRuntime.available()) {
+            throw new IllegalStateException("Target JNI/JVMTI bridge is unavailable: " + nativeRuntime.error());
+        }
+        return targetCode;
+    }
+
     @Override
     public void close() {
-        targetObjects.close();
+        try {
+            targetCode.close();
+        } finally {
+            targetObjects.close();
+        }
     }
 
     public String displayName() {
