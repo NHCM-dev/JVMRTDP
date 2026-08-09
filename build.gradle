@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'nhcm.jvmrtdp'
-version = '1.0.0'
+version = '1.1.0'
 
 java {
     toolchain {
@@ -38,7 +38,7 @@ def java8Launcher = javaToolchains.launcherFor {
 
 tasks.register('buildInjectorNative', Exec) {
     group = 'build'
-    description = 'Builds the x64 Release LoadLibrary injector DLL.'
+    description = 'Builds the x64 Release manual-map/NtCreateThreadEx injector DLL.'
     onlyIf { isWindows }
     inputs.files(fileTree('CPPProjects/Injector') {
         include '**/*.cpp', '**/*.h', '**/*.vcxproj'

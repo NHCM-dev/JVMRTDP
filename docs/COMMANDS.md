@@ -883,6 +883,10 @@ secondary subject 和 text 等事件附加参数。`JvmtiClassFileEvent` 另外�
 capability 会明确指出所需 capability。要获得 MethodEntry/MethodExit 等 OnLoad-only capability，使用启动模式并把
 JVMRTDP JAR 放入 system class path：
 
+Windows x64 控制端使用 Manual Map 和 `NtCreateThreadEx` 装入 bootstrap DLL；进入目标进程后仍通过
+`JNI_GetCreatedJavaVMs`、`AttachCurrentThread` 和 `JavaVM.GetEnv(JVMTI_VERSION_1_2)` 接入现有 JVM。
+Manual Map 只改变 DLL 进入目标进程的方式，不改变上述 live-phase capability 限制。
+
 ```text
 java -agentpath:C:\path\jvmrtdp-agent.dll -cp JVMRTDP.jar;application.jar application.Main
 ```

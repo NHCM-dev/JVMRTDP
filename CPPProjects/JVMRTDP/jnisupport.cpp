@@ -22,7 +22,12 @@
 
 namespace {
 
-constexpr std::string_view kBindingClass = "nhcm/jvmrtdp/agent/NativeAgent";
+constexpr std::string_view kRuntimeBindingClass =
+    "nhcm/jvmrtdp/agent/nativebridge/NativeRuntimeBridge";
+constexpr std::string_view kJniBindingClass =
+    "nhcm/jvmrtdp/agent/nativebridge/NativeJniBridge";
+constexpr std::string_view kJvmtiBindingClass =
+    "nhcm/jvmrtdp/agent/nativebridge/NativeJvmtiBridge";
 constexpr jint kAccStatic = 0x0008;
 constexpr jint kAccNative = 0x0100;
 constexpr jint kMethodFlagStatic = 1;
@@ -1835,72 +1840,78 @@ jobjectArray JNICALL NativeSystemProperties(JNIEnv* env, jclass) {
     return NewStringArray(env, values);
 }
 
-JNINativeMethod kMethods[] = {
-    {const_cast<char*>("nativeVersion"), const_cast<char*>("()Ljava/lang/String;"),
+JNINativeMethod kRuntimeMethods[] = {
+    {const_cast<char*>("version"), const_cast<char*>("()Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeVersion)},
-    {const_cast<char*>("nativeJvmtiVersion"), const_cast<char*>("()I"),
+    {const_cast<char*>("jvmtiVersion"), const_cast<char*>("()I"),
      reinterpret_cast<void*>(&NativeJvmtiVersion)},
-    {const_cast<char*>("nativeGetClassBytes"), const_cast<char*>("(Ljava/lang/String;)[B"),
-     reinterpret_cast<void*>(&NativeGetClassBytes)},
-    {const_cast<char*>("nativeReadStaticFields"), const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
+};
+
+JNINativeMethod kJniMethods[] = {
+    {const_cast<char*>("readStaticFields"), const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeReadStaticFields)},
-    {const_cast<char*>("nativeReadStaticField"),
+    {const_cast<char*>("readStaticField"),
      const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeReadStaticField)},
-    {const_cast<char*>("nativeCallStaticMethod"),
+    {const_cast<char*>("callStaticMethod"),
      const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCallStaticMethod)},
-    {const_cast<char*>("nativeFindLoadedClass"),
+    {const_cast<char*>("findLoadedClass"),
      const_cast<char*>("(Ljava/lang/String;)Ljava/lang/Class;"),
      reinterpret_cast<void*>(&NativeFindLoadedClass)},
-    {const_cast<char*>("nativeListLoadedClassNames"), const_cast<char*>("()[Ljava/lang/String;"),
+    {const_cast<char*>("listLoadedClassNames"), const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeListLoadedClassNames)},
-    {const_cast<char*>("nativeListLoadedClasses"), const_cast<char*>("()[Ljava/lang/Class;"),
+    {const_cast<char*>("listLoadedClasses"), const_cast<char*>("()[Ljava/lang/Class;"),
      reinterpret_cast<void*>(&NativeListLoadedClasses)},
-    {const_cast<char*>("nativeDefineClass"),
+    {const_cast<char*>("defineClass"),
      const_cast<char*>("(Ljava/lang/String;[BLjava/lang/ClassLoader;)Ljava/lang/Class;"),
      reinterpret_cast<void*>(&NativeDefineClass)},
-    {const_cast<char*>("nativeAddToClassLoaderSearch"),
+};
+
+JNINativeMethod kJvmtiMethods[] = {
+    {const_cast<char*>("getClassBytes"), const_cast<char*>("(Ljava/lang/String;)[B"),
+     reinterpret_cast<void*>(&NativeGetClassBytes)},
+    {const_cast<char*>("addToClassLoaderSearch"),
      const_cast<char*>("(Ljava/lang/String;Z)V"),
      reinterpret_cast<void*>(&NativeAddToClassLoaderSearch)},
-    {const_cast<char*>("nativeSetEventNotification"),
+    {const_cast<char*>("setEventNotification"),
      const_cast<char*>("(Ljava/lang/String;Z)V"),
      reinterpret_cast<void*>(&NativeSetEventNotification)},
-    {const_cast<char*>("nativeSetBreakpoint"),
+    {const_cast<char*>("setBreakpoint"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZ)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
-    {const_cast<char*>("nativeSetFieldWatch"),
+    {const_cast<char*>("setFieldWatch"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZ)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatch)},
-    {const_cast<char*>("nativeNotifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
+    {const_cast<char*>("notifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeNotifyFramePop)},
-    {const_cast<char*>("nativeEventQueueStatistics"), const_cast<char*>("()[J"),
+    {const_cast<char*>("eventQueueStatistics"), const_cast<char*>("()[J"),
      reinterpret_cast<void*>(&NativeEventQueueStatistics)},
-    {const_cast<char*>("nativeRetransformClass"), const_cast<char*>("(Ljava/lang/Class;)V"),
+    {const_cast<char*>("retransformClass"), const_cast<char*>("(Ljava/lang/Class;)V"),
      reinterpret_cast<void*>(&NativeRetransformClass)},
-    {const_cast<char*>("nativeRedefineClass"), const_cast<char*>("(Ljava/lang/Class;[B)V"),
+    {const_cast<char*>("redefineClass"), const_cast<char*>("(Ljava/lang/Class;[B)V"),
      reinterpret_cast<void*>(&NativeRedefineClass)},
-    {const_cast<char*>("nativeCapabilities"), const_cast<char*>("()Ljava/lang/String;"),
+    {const_cast<char*>("capabilities"), const_cast<char*>("()Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCapabilities)},
-    {const_cast<char*>("nativeCapabilityStatuses"), const_cast<char*>("()[Ljava/lang/String;"),
+    {const_cast<char*>("capabilityStatuses"), const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCapabilityStatuses)},
-    {const_cast<char*>("nativeGetAllThreads"), const_cast<char*>("()[Ljava/lang/Thread;"),
+    {const_cast<char*>("getAllThreads"), const_cast<char*>("()[Ljava/lang/Thread;"),
      reinterpret_cast<void*>(&NativeGetAllThreads)},
-    {const_cast<char*>("nativeGetThreadState"), const_cast<char*>("(Ljava/lang/Thread;)I"),
+    {const_cast<char*>("getThreadState"), const_cast<char*>("(Ljava/lang/Thread;)I"),
      reinterpret_cast<void*>(&NativeGetThreadState)},
-    {const_cast<char*>("nativeGetStackTrace"), const_cast<char*>("(Ljava/lang/Thread;I)[Ljava/lang/String;"),
+    {const_cast<char*>("getStackTrace"), const_cast<char*>("(Ljava/lang/Thread;I)[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeGetStackTrace)},
-    {const_cast<char*>("nativeThreadControl"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
+    {const_cast<char*>("threadControl"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeThreadControl)},
-    {const_cast<char*>("nativeGetObjectSize"), const_cast<char*>("(Ljava/lang/Object;)J"),
+    {const_cast<char*>("getObjectSize"), const_cast<char*>("(Ljava/lang/Object;)J"),
      reinterpret_cast<void*>(&NativeGetObjectSize)},
-    {const_cast<char*>("nativeGetTag"), const_cast<char*>("(Ljava/lang/Object;)J"),
+    {const_cast<char*>("getTag"), const_cast<char*>("(Ljava/lang/Object;)J"),
      reinterpret_cast<void*>(&NativeGetTag)},
-    {const_cast<char*>("nativeSetTag"), const_cast<char*>("(Ljava/lang/Object;J)V"),
+    {const_cast<char*>("setTag"), const_cast<char*>("(Ljava/lang/Object;J)V"),
      reinterpret_cast<void*>(&NativeSetTag)},
-    {const_cast<char*>("nativeForceGarbageCollection"), const_cast<char*>("()V"),
+    {const_cast<char*>("forceGarbageCollection"), const_cast<char*>("()V"),
      reinterpret_cast<void*>(&NativeForceGarbageCollection)},
-    {const_cast<char*>("nativeSystemProperties"), const_cast<char*>("()[Ljava/lang/String;"),
+    {const_cast<char*>("systemProperties"), const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeSystemProperties)},
 };
 
@@ -1989,26 +2000,39 @@ jclass LoadSystemClass(JNIEnv* env, const char* binaryName) {
     return result;
 }
 
-bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
-    if (gDispatcherClass != nullptr && gDispatchMethod != nullptr && gTransformMethod != nullptr) return true;
-    if (vm == nullptr || env == nullptr) return false;
-    jclass bindingClass = preloadedAgent
-        ? LoadSystemClass(env, "nhcm.jvmrtdp.agent.NativeAgent")
-        : env->FindClass(kBindingClass.data());
+jclass LoadBindingClass(JNIEnv* env, std::string_view internalName, bool preloadedAgent) {
+    if (!preloadedAgent) return env->FindClass(internalName.data());
+    std::string binaryName(internalName);
+    std::replace(binaryName.begin(), binaryName.end(), '/', '.');
+    return LoadSystemClass(env, binaryName.c_str());
+}
+
+bool RegisterNativeGroup(JNIEnv* env, bool preloadedAgent, std::string_view className,
+        JNINativeMethod* methods, jint methodCount) {
+    jclass bindingClass = LoadBindingClass(env, className, preloadedAgent);
     if (bindingClass == nullptr) {
         if (preloadedAgent && env->ExceptionCheck()) env->ExceptionClear();
         return false;
     }
+    const jint result = env->RegisterNatives(bindingClass, methods, methodCount);
+    env->DeleteLocalRef(bindingClass);
+    return result == JNI_OK;
+}
+
+bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
+    if (gDispatcherClass != nullptr && gDispatchMethod != nullptr && gTransformMethod != nullptr) return true;
+    if (vm == nullptr || env == nullptr) return false;
     if (preloadedAgent) SetPreloadedAgentProperty(env);
     if (env->ExceptionCheck() || !CacheCallbackTypes(env)) {
         if (preloadedAgent && env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(bindingClass);
         return false;
     }
-    const jint registration = env->RegisterNatives(
-        bindingClass, kMethods, static_cast<jint>(sizeof(kMethods) / sizeof(kMethods[0])));
-    env->DeleteLocalRef(bindingClass);
-    if (registration != JNI_OK) return false;
+    if (!RegisterNativeGroup(env, preloadedAgent, kRuntimeBindingClass, kRuntimeMethods,
+            static_cast<jint>(sizeof(kRuntimeMethods) / sizeof(kRuntimeMethods[0])))
+        || !RegisterNativeGroup(env, preloadedAgent, kJniBindingClass, kJniMethods,
+            static_cast<jint>(sizeof(kJniMethods) / sizeof(kJniMethods[0])))
+        || !RegisterNativeGroup(env, preloadedAgent, kJvmtiBindingClass, kJvmtiMethods,
+            static_cast<jint>(sizeof(kJvmtiMethods) / sizeof(kJvmtiMethods[0])))) return false;
     gJavaVm = vm;
 
     jclass dispatcher = preloadedAgent

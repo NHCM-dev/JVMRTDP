@@ -193,6 +193,13 @@ CPPProjects/Injector                       Windows x64 注入器和进程信息�
 CPPProjects/JVMRTDP                        目标端 JNI/JVMTI 原生桥
 ```
 
+Windows x64 动态注入会把 `jvmrtdp-injector.dll` 作为 PE 映像手动映射到目标进程，处理重定位、
+imports、TLS callback、x64 unwind function table 和 section protection，再通过 `NtCreateThreadEx`
+调用 DLL 入口及 `JVMRTDP_Bootstrap`；产品 DLL 本身不经过 `LoadLibraryW`。缺失的系统依赖仍可能由
+映射器在目标进程中加载。目标端 native 方法按职责注册到
+`nhcm.jvmrtdp.agent.nativebridge` 下的 Runtime、JNI、JVMTI 三个 binding 类，原有 `NativeAgent`
+作为兼容 facade 保持公开 API 不变。
+
 核心对象关系：
 
 - `JVMRTDP` / `JRDInjector`：发现 JVM 并建立注入会话。

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "bootstrap.h"
+#include "injection/manual_mapper.h"
 
 #include <jni.h>
 #include <TlHelp32.h>
@@ -13,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <winternl.h>
 
 namespace {
 
@@ -269,6 +272,34 @@ bool WriteRemote(HANDLE process, LPVOID destination, const void* source, SIZE_T 
     return WriteProcessMemory(process, destination, source, size, &written) != FALSE && written == size;
 }
 
+HANDLE StartRemoteThread(HANDLE process, LPTHREAD_START_ROUTINE start, void* argument) {
+    using NtCreateThreadExFunction = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE,
+        PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+    const auto createThread = reinterpret_cast<NtCreateThreadExFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
+    if (createThread == nullptr || start == nullptr) return nullptr;
+    HANDLE thread = nullptr;
+    const NTSTATUS status = createThread(&thread, THREAD_ALL_ACCESS, nullptr, process,
+        reinterpret_cast<void*>(start), argument, 0, 0, 0, 0, nullptr);
+    return status >= 0 ? thread : nullptr;
+}
+
+std::uintptr_t PublishedInjectorBase(HANDLE process, DWORD pid) {
+    wchar_t name[96]{};
+    swprintf_s(name, L"Local\\JVMRTDP.Injector.%08lx", pid);
+    Handle mapping(OpenFileMappingW(FILE_MAP_READ, FALSE, name));
+    if (!mapping) return 0;
+    void* view = MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, sizeof(std::uintptr_t));
+    if (view == nullptr) return 0;
+    const std::uintptr_t base = *static_cast<const std::uintptr_t*>(view);
+    UnmapViewOfFile(view);
+    if (base == 0) return 0;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQueryEx(process, reinterpret_cast<const void*>(base), &memory, sizeof(memory)) != sizeof(memory)
+        || memory.State != MEM_COMMIT || reinterpret_cast<std::uintptr_t>(memory.AllocationBase) != base) return 0;
+    return base;
+}
+
 jlong JNICALL NativeCurrentProcessId(JNIEnv*, jclass) noexcept {
     return static_cast<jlong>(GetCurrentProcessId());
 }
@@ -392,38 +423,19 @@ void JNICALL NativeInject(JNIEnv* env, jclass, jlong pidValue, jstring dllPathVa
         return;
     }
 
-    const SIZE_T dllBytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    RemoteMemory remoteDllPath(process.get(), dllBytes);
-    if (remoteDllPath.get() == nullptr || !WriteRemote(process.get(), remoteDllPath.get(), dllPath.c_str(), dllBytes)) {
-        ThrowInjectionException(env, WindowsError(L"Cannot write the injector DLL path to the target process"));
-        return;
+    const DWORD nativeTimeout = static_cast<DWORD>(std::min<jlong>(timeoutMillis, MAXDWORD - 1));
+    std::uintptr_t remoteInjector = PublishedInjectorBase(process.get(), pid);
+    if (remoteInjector == 0) {
+        jvmrtdp::injection::ManualMapResult mapped{};
+        std::wstring mappingError;
+        if (!jvmrtdp::injection::ManualMapLibrary(
+                process.get(), pid, dllPath, nativeTimeout, &mapped, &mappingError)) {
+            ThrowInjectionException(env, mappingError.empty()
+                ? L"Cannot manually map the injector DLL" : mappingError);
+            return;
+        }
+        remoteInjector = reinterpret_cast<std::uintptr_t>(mapped.remoteImage);
     }
-
-    FARPROC localLoadLibrary = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-    LPTHREAD_START_ROUTINE remoteLoadLibrary = localLoadLibrary == nullptr
-        ? nullptr : ResolveRemoteProcedure(pid, localLoadLibrary);
-    if (remoteLoadLibrary == nullptr) {
-        ThrowInjectionException(env, L"Cannot resolve LoadLibraryW in the target process");
-        return;
-    }
-    Handle loadThread(CreateRemoteThread(process.get(), nullptr, 0, remoteLoadLibrary, remoteDllPath.get(), 0, nullptr));
-    if (!loadThread) {
-        ThrowInjectionException(env, WindowsError(L"Cannot create the remote LoadLibraryW thread"));
-        return;
-    }
-    DWORD wait = WaitForSingleObject(loadThread.get(), static_cast<DWORD>(std::min<jlong>(timeoutMillis, MAXDWORD - 1)));
-    if (wait != WAIT_OBJECT_0) {
-        ThrowInjectionException(env, wait == WAIT_TIMEOUT
-            ? L"Timed out while loading the injector DLL" : WindowsError(L"Waiting for LoadLibraryW failed"));
-        return;
-    }
-    DWORD loadResult = 0;
-    if (!GetExitCodeThread(loadThread.get(), &loadResult) || loadResult == 0) {
-        ThrowInjectionException(env, L"LoadLibraryW failed in the target process");
-        return;
-    }
-
-    const std::uintptr_t remoteInjector = FindRemoteModule(pid, dllPath, true);
     HMODULE localInjector = nullptr;
     if (remoteInjector == 0 || !GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -448,13 +460,12 @@ void JNICALL NativeInject(JNIEnv* env, jclass, jlong pidValue, jstring dllPathVa
         return;
     }
 
-    Handle bootstrapThread(CreateRemoteThread(
-        process.get(), nullptr, 0, remoteBootstrap, remoteParameters.get(), 0, nullptr));
+    Handle bootstrapThread(StartRemoteThread(process.get(), remoteBootstrap, remoteParameters.get()));
     if (!bootstrapThread) {
-        ThrowInjectionException(env, WindowsError(L"Cannot create the remote JVM bootstrap thread"));
+        ThrowInjectionException(env, WindowsError(L"Cannot create the remote JVM bootstrap thread with NtCreateThreadEx"));
         return;
     }
-    wait = WaitForSingleObject(bootstrapThread.get(), static_cast<DWORD>(std::min<jlong>(timeoutMillis, MAXDWORD - 1)));
+    DWORD wait = WaitForSingleObject(bootstrapThread.get(), nativeTimeout);
     if (wait == WAIT_TIMEOUT) {
         remoteParameters.release(); // The target thread still owns this memory.
         ThrowInjectionException(env, L"Timed out while starting JVMRTDP inside the target JVM");
