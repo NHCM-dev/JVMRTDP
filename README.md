@@ -243,7 +243,7 @@ try (ServerHandle server = jvmrtdp.inject(pid)) {
 - 私有成员访问仍可能被 SecurityManager、模块边界或 JVM 实现限制。
 - 只列出当前已经加载的类；搜索和 package 浏览不会主动加载新业务类。
 - 当前原生注入器只构建 Windows x64 版本。
-- 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。`jvmti capability-status` 会完整显示每个 JVMTI 1.2 capability 的 enabled/potential 状态。MethodEntry/MethodExit 等启动期能力可通过 `-agentpath` 模式在 `Agent_OnLoad` 获取；不可用能力会返回包含 capability 名称和启动建议的明确错误。
+- 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。`jvmti capability-status` 会完整显示每个 JVMTI 1.2 capability 的 enabled/potential 状态。MethodEntry/MethodExit 等启动期能力可通过 `-agentpath` 模式在 `Agent_OnLoad` 获取；之后仍可正常 `attach`，注入器会把隔离 ClassLoader 绑定到同一个预加载 native agent（DLL 与 JAR 必须来自同一次构建）。不可用能力会返回包含 capability 名称和启动建议的明确错误。
 - capability 可以在运行时按名称申请或释放：`jvmti capability add <name...>`、
   `jvmti capability relinquish <name...>`。释放后只有仍为 potential 的能力才能重新申请；
   live phase 无法强制补齐 OnLoad-only 初始化。

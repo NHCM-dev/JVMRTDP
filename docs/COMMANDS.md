@@ -891,7 +891,18 @@ Manual Map 只改变 DLL 进入目标进程的方式，不改变上述 live-phas
 java -agentpath:C:\path\jvmrtdp-agent.dll -cp JVMRTDP.jar;application.jar application.Main
 ```
 
-原生 agent 在 `Agent_OnLoad` 请求该 VM 当时提供的全部 JVMTI 1.2 capability，并在 `VMInit` 绑定 Java dispatcher。
+也可以只在启动参数中加载 native agent，应用类路径不必包含 JVMRTDP JAR：
+
+```text
+java -agentpath:C:\path\jvmrtdp-agent.dll -jar application.jar
+```
+
+之后照常从控制端执行 `attach <pid>`。注入器会把 attach 创建的隔离 ClassLoader
+绑定到启动期的同一个 native agent/JVMTI environment，从而保留 OnLoad 阶段取得的
+MethodEntry、MethodExit 等 capability。DLL 与控制端 JAR 必须来自同一次构建。
+
+原生 agent 在 `Agent_OnLoad` 请求该 VM 当时提供的全部 JVMTI 1.2 capability。若 JVMRTDP Java 类已在
+系统类路径中，会在 `VMInit` 绑定 dispatcher；否则在后续 attach 时绑定注入器的隔离 ClassLoader。
 
 ### 其他 JVMTI 操作
 
@@ -1009,3 +1020,9 @@ version
 - `limit must be between 1 and 10000`：缩小或修正 limit。
 - 找不到预期类：JVMRTDP 只搜索当前已经加载的类。
 - 参数包含空格：使用双引号包住完整 token。
+
+## 26. 对象摘要大小
+
+对象摘要会自动显示容器大小：数组、`Collection` 和 `Map` 使用 `[size=N]`；不属于
+`Collection` 的普通 `Iterable` 没有安全的标准 size 操作，因此显示 `[size=unknown]`，
+不会为了展示而消费、遍历或卡在无限迭代器上。

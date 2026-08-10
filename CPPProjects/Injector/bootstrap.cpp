@@ -2,6 +2,7 @@
 #include "bootstrap.h"
 
 #include <jni.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cwchar>
@@ -72,7 +73,59 @@ bool CheckJava(JNIEnv* env, BootstrapParameters* parameters, const wchar_t* oper
     return false;
 }
 
-bool StartJavaServer(JNIEnv* env, BootstrapParameters* parameters) {
+using InitializePreloadedBridgeFunction = jint(JNICALL*)(JavaVM*, JNIEnv*, jobject);
+
+InitializePreloadedBridgeFunction FindPreloadedBridge(bool* incompatibleAgentFound) {
+    if (incompatibleAgentFound != nullptr) *incompatibleAgentFound = false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return nullptr;
+
+    InitializePreloadedBridgeFunction result = nullptr;
+    MODULEENTRY32W module{};
+    module.dwSize = sizeof(module);
+    if (Module32FirstW(snapshot, &module)) {
+        do {
+            FARPROC entry = GetProcAddress(module.hModule, "JVMRTDP_InitializeJavaBridge");
+            if (entry != nullptr) {
+                result = reinterpret_cast<InitializePreloadedBridgeFunction>(entry);
+                break;
+            }
+            if (incompatibleAgentFound != nullptr
+                && _wcsicmp(module.szModule, L"jvmrtdp-agent.dll") == 0) {
+                *incompatibleAgentFound = true;
+            }
+        } while (Module32NextW(snapshot, &module));
+    }
+    CloseHandle(snapshot);
+    return result;
+}
+
+bool BindPreloadedAgentBridge(JavaVM* vm, JNIEnv* env, jobject loader,
+        BootstrapParameters* parameters) {
+    bool incompatibleAgentFound = false;
+    InitializePreloadedBridgeFunction initialize = FindPreloadedBridge(&incompatibleAgentFound);
+    if (initialize == nullptr) {
+        if (incompatibleAgentFound) {
+            SetError(parameters, BootstrapStatus::JavaBootstrapFailed,
+                L"A startup-loaded jvmrtdp-agent.dll is incompatible with this JVMRTDP JAR; "
+                L"restart the target with the agent DLL from the same build");
+            return false;
+        }
+        return true;
+    }
+
+    const jint result = initialize(vm, env, loader);
+    if (result == JNI_OK) return true;
+    if (env->ExceptionCheck()) {
+        return CheckJava(env, parameters, L"Cannot bind the preloaded JVMTI agent to the attach class loader");
+    }
+    SetError(parameters, BootstrapStatus::JavaBootstrapFailed,
+        L"The startup-loaded JVMTI agent rejected the attach class loader; use the agent DLL and JAR from the same build");
+    return false;
+}
+
+bool StartJavaServer(JavaVM* vm, JNIEnv* env, BootstrapParameters* parameters) {
     jclass fileClass = env->FindClass("java/io/File");
     if (!CheckJava(env, parameters, L"Cannot resolve java.io.File") || fileClass == nullptr) {
         return false;
@@ -121,6 +174,9 @@ bool StartJavaServer(JNIEnv* env, BootstrapParameters* parameters) {
     jobject loader = loaderConstructor == nullptr ? nullptr
         : env->NewObject(urlClassLoaderClass, loaderConstructor, urls, nullptr);
     if (!CheckJava(env, parameters, L"Cannot create the JVMRTDP class loader") || loader == nullptr) {
+        return false;
+    }
+    if (!BindPreloadedAgentBridge(vm, env, loader, parameters)) {
         return false;
     }
 
@@ -202,7 +258,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI JVMRTDP_Bootstrap(
         return static_cast<DWORD>(BootstrapStatus::AttachThreadFailed);
     }
 
-    const bool started = StartJavaServer(env, parameters);
+    const bool started = StartJavaServer(javaVm, env, parameters);
     if (attachedHere) {
         javaVm->DetachCurrentThread();
     }

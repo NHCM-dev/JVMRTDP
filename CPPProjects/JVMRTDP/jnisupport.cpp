@@ -93,7 +93,8 @@ std::atomic<jlong> gNativeQueued{0};
 std::atomic<jlong> gNativeDropped{0};
 
 jobjectArray NewStringArray(JNIEnv* env, const std::vector<std::string>& values);
-bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent);
+bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent, jobject classLoader = nullptr);
+void ReleaseCallbackTypes(JNIEnv* env);
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) return {};
@@ -134,6 +135,13 @@ std::string ConsumeJavaException(JNIEnv* env) {
 }
 
 bool CacheCallbackTypes(JNIEnv* env) {
+    bool complete = gObjectClass != nullptr;
+    for (const BoxingType& boxing : gBoxingTypes) {
+        complete = complete && boxing.klass != nullptr && boxing.valueOf != nullptr;
+    }
+    if (complete) return true;
+    if (gObjectClass != nullptr) ReleaseCallbackTypes(env);
+
     jclass objectClass = env->FindClass("java/lang/Object");
     if (objectClass == nullptr) return false;
     gObjectClass = static_cast<jclass>(env->NewGlobalRef(objectClass));
@@ -811,7 +819,7 @@ FieldDetails DescribeField(jclass klass, jfieldID field) {
 
 void JNICALL VmInit(jvmtiEnv*, JNIEnv* env, jthread thread) {
     if (gLoadedAsJvmtiAgent.load() && gDispatcherClass == nullptr) {
-        InitializeJavaBridge(gJavaVm, env, true);
+        InitializeJavaBridge(gJavaVm, env, true, nullptr);
     }
     DispatchEvent(env, "vm_init", thread, nullptr, nullptr, 0, nullptr, 0);
 }
@@ -2653,18 +2661,35 @@ jclass LoadSystemClass(JNIEnv* env, const char* binaryName) {
     return result;
 }
 
-jclass LoadBindingClass(JNIEnv* env, std::string_view internalName, bool preloadedAgent) {
-    if (!preloadedAgent) return env->FindClass(internalName.data());
+jclass LoadClassWithLoader(JNIEnv* env, jobject loader, const char* binaryName) {
+    if (loader == nullptr) return nullptr;
+    jclass loaderClass = env->FindClass("java/lang/ClassLoader");
+    jmethodID loadClass = loaderClass == nullptr ? nullptr : env->GetMethodID(
+        loaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = loadClass == nullptr ? nullptr : env->NewStringUTF(binaryName);
+    jclass result = name == nullptr ? nullptr : static_cast<jclass>(
+        env->CallObjectMethod(loader, loadClass, name));
+    if (name != nullptr) env->DeleteLocalRef(name);
+    if (loaderClass != nullptr) env->DeleteLocalRef(loaderClass);
+    return result;
+}
+
+jclass LoadBindingClass(JNIEnv* env, std::string_view internalName, bool preloadedAgent,
+        jobject classLoader) {
     std::string binaryName(internalName);
     std::replace(binaryName.begin(), binaryName.end(), '/', '.');
+    if (classLoader != nullptr) return LoadClassWithLoader(env, classLoader, binaryName.c_str());
+    if (!preloadedAgent) return env->FindClass(internalName.data());
     return LoadSystemClass(env, binaryName.c_str());
 }
 
 bool RegisterNativeGroup(JNIEnv* env, bool preloadedAgent, std::string_view className,
-        JNINativeMethod* methods, jint methodCount) {
-    jclass bindingClass = LoadBindingClass(env, className, preloadedAgent);
+        JNINativeMethod* methods, jint methodCount, jobject classLoader) {
+    jclass bindingClass = LoadBindingClass(env, className, preloadedAgent, classLoader);
     if (bindingClass == nullptr) {
-        if (preloadedAgent && env->ExceptionCheck()) env->ExceptionClear();
+        // Missing application classes during VMInit is expected when only -agentpath is used.
+        // An explicit attach class loader, however, should retain its exception for diagnostics.
+        if (preloadedAgent && classLoader == nullptr && env->ExceptionCheck()) env->ExceptionClear();
         return false;
     }
     const jint result = env->RegisterNatives(bindingClass, methods, methodCount);
@@ -2672,8 +2697,7 @@ bool RegisterNativeGroup(JNIEnv* env, bool preloadedAgent, std::string_view clas
     return result == JNI_OK;
 }
 
-bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
-    if (gDispatcherClass != nullptr && gDispatchMethod != nullptr && gTransformMethod != nullptr) return true;
+bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent, jobject classLoader) {
     if (vm == nullptr || env == nullptr) return false;
     if (preloadedAgent) SetPreloadedAgentProperty(env);
     if (env->ExceptionCheck() || !CacheCallbackTypes(env)) {
@@ -2681,28 +2705,32 @@ bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
         return false;
     }
     if (!RegisterNativeGroup(env, preloadedAgent, kRuntimeBindingClass, kRuntimeMethods,
-            static_cast<jint>(sizeof(kRuntimeMethods) / sizeof(kRuntimeMethods[0])))
+            static_cast<jint>(sizeof(kRuntimeMethods) / sizeof(kRuntimeMethods[0])), classLoader)
         || !RegisterNativeGroup(env, preloadedAgent, kJniBindingClass, kJniMethods,
-            static_cast<jint>(sizeof(kJniMethods) / sizeof(kJniMethods[0])))
+            static_cast<jint>(sizeof(kJniMethods) / sizeof(kJniMethods[0])), classLoader)
         || !RegisterNativeGroup(env, preloadedAgent, kJvmtiBindingClass, kJvmtiMethods,
-            static_cast<jint>(sizeof(kJvmtiMethods) / sizeof(kJvmtiMethods[0])))) return false;
+            static_cast<jint>(sizeof(kJvmtiMethods) / sizeof(kJvmtiMethods[0])), classLoader)) return false;
     gJavaVm = vm;
 
-    jclass dispatcher = preloadedAgent
-        ? LoadSystemClass(env, "nhcm.jvmrtdp.remoteside.JvmtiCallbackDispatcher")
-        : env->FindClass("nhcm/jvmrtdp/remoteside/JvmtiCallbackDispatcher");
-    if (dispatcher == nullptr) return false;
-    gDispatcherClass = static_cast<jclass>(env->NewGlobalRef(dispatcher));
-    gDispatchMethod = env->GetStaticMethodID(dispatcher, "dispatch",
-        "(Ljava/lang/String;Ljava/lang/Thread;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
-        "JLjava/lang/Object;JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
-        "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/String;"
-        "Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;[I"
-        "[Ljava/lang/String;ILjava/lang/Object;)V");
-    gTransformMethod = env->GetStaticMethodID(dispatcher, "transform",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;Ljava/security/ProtectionDomain;[B)[B");
-    env->DeleteLocalRef(dispatcher);
-    if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) return false;
+    if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) {
+        jclass dispatcher = classLoader != nullptr
+            ? LoadClassWithLoader(env, classLoader, "nhcm.jvmrtdp.remoteside.JvmtiCallbackDispatcher")
+            : (preloadedAgent
+                ? LoadSystemClass(env, "nhcm.jvmrtdp.remoteside.JvmtiCallbackDispatcher")
+                : env->FindClass("nhcm/jvmrtdp/remoteside/JvmtiCallbackDispatcher"));
+        if (dispatcher == nullptr) return false;
+        gDispatcherClass = static_cast<jclass>(env->NewGlobalRef(dispatcher));
+        gDispatchMethod = env->GetStaticMethodID(dispatcher, "dispatch",
+            "(Ljava/lang/String;Ljava/lang/Thread;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+            "JLjava/lang/Object;JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
+            "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/String;"
+            "Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;[I"
+            "[Ljava/lang/String;ILjava/lang/Object;)V");
+        gTransformMethod = env->GetStaticMethodID(dispatcher, "transform",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;Ljava/security/ProtectionDomain;[B)[B");
+        env->DeleteLocalRef(dispatcher);
+        if (gDispatcherClass == nullptr || gDispatchMethod == nullptr || gTransformMethod == nullptr) return false;
+    }
     if (gEventWorker == nullptr) {
         gWorkerStopping.store(false);
         try {
@@ -2715,6 +2743,15 @@ bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent) {
 }
 
 } // namespace
+
+// Called by the manual-map injector when this DLL was loaded at VM startup with -agentpath.
+// It binds the Java classes from the injector's isolated URLClassLoader to the original
+// OnLoad JVMTI environment, preserving capabilities that cannot be acquired in LIVE phase.
+extern "C" JNIEXPORT jint JNICALL JVMRTDP_InitializeJavaBridge(
+        JavaVM* vm, JNIEnv* env, jobject classLoader) {
+    if (!gLoadedAsJvmtiAgent.load() || classLoader == nullptr) return JNI_ERR;
+    return InitializeJavaBridge(vm, env, true, classLoader) ? JNI_OK : JNI_ERR;
+}
 
 extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char*, void*) {
     if (vm == nullptr || vm->GetEnv(reinterpret_cast<void**>(&gJvmti), JVMTI_VERSION_1_2) != JNI_OK
@@ -2737,7 +2774,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         return JNI_ERR;
     }
     if (!RequestAllCapabilities() || !InstallJvmtiCallbacks()
-        || !InitializeJavaBridge(vm, env, false)) return JNI_ERR;
+        || !InitializeJavaBridge(vm, env, false, nullptr)) return JNI_ERR;
     return JNI_VERSION_1_8;
 }
 

@@ -2,6 +2,8 @@ package nhcm.jvmrtdp.remoteside;
 
 import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 
+import java.lang.reflect.Array;
+import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -67,11 +69,34 @@ public class TargetObjectRegistry implements AutoCloseable {
                 display = "<toString failed: " + failure + ">";
             }
         }
-        if (display.length() > MAX_DISPLAY_LENGTH) {
-            display = display.substring(0, MAX_DISPLAY_LENGTH - 3) + "...";
+        String sizeSuffix = sizeSuffix(value);
+        int displayLimit = MAX_DISPLAY_LENGTH - sizeSuffix.length();
+        if (display.length() > displayLimit) {
+            display = display.substring(0, displayLimit - 3) + "...";
         }
+        display += sizeSuffix;
         String type = value == null ? declaredType : value.getClass().getName();
         return new RemoteObjectDescriptor(id, value == null, type, display);
+    }
+
+    private static String sizeSuffix(Object value) {
+        if (value == null) return "";
+        try {
+            Class<?> type = value.getClass();
+            if (type.isArray()) return " [size=" + Array.getLength(value) + "]";
+            if (value instanceof Collection<?>) {
+                return " [size=" + ((Collection<?>) value).size() + "]";
+            }
+            if (value instanceof Map<?, ?>) return " [size=" + ((Map<?, ?>) value).size() + "]";
+            // Iterable itself intentionally has no size contract. Do not consume an iterator merely
+            // to render a diagnostic summary: it may be infinite, stateful or expensive.
+            if (value instanceof Iterable<?>) return " [size=unknown]";
+            return "";
+        } catch (ThreadDeath | VirtualMachineError fatal) {
+            throw fatal;
+        } catch (Throwable failure) {
+            return " [size=unavailable]";
+        }
     }
 
     private static class Entry {
