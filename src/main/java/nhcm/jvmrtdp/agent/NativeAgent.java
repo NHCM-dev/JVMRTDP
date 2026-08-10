@@ -3,6 +3,8 @@ package nhcm.jvmrtdp.agent;
 import nhcm.jvmrtdp.tools.DLLSupport;
 import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
 import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
+import nhcm.jvmrtdp.api.jvmti.JvmtiLocationFormat;
+import nhcm.jvmrtdp.api.jvmti.JvmtiPhase;
 import nhcm.jvmrtdp.agent.nativebridge.NativeJniBridge;
 import nhcm.jvmrtdp.agent.nativebridge.NativeJvmtiBridge;
 import nhcm.jvmrtdp.agent.nativebridge.NativeRuntimeBridge;
@@ -144,6 +146,105 @@ public class NativeAgent {
         return Collections.unmodifiableList(result);
     }
 
+    public static List<JvmtiCapabilityStatus> addCapabilities(JvmtiCapability... capabilities) {
+        return changeCapabilities(true, capabilities);
+    }
+
+    public static List<JvmtiCapabilityStatus> relinquishCapabilities(JvmtiCapability... capabilities) {
+        return changeCapabilities(false, capabilities);
+    }
+
+    private static List<JvmtiCapabilityStatus> changeCapabilities(
+            boolean add, JvmtiCapability... capabilities) {
+        requireAvailable();
+        if (capabilities == null || capabilities.length == 0) {
+            throw new IllegalArgumentException("At least one capability is required");
+        }
+        String[] names = new String[capabilities.length];
+        for (int index = 0; index < capabilities.length; index++) {
+            if (capabilities[index] == null) {
+                throw new IllegalArgumentException("Capability at index " + index + " is null");
+            }
+            names[index] = capabilities[index].wireName();
+        }
+        NativeJvmtiBridge.changeCapabilities(names, add);
+        return capabilityStatuses();
+    }
+
+    public static JvmtiPhase phase() {
+        requireAvailable();
+        return JvmtiPhase.fromNativeValue(NativeJvmtiBridge.phase());
+    }
+
+    public static long time() {
+        requireAvailable();
+        return NativeJvmtiBridge.time();
+    }
+
+    public static int availableProcessors() {
+        requireAvailable();
+        return NativeJvmtiBridge.availableProcessors();
+    }
+
+    public static JvmtiLocationFormat locationFormat() {
+        requireAvailable();
+        return JvmtiLocationFormat.fromNativeValue(NativeJvmtiBridge.locationFormat());
+    }
+
+    public static String[] classInfo(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.classInfo(requireType(type));
+    }
+
+    public static Class<?>[] implementedInterfaces(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.implementedInterfaces(requireType(type));
+    }
+
+    public static ClassLoader classLoader(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.classLoader(requireType(type));
+    }
+
+    public static Class<?>[] classLoaderClasses(ClassLoader loader) {
+        requireAvailable();
+        return NativeJvmtiBridge.classLoaderClasses(loader);
+    }
+
+    public static String[] methodInfo(Class<?> type, String methodName, String descriptor) {
+        requireAvailable();
+        requireMember(methodName, descriptor);
+        return NativeJvmtiBridge.methodInfo(requireType(type), methodName, descriptor);
+    }
+
+    public static byte[] methodBytecodes(Class<?> type, String methodName, String descriptor) {
+        requireAvailable();
+        requireMember(methodName, descriptor);
+        return NativeJvmtiBridge.methodBytecodes(requireType(type), methodName, descriptor);
+    }
+
+    public static String[] lineNumberTable(Class<?> type, String methodName, String descriptor) {
+        requireAvailable();
+        requireMember(methodName, descriptor);
+        return NativeJvmtiBridge.lineNumberTable(requireType(type), methodName, descriptor);
+    }
+
+    public static String[] fieldInfo(Class<?> type, String fieldName, String descriptor) {
+        requireAvailable();
+        requireMember(fieldName, descriptor);
+        return NativeJvmtiBridge.fieldInfo(requireType(type), fieldName, descriptor);
+    }
+
+    public static String sourceDebugExtension(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.sourceDebugExtension(requireType(type));
+    }
+
+    public static byte[] constantPool(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.constantPool(requireType(type));
+    }
+
     public static Thread[] getAllThreads() {
         requireAvailable();
         return NativeJvmtiBridge.getAllThreads();
@@ -177,9 +278,56 @@ public class NativeAgent {
         NativeJvmtiBridge.threadControl(thread, 3);
     }
 
+    public static String[] threadInfo(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        return NativeJvmtiBridge.threadInfo(thread);
+    }
+
+    public static int frameCount(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        return NativeJvmtiBridge.frameCount(thread);
+    }
+
+    public static long threadCpuTime(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        return NativeJvmtiBridge.threadCpuTime(thread);
+    }
+
+    public static Object[] ownedMonitors(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        return NativeJvmtiBridge.ownedMonitors(thread);
+    }
+
+    public static Object currentContendedMonitor(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        return NativeJvmtiBridge.currentContendedMonitor(thread);
+    }
+
     public static long getObjectSize(Object object) {
         requireAvailable();
         return NativeJvmtiBridge.getObjectSize(object);
+    }
+
+    public static int getObjectHashCode(Object object) {
+        requireAvailable();
+        if (object == null) throw new IllegalArgumentException("object must not be null");
+        return NativeJvmtiBridge.getObjectHashCode(object);
+    }
+
+    public static String[] objectMonitorUsage(Object object) {
+        requireAvailable();
+        if (object == null) throw new IllegalArgumentException("object must not be null");
+        return NativeJvmtiBridge.objectMonitorUsage(object);
+    }
+
+    public static Object[] objectsWithTag(long tag) {
+        requireAvailable();
+        return NativeJvmtiBridge.objectsWithTag(tag);
     }
 
     public static long getTag(Object object) {
@@ -202,6 +350,49 @@ public class NativeAgent {
         return NativeJvmtiBridge.systemProperties();
     }
 
+    public static String getSystemProperty(String name) {
+        requireAvailable();
+        if (name == null || name.trim().isEmpty()) {
+            throw new IllegalArgumentException("Property name must not be empty");
+        }
+        return NativeJvmtiBridge.getSystemProperty(name);
+    }
+
+    public static void setSystemProperty(String name, String value) {
+        requireAvailable();
+        if (name == null || name.trim().isEmpty()) {
+            throw new IllegalArgumentException("Property name must not be empty");
+        }
+        if (value == null) throw new IllegalArgumentException("Property value must not be null");
+        NativeJvmtiBridge.setSystemProperty(name, value);
+    }
+
+    public static long currentThreadCpuTime() {
+        requireAvailable();
+        return NativeJvmtiBridge.currentThreadCpuTime();
+    }
+
+    public static String[] timerInfo() {
+        requireAvailable();
+        return NativeJvmtiBridge.timerInfo();
+    }
+
+    public static void generateEvents(String eventName) {
+        requireAvailable();
+        if (eventName == null || eventName.trim().isEmpty()) {
+            throw new IllegalArgumentException("eventName must not be empty");
+        }
+        NativeJvmtiBridge.generateEvents(eventName);
+    }
+
+    public static void setVerboseFlag(String flagName, boolean enabled) {
+        requireAvailable();
+        if (flagName == null || flagName.trim().isEmpty()) {
+            throw new IllegalArgumentException("flagName must not be empty");
+        }
+        NativeJvmtiBridge.setVerboseFlag(flagName, enabled);
+    }
+
     private static RuntimeInfo initialize() {
         try {
             if (!Boolean.getBoolean("jvmrtdp.native.preloaded")) {
@@ -218,6 +409,18 @@ public class NativeAgent {
     private static void requireAvailable() {
         if (!RUNTIME_INFO.available()) {
             throw new IllegalStateException("JNI/JVMTI bridge is unavailable: " + RUNTIME_INFO.error());
+        }
+    }
+
+    private static Class<?> requireType(Class<?> type) {
+        if (type == null) throw new IllegalArgumentException("type must not be null");
+        return type;
+    }
+
+    private static void requireMember(String name, String descriptor) {
+        if (name == null || name.isEmpty()) throw new IllegalArgumentException("member name must not be empty");
+        if (descriptor == null || descriptor.isEmpty()) {
+            throw new IllegalArgumentException("member descriptor must not be empty");
         }
     }
 

@@ -898,18 +898,41 @@ java -agentpath:C:\path\jvmrtdp-agent.dll -cp JVMRTDP.jar;application.jar applic
 ```text
 jvmti capabilities
 jvmti capability-status
+jvmti capability <add|relinquish> <capability...>
+jvmti phase
+jvmti time
+jvmti timer-info
+jvmti current-thread-cpu-time
+jvmti processors
+jvmti location-format
+jvmti property <get|set> <name> [value]
+jvmti verbose <other|gc|class|jni> <enable|disable>
+jvmti class <info|interfaces|loader-classes|source-debug|constant-pool> <class>
+jvmti method <info|bytecodes|lines> <class> <method> <descriptor>
+jvmti field info <class> <field> <descriptor>
 jvmti events
+jvmti events generate <compiled_method_load|dynamic_code_generated|data_dump_request>
 jvmti retransform <class>
 jvmti redefine <class> <class-file>
 jvmti breakpoint <set|clear> <class> <method> <descriptor> <location>
 jvmti watch <access|modification> <set|clear> <class> <field> <descriptor>
 jvmti threads [variable-prefix] [limit]
-jvmti thread <state|stack|suspend|resume|interrupt|frame-pop> <thread-object> [depth|max]
+jvmti thread <info|state|stack|frame-count|cpu-time|owned-monitors|contended-monitor|suspend|resume|interrupt|frame-pop> <thread-object> [depth|max]
 jvmti size <object>
+jvmti hash <object>
+jvmti monitor-usage <object>
 jvmti tag <object> [new-value]
+jvmti tagged <tag> [variable-prefix] [limit]
 jvmti gc
 jvmti properties
 ```
+
+`capability add` 调用真正的 `AddCapabilities`，不会篡改 HotSpot 内存位。若 capability 在当前 phase
+不是 potential，会返回 `JVMTI_ERROR_NOT_AVAILABLE`、当前 phase 和启动期加载建议。
+
+`method bytecodes`、`class constant-pool` 等命令需要对应 capability；库式 API
+`RemoteJVMTIEnv.methodBytecodes()` / `constantPool()` 返回原始字节。交互命令只展示长度或适合终端的内容，
+避免把很大的二进制数据直接刷到屏幕。
 
 `jvmti threads` 把保留的线程保存为 `$prefix0`、`$prefix1`……远程对象。挂起线程可能冻结应用；JVMRTDP 拒绝挂起
 当前命令处理线程。断点、field watch、single-step、frame-pop 等操作也要求对应 capability。

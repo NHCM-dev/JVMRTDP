@@ -32,6 +32,36 @@ public final class NativeJvmtiBridge {
 
     public static native String[] capabilityStatuses();
 
+    public static native void changeCapabilities(String[] capabilityNames, boolean add);
+
+    public static native int phase();
+
+    public static native long time();
+
+    public static native int availableProcessors();
+
+    public static native int locationFormat();
+
+    public static native String[] classInfo(Class<?> type);
+
+    public static native Class<?>[] implementedInterfaces(Class<?> type);
+
+    public static native ClassLoader classLoader(Class<?> type);
+
+    public static native Class<?>[] classLoaderClasses(ClassLoader loader);
+
+    public static native String[] methodInfo(Class<?> type, String methodName, String descriptor);
+
+    public static native byte[] methodBytecodes(Class<?> type, String methodName, String descriptor);
+
+    public static native String[] lineNumberTable(Class<?> type, String methodName, String descriptor);
+
+    public static native String[] fieldInfo(Class<?> type, String fieldName, String descriptor);
+
+    public static native String sourceDebugExtension(Class<?> type);
+
+    public static native byte[] constantPool(Class<?> type);
+
     public static native Thread[] getAllThreads();
 
     public static native int getThreadState(Thread thread);
@@ -40,7 +70,23 @@ public final class NativeJvmtiBridge {
 
     public static native void threadControl(Thread thread, int operation);
 
+    public static native String[] threadInfo(Thread thread);
+
+    public static native int frameCount(Thread thread);
+
+    public static native long threadCpuTime(Thread thread);
+
+    public static native Object[] ownedMonitors(Thread thread);
+
+    public static native Object currentContendedMonitor(Thread thread);
+
     public static native long getObjectSize(Object object);
+
+    public static native int getObjectHashCode(Object object);
+
+    public static native String[] objectMonitorUsage(Object object);
+
+    public static native Object[] objectsWithTag(long tag);
 
     public static native long getTag(Object object);
 
@@ -49,4 +95,16 @@ public final class NativeJvmtiBridge {
     public static native void forceGarbageCollection();
 
     public static native String[] systemProperties();
+
+    public static native String getSystemProperty(String name);
+
+    public static native void setSystemProperty(String name, String value);
+
+    public static native long currentThreadCpuTime();
+
+    public static native String[] timerInfo();
+
+    public static native void generateEvents(String eventName);
+
+    public static native void setVerboseFlag(String flagName, boolean enabled);
 }

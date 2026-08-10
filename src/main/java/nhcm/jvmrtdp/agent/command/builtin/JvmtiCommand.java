@@ -3,6 +3,7 @@ package nhcm.jvmrtdp.agent.command.builtin;
 import nhcm.jvmrtdp.agent.NativeAgent;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
 import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
 import nhcm.jvmrtdp.agent.command.RemoteCommand;
 import nhcm.jvmrtdp.handles.JRDHandle;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -23,9 +24,14 @@ public class JvmtiCommand implements RemoteCommand {
 
     @Override
     public String usage() {
-        return "jvmti <bytes|capabilities|capability-status|events|retransform|redefine|breakpoint|watch|threads|"
-                + "thread.state|thread.stack|thread.suspend|thread.resume|thread.interrupt|thread.frame-pop|"
-                + "object.size|tag.get|tag.set|gc|properties> ...";
+        return "jvmti <bytes|capabilities|capability-status|capability.add|capability.relinquish|"
+                + "phase|time|timer-info|current-thread.cpu-time|processors|location-format|"
+                + "class.info|class.interfaces|class.loader-classes|class.source-debug|class.constant-pool|"
+                + "method.info|method.bytecodes|method.lines|field.info|events|events.generate|verbose|retransform|redefine|"
+                + "breakpoint|watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
+                + "thread.cpu-time|thread.owned-monitors|thread.contended-monitor|thread.suspend|thread.resume|"
+                + "thread.interrupt|thread.frame-pop|object.size|object.hash|object.monitor-usage|"
+                + "tag.get|tag.set|tag.objects|gc|properties|property.get|property.set> ...";
     }
 
     @Override
@@ -45,12 +51,104 @@ public class JvmtiCommand implements RemoteCommand {
             return success(NativeAgent.capabilities());
         }
         if ("capability-status".equals(operation) && arguments.size() == 1) {
+            return capabilityStatusReply();
+        }
+        if (("capability.add".equals(operation) || "capability.relinquish".equals(operation))
+                && arguments.size() >= 2) {
+            JvmtiCapability[] requested = new JvmtiCapability[arguments.size() - 1];
+            for (int index = 1; index < arguments.size(); index++) {
+                requested[index - 1] = JvmtiCapability.parse(arguments.get(index));
+            }
+            if ("capability.add".equals(operation)) NativeAgent.addCapabilities(requested);
+            else NativeAgent.relinquishCapabilities(requested);
+            return capabilityStatusReply();
+        }
+        if ("phase".equals(operation) && arguments.size() == 1) {
+            return success(NativeAgent.phase().name());
+        }
+        if ("time".equals(operation) && arguments.size() == 1) {
+            return success(Long.toString(NativeAgent.time()));
+        }
+        if ("timer-info".equals(operation) && arguments.size() == 1) {
+            return success(TextWireCodec.encode(NativeAgent.timerInfo()));
+        }
+        if ("current-thread.cpu-time".equals(operation) && arguments.size() == 1) {
+            return success(Long.toString(NativeAgent.currentThreadCpuTime()));
+        }
+        if ("processors".equals(operation) && arguments.size() == 1) {
+            return success(Integer.toString(NativeAgent.availableProcessors()));
+        }
+        if ("location-format".equals(operation) && arguments.size() == 1) {
+            return success(NativeAgent.locationFormat().name());
+        }
+        if ("property.get".equals(operation) && arguments.size() == 2) {
+            return success(NativeAgent.getSystemProperty(arguments.get(1)));
+        }
+        if ("property.set".equals(operation) && arguments.size() == 3) {
+            NativeAgent.setSystemProperty(arguments.get(1), arguments.get(2));
+            return success(NativeAgent.getSystemProperty(arguments.get(1)));
+        }
+        if ("class.info".equals(operation) && arguments.size() == 2) {
+            String[] info = NativeAgent.classInfo(NativeAgent.findLoadedClass(arguments.get(1)));
+            return success(TextWireCodec.encode(arguments.get(1), info[0], info[1], info[2],
+                    info[3], info[4], info[5], info[6], info[7], info[8], info[9]));
+        }
+        if ("class.interfaces".equals(operation) && arguments.size() == 2) {
             List<String> rows = new ArrayList<String>();
-            for (JvmtiCapabilityStatus status : NativeAgent.capabilityStatuses()) {
-                rows.add(TextWireCodec.encode(status.capability().wireName(),
-                        Boolean.toString(status.enabled()), Boolean.toString(status.potential())));
+            for (Class<?> type : NativeAgent.implementedInterfaces(
+                    NativeAgent.findLoadedClass(arguments.get(1)))) {
+                rows.add(TextWireCodec.encode(type.getName()));
             }
             return success(join(rows));
+        }
+        if ("class.loader-classes".equals(operation) && arguments.size() == 2) {
+            Class<?> type = NativeAgent.findLoadedClass(arguments.get(1));
+            List<String> rows = new ArrayList<String>();
+            for (Class<?> loaded : NativeAgent.classLoaderClasses(NativeAgent.classLoader(type))) {
+                rows.add(TextWireCodec.encode(loaded.getName()));
+            }
+            return success(join(rows));
+        }
+        if ("method.info".equals(operation) && arguments.size() == 4) {
+            String[] info = NativeAgent.methodInfo(NativeAgent.findLoadedClass(arguments.get(1)),
+                    arguments.get(2), arguments.get(3));
+            return success(TextWireCodec.encode(arguments.get(1), arguments.get(2), arguments.get(3),
+                    info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7], info[8]));
+        }
+        if ("method.bytecodes".equals(operation) && arguments.size() == 4) {
+            return success(Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    NativeAgent.methodBytecodes(NativeAgent.findLoadedClass(arguments.get(1)),
+                            arguments.get(2), arguments.get(3))));
+        }
+        if ("method.lines".equals(operation) && arguments.size() == 4) {
+            List<String> rows = new ArrayList<String>();
+            for (String line : NativeAgent.lineNumberTable(NativeAgent.findLoadedClass(arguments.get(1)),
+                    arguments.get(2), arguments.get(3))) {
+                String[] fields = line.split("\\|", -1);
+                rows.add(TextWireCodec.encode(fields[0], fields[1]));
+            }
+            return success(join(rows));
+        }
+        if ("field.info".equals(operation) && arguments.size() == 4) {
+            String[] info = NativeAgent.fieldInfo(NativeAgent.findLoadedClass(arguments.get(1)),
+                    arguments.get(2), arguments.get(3));
+            return success(TextWireCodec.encode(arguments.get(1), arguments.get(2), arguments.get(3),
+                    info[0], info[1], info[2], info[3]));
+        }
+        if ("class.source-debug".equals(operation) && arguments.size() == 2) {
+            return success(NativeAgent.sourceDebugExtension(NativeAgent.findLoadedClass(arguments.get(1))));
+        }
+        if ("class.constant-pool".equals(operation) && arguments.size() == 2) {
+            return success(Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    NativeAgent.constantPool(NativeAgent.findLoadedClass(arguments.get(1)))));
+        }
+        if ("events.generate".equals(operation) && arguments.size() == 2) {
+            NativeAgent.generateEvents(arguments.get(1));
+            return success("ok");
+        }
+        if ("verbose".equals(operation) && arguments.size() == 3) {
+            NativeAgent.setVerboseFlag(arguments.get(1), toggle(arguments.get(2)));
+            return success("ok");
         }
         if ("events".equals(operation) && arguments.size() == 1) {
             List<String> names = new ArrayList<String>();
@@ -94,6 +192,27 @@ public class JvmtiCommand implements RemoteCommand {
         if ("thread.state".equals(operation) && arguments.size() == 2) {
             return success(Integer.toString(NativeAgent.getThreadState(thread(handle, arguments.get(1)))));
         }
+        if ("thread.info".equals(operation) && arguments.size() == 2) {
+            String[] info = NativeAgent.threadInfo(thread(handle, arguments.get(1)));
+            return success(TextWireCodec.encode(info));
+        }
+        if ("thread.frame-count".equals(operation) && arguments.size() == 2) {
+            return success(Integer.toString(NativeAgent.frameCount(thread(handle, arguments.get(1)))));
+        }
+        if ("thread.cpu-time".equals(operation) && arguments.size() == 2) {
+            return success(Long.toString(NativeAgent.threadCpuTime(thread(handle, arguments.get(1)))));
+        }
+        if ("thread.owned-monitors".equals(operation) && arguments.size() == 2) {
+            List<String> rows = new ArrayList<String>();
+            for (Object monitor : NativeAgent.ownedMonitors(thread(handle, arguments.get(1)))) {
+                rows.add(handle.targetObjects().storeExternal(monitor).encode());
+            }
+            return success(join(rows));
+        }
+        if ("thread.contended-monitor".equals(operation) && arguments.size() == 2) {
+            Object monitor = NativeAgent.currentContendedMonitor(thread(handle, arguments.get(1)));
+            return success(handle.targetObjects().storeExternal(monitor).encode());
+        }
         if ("thread.stack".equals(operation) && arguments.size() == 3) {
             String[] frames = NativeAgent.getStackTrace(thread(handle, arguments.get(1)),
                     Integer.parseInt(arguments.get(2)));
@@ -121,12 +240,26 @@ public class JvmtiCommand implements RemoteCommand {
         if ("object.size".equals(operation) && arguments.size() == 2) {
             return success(Long.toString(NativeAgent.getObjectSize(object(handle, arguments.get(1)))));
         }
+        if ("object.hash".equals(operation) && arguments.size() == 2) {
+            return success(Integer.toString(NativeAgent.getObjectHashCode(object(handle, arguments.get(1)))));
+        }
+        if ("object.monitor-usage".equals(operation) && arguments.size() == 2) {
+            return success(TextWireCodec.encode(NativeAgent.objectMonitorUsage(
+                    object(handle, arguments.get(1)))));
+        }
         if ("tag.get".equals(operation) && arguments.size() == 2) {
             return success(Long.toString(NativeAgent.getTag(object(handle, arguments.get(1)))));
         }
         if ("tag.set".equals(operation) && arguments.size() == 3) {
             NativeAgent.setTag(object(handle, arguments.get(1)), Long.parseLong(arguments.get(2)));
             return success("ok");
+        }
+        if ("tag.objects".equals(operation) && arguments.size() == 2) {
+            List<String> rows = new ArrayList<String>();
+            for (Object object : NativeAgent.objectsWithTag(Long.parseLong(arguments.get(1)))) {
+                rows.add(handle.targetObjects().storeExternal(object).encode());
+            }
+            return success(join(rows));
         }
         if ("gc".equals(operation) && arguments.size() == 1) {
             NativeAgent.forceGarbageCollection();
@@ -138,6 +271,15 @@ public class JvmtiCommand implements RemoteCommand {
             return success(join(rows));
         }
         return invalid();
+    }
+
+    private static CommandReply capabilityStatusReply() {
+        List<String> rows = new ArrayList<String>();
+        for (JvmtiCapabilityStatus status : NativeAgent.capabilityStatuses()) {
+            rows.add(TextWireCodec.encode(status.capability().wireName(),
+                    Boolean.toString(status.enabled()), Boolean.toString(status.potential())));
+        }
+        return success(join(rows));
     }
 
     private static Object object(JRDHandle handle, String id) {

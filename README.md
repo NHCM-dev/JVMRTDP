@@ -244,5 +244,11 @@ try (ServerHandle server = jvmrtdp.inject(pid)) {
 - 只列出当前已经加载的类；搜索和 package 浏览不会主动加载新业务类。
 - 当前原生注入器只构建 Windows x64 版本。
 - 动态注入发生在 JVMTI live phase；JVM 只会授予此阶段仍可添加的 capability。`jvmti capability-status` 会完整显示每个 JVMTI 1.2 capability 的 enabled/potential 状态。MethodEntry/MethodExit 等启动期能力可通过 `-agentpath` 模式在 `Agent_OnLoad` 获取；不可用能力会返回包含 capability 名称和启动建议的明确错误。
+- capability 可以在运行时按名称申请或释放：`jvmti capability add <name...>`、
+  `jvmti capability relinquish <name...>`。释放后只有仍为 potential 的能力才能重新申请；
+  live phase 无法强制补齐 OnLoad-only 初始化。
+- 新增类/方法/字段元数据、字节码、行号、constant pool、线程 CPU/monitor、tag 反查、timer、
+  system property、GenerateEvents 和 verbose flag 等 JVMTI API。覆盖明细见
+  [JVMTI API 覆盖表](docs/JVMTI-API-COVERAGE.md)。
 
 完整语法和行为细节见 [命令手册](docs/COMMANDS.md)，脚本控制流见 [脚本语言手册](docs/SCRIPTING.md)。

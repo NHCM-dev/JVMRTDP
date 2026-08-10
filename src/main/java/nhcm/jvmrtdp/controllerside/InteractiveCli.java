@@ -22,6 +22,12 @@ import nhcm.jvmrtdp.handles.jvm.RemoteJVMTIEnv;
 import nhcm.jvmrtdp.handles.jvm.RemoteJvmtiThread;
 import nhcm.jvmrtdp.handles.jvm.JvmtiCallbackRegistration;
 import nhcm.jvmrtdp.handles.jvm.JvmtiCallbackStatistics;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
+import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
+import nhcm.jvmrtdp.api.jvmti.JvmtiFieldInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiLineNumber;
+import nhcm.jvmrtdp.api.jvmti.JvmtiThreadInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiMonitorUsage;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -43,6 +49,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -1009,11 +1016,16 @@ public class InteractiveCli {
 
     private static class JvmtiShellCommand extends ShellCommand<TargetSession> {
         private JvmtiShellCommand() {
-            super("jvmti", "jvmti capabilities | capability-status | events | retransform <class> | redefine <class> <class-file> | "
+            super("jvmti", "jvmti capabilities | capability-status | capability <add|relinquish> <name...> | "
+                            + "phase | time | timer-info | current-thread-cpu-time | processors | location-format | "
+                            + "property <get|set> <name> [value] | verbose <other|gc|class|jni> <enable|disable> | "
+                            + "class <info|interfaces|loader-classes|source-debug|constant-pool> <class> | "
+                            + "method <info|bytecodes|lines> <class> <method> <descriptor> | "
+                            + "field info <class> <field> <descriptor> | events [generate <event>] | retransform <class> | redefine <class> <class-file> | "
                             + "breakpoint <set|clear> <class> <method> <descriptor> <location> | "
                             + "watch <access|modification> <set|clear> <class> <field> <descriptor> | "
-                            + "threads [prefix] [limit] | thread <state|stack|suspend|resume|interrupt|frame-pop> <object> [depth|max] | "
-                            + "size <object> | tag <object> [value] | gc | properties",
+                            + "threads [prefix] [limit] | thread <info|state|stack|frame-count|cpu-time|owned-monitors|contended-monitor|suspend|resume|interrupt|frame-pop> <object> [depth|max] | "
+                            + "size <object> | hash <object> | monitor-usage <object> | tag <object> [value] | tagged <tag> [prefix] [limit] | gc | properties",
                     "Runs JVMTI class, thread, heap/tag, GC and runtime operations.");
         }
 
@@ -1026,11 +1038,113 @@ public class InteractiveCli {
                 return true;
             }
             if ("capability-status".equals(operation) && arguments.size() == 1) {
-                for (nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus status
-                        : session.jvmti().capabilityStatuses()) {
-                    session.output().printf("%s enabled=%s potential=%s%n",
-                            status.capability().wireName(), status.enabled(), status.potential());
+                printCapabilities(session, session.jvmti().capabilityStatuses());
+                return true;
+            }
+            if ("capability".equals(operation) && arguments.size() >= 3) {
+                String action = lower(arguments.get(1));
+                JvmtiCapability[] requested = new JvmtiCapability[arguments.size() - 2];
+                for (int index = 2; index < arguments.size(); index++) {
+                    requested[index - 2] = JvmtiCapability.parse(arguments.get(index));
                 }
+                List<JvmtiCapabilityStatus> statuses;
+                if ("add".equals(action)) statuses = session.jvmti().addCapabilities(requested);
+                else if ("relinquish".equals(action) || "release".equals(action)) {
+                    statuses = session.jvmti().relinquishCapabilities(requested);
+                } else throw new IllegalArgumentException("Capability operation must be add or relinquish");
+                for (JvmtiCapability requestedCapability : requested) {
+                    for (JvmtiCapabilityStatus status : statuses) {
+                        if (status.capability() == requestedCapability) {
+                            session.output().printf("%s enabled=%s potential=%s%n",
+                                    status.capability().wireName(), status.enabled(), status.potential());
+                        }
+                    }
+                }
+                return true;
+            }
+            if ("phase".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().phase());
+                return true;
+            }
+            if ("time".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().time());
+                return true;
+            }
+            if ("timer-info".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().timerInfo());
+                return true;
+            }
+            if ("current-thread-cpu-time".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().currentThreadCpuTime());
+                return true;
+            }
+            if ("processors".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().availableProcessors());
+                return true;
+            }
+            if ("location-format".equals(operation) && arguments.size() == 1) {
+                session.output().println(session.jvmti().locationFormat());
+                return true;
+            }
+            if ("property".equals(operation) && arguments.size() >= 3 && arguments.size() <= 4) {
+                String action = lower(arguments.get(1));
+                if ("get".equals(action) && arguments.size() == 3) {
+                    session.output().println(session.jvmti().getSystemProperty(arguments.get(2)));
+                } else if ("set".equals(action) && arguments.size() == 4) {
+                    session.output().println(session.jvmti().setSystemProperty(arguments.get(2), arguments.get(3)));
+                } else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if ("verbose".equals(operation) && arguments.size() == 3) {
+                session.jvmti().setVerboseFlag(arguments.get(1), setOrClear(arguments.get(2)));
+                session.output().println("ok");
+                return true;
+            }
+            if ("class".equals(operation) && arguments.size() == 3) {
+                String action = lower(arguments.get(1));
+                if ("info".equals(action)) session.output().println(session.jvmti().classInfo(arguments.get(2)));
+                else if ("interfaces".equals(action)) {
+                    for (String type : session.jvmti().implementedInterfaces(arguments.get(2))) {
+                        session.output().println(type);
+                    }
+                } else if ("loader-classes".equals(action)) {
+                    for (String type : session.jvmti().classLoaderClasses(arguments.get(2))) {
+                        session.output().println(type);
+                    }
+                } else if ("source-debug".equals(action)) {
+                    session.output().println(session.jvmti().sourceDebugExtension(arguments.get(2)));
+                } else if ("constant-pool".equals(action)) {
+                    byte[] bytes = session.jvmti().constantPool(arguments.get(2));
+                    session.output().printf("length=%d (use RemoteJVMTIEnv.constantPool() to read bytes)%n",
+                            bytes.length);
+                } else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if ("method".equals(operation) && arguments.size() == 5) {
+                String action = lower(arguments.get(1));
+                if ("info".equals(action)) {
+                    session.output().println(session.jvmti().methodInfo(
+                            arguments.get(2), arguments.get(3), arguments.get(4)));
+                } else if ("bytecodes".equals(action)) {
+                    byte[] bytes = session.jvmti().methodBytecodes(
+                            arguments.get(2), arguments.get(3), arguments.get(4));
+                    session.output().printf("length=%d base64=%s%n", bytes.length,
+                            Base64.getEncoder().encodeToString(bytes));
+                } else if ("lines".equals(action)) {
+                    for (JvmtiLineNumber line : session.jvmti().lineNumberTable(
+                            arguments.get(2), arguments.get(3), arguments.get(4))) {
+                        session.output().println(line);
+                    }
+                } else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if ("field".equals(operation) && arguments.size() == 5
+                    && "info".equalsIgnoreCase(arguments.get(1))) {
+                JvmtiFieldInfo field = session.jvmti().fieldInfo(
+                        arguments.get(2), arguments.get(3), arguments.get(4));
+                session.output().printf("%s.%s %s modifiers=0x%x synthetic=%s declaring=%s generic=%s%n",
+                        field.className(), field.name(), field.descriptor(), field.modifiers(),
+                        field.synthetic(), field.declaringClass(), field.genericSignature());
                 return true;
             }
             if ("events".equals(operation) && arguments.size() == 1) {
@@ -1038,6 +1152,13 @@ public class InteractiveCli {
                         : nhcm.jvmrtdp.api.jvmti.JvmtiEventType.values()) {
                     session.output().println(event.wireName());
                 }
+                return true;
+            }
+            if ("events".equals(operation) && arguments.size() == 3
+                    && "generate".equalsIgnoreCase(arguments.get(1))) {
+                session.jvmti().generateEvents(
+                        nhcm.jvmrtdp.api.jvmti.JvmtiEventType.parse(arguments.get(2)));
+                session.output().println("ok");
                 return true;
             }
             if ("retransform".equals(operation) && arguments.size() == 2) {
@@ -1092,6 +1213,27 @@ public class InteractiveCli {
                     RemoteObject thread = value.only();
                     if ("state".equals(action) && arguments.size() == 3) {
                         session.output().printf("0x%08x%n", session.jvmti().threadState(thread));
+                    } else if ("info".equals(action) && arguments.size() == 3) {
+                        JvmtiThreadInfo info = session.jvmti().threadInfo(thread);
+                        session.output().printf("name=%s priority=%d daemon=%s state=0x%08x "
+                                        + "group=%s contextLoader=%s%n",
+                                info.name(), info.priority(), info.daemon(), info.state(),
+                                info.threadGroupClass(), info.contextClassLoaderClass());
+                    } else if ("frame-count".equals(action) && arguments.size() == 3) {
+                        session.output().println(session.jvmti().frameCount(thread));
+                    } else if ("cpu-time".equals(action) && arguments.size() == 3) {
+                        session.output().println(session.jvmti().threadCpuTime(thread));
+                    } else if ("owned-monitors".equals(action) && arguments.size() == 3) {
+                        List<RemoteObject> monitors = session.jvmti().ownedMonitors(thread);
+                        try {
+                            for (RemoteObject monitor : monitors) session.output().println(monitor);
+                        } finally {
+                            for (RemoteObject monitor : monitors) monitor.close();
+                        }
+                    } else if ("contended-monitor".equals(action) && arguments.size() == 3) {
+                        try (RemoteObject monitor = session.jvmti().currentContendedMonitor(thread)) {
+                            session.output().println(monitor);
+                        }
                     } else if ("stack".equals(action)) {
                         int max = arguments.size() == 4 ? integer(arguments.get(3), "max frames") : 64;
                         for (String frame : session.jvmti().stackTrace(thread, max)) session.output().println(frame);
@@ -1126,6 +1268,37 @@ public class InteractiveCli {
                 }
                 return true;
             }
+            if ("hash".equals(operation) && arguments.size() == 2) {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(1)))) {
+                    session.output().println(session.jvmti().objectHashCode(value.only()));
+                }
+                return true;
+            }
+            if ("monitor-usage".equals(operation) && arguments.size() == 2) {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(1)))) {
+                    JvmtiMonitorUsage usage = session.jvmti().objectMonitorUsage(value.only());
+                    session.output().println(usage);
+                }
+                return true;
+            }
+            if ("tagged".equals(operation) && arguments.size() >= 2 && arguments.size() <= 4) {
+                long tag = Long.parseLong(arguments.get(1));
+                String prefix = arguments.size() >= 3 ? arguments.get(2) : "tagged";
+                int limit = arguments.size() == 4 ? integer(arguments.get(3), "limit") : 128;
+                List<RemoteObject> objects = session.jvmti().objectsWithTag(tag);
+                int kept = Math.min(limit, objects.size());
+                for (int index = 0; index < objects.size(); index++) {
+                    RemoteObject object = objects.get(index);
+                    if (index < kept) {
+                        session.workspace().defineObject(prefix + index, object);
+                        session.output().printf("$%s%d %s%n", prefix, index, object);
+                    } else object.close();
+                }
+                session.output().printf("Saved %d of %d tagged object handle(s)%n", kept, objects.size());
+                return true;
+            }
             if ("gc".equals(operation) && arguments.size() == 1) {
                 session.jvmti().forceGarbageCollection();
                 session.output().println("ok");
@@ -1136,6 +1309,14 @@ public class InteractiveCli {
                 return true;
             }
             return InteractiveCli.usage(session, this);
+        }
+
+        private static void printCapabilities(
+                TargetSession session, List<JvmtiCapabilityStatus> statuses) {
+            for (JvmtiCapabilityStatus status : statuses) {
+                session.output().printf("%s enabled=%s potential=%s%n",
+                        status.capability().wireName(), status.enabled(), status.potential());
+            }
         }
 
         private static boolean setOrClear(String value) {

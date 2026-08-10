@@ -10,6 +10,16 @@ import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 import nhcm.jvmrtdp.protocol.TextWireCodec;
 import nhcm.jvmrtdp.api.jvmti.JvmtiCapability;
 import nhcm.jvmrtdp.api.jvmti.JvmtiCapabilityStatus;
+import nhcm.jvmrtdp.api.jvmti.JvmtiLocationFormat;
+import nhcm.jvmrtdp.api.jvmti.JvmtiPhase;
+import nhcm.jvmrtdp.api.jvmti.JvmtiClassInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiFieldInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiLineNumber;
+import nhcm.jvmrtdp.api.jvmti.JvmtiMethodInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiThreadInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiMonitorUsage;
+import nhcm.jvmrtdp.api.jvmti.JvmtiTimerInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -56,8 +66,163 @@ public class RemoteJVMTIEnv extends RemoteHandle {
     }
 
     public List<JvmtiCapabilityStatus> capabilityStatuses() {
+        return parseCapabilityStatuses(executeForOutput(CommandLine.of("jvmti", "capability-status")));
+    }
+
+    public List<JvmtiCapabilityStatus> addCapabilities(JvmtiCapability... capabilities) {
+        return changeCapabilities("capability.add", capabilities);
+    }
+
+    public List<JvmtiCapabilityStatus> relinquishCapabilities(JvmtiCapability... capabilities) {
+        return changeCapabilities("capability.relinquish", capabilities);
+    }
+
+    public JvmtiPhase phase() {
+        return JvmtiPhase.valueOf(executeForOutput(CommandLine.of("jvmti", "phase")));
+    }
+
+    public long time() {
+        return Long.parseLong(executeForOutput(CommandLine.of("jvmti", "time")));
+    }
+
+    public int availableProcessors() {
+        return Integer.parseInt(executeForOutput(CommandLine.of("jvmti", "processors")));
+    }
+
+    public JvmtiLocationFormat locationFormat() {
+        return JvmtiLocationFormat.valueOf(
+                executeForOutput(CommandLine.of("jvmti", "location-format")));
+    }
+
+    public String getSystemProperty(String name) {
+        return executeForOutput(CommandLine.of("jvmti", "property.get", required(name, "name")));
+    }
+
+    public String setSystemProperty(String name, String value) {
+        if (value == null) throw new IllegalArgumentException("value must not be null");
+        return executeForOutput(CommandLine.of(
+                "jvmti", "property.set", required(name, "name"), value));
+    }
+
+    public JvmtiClassInfo classInfo(String className) {
+        String name = required(className, "className");
+        List<String> fields = TextWireCodec.decode(
+                executeForOutput(CommandLine.of("jvmti", "class.info", name)), 11);
+        return new JvmtiClassInfo(fields.get(0), fields.get(1), fields.get(2), fields.get(3),
+                Integer.parseInt(fields.get(4)), Integer.parseInt(fields.get(5)),
+                Boolean.parseBoolean(fields.get(6)), Boolean.parseBoolean(fields.get(7)),
+                Boolean.parseBoolean(fields.get(8)), Integer.parseInt(fields.get(9)),
+                Integer.parseInt(fields.get(10)));
+    }
+
+    public List<String> implementedInterfaces(String className) {
+        return decodedLines(executeForOutput(CommandLine.of(
+                "jvmti", "class.interfaces", required(className, "className"))), 1);
+    }
+
+    public List<String> classLoaderClasses(String anchorClassName) {
+        return decodedLines(executeForOutput(CommandLine.of("jvmti", "class.loader-classes",
+                required(anchorClassName, "anchorClassName"))), 1);
+    }
+
+    public JvmtiMethodInfo methodInfo(String className, String methodName, String descriptor) {
+        List<String> fields = TextWireCodec.decode(executeForOutput(CommandLine.of(
+                "jvmti", "method.info", required(className, "className"),
+                required(methodName, "methodName"), required(descriptor, "descriptor"))), 12);
+        return new JvmtiMethodInfo(fields.get(0), fields.get(1), fields.get(2), fields.get(3),
+                Integer.parseInt(fields.get(4)), Integer.parseInt(fields.get(5)),
+                Integer.parseInt(fields.get(6)), Long.parseLong(fields.get(7)),
+                Long.parseLong(fields.get(8)), Boolean.parseBoolean(fields.get(9)),
+                Boolean.parseBoolean(fields.get(10)), Boolean.parseBoolean(fields.get(11)));
+    }
+
+    public byte[] methodBytecodes(String className, String methodName, String descriptor) {
+        String encoded = executeForOutput(CommandLine.of("jvmti", "method.bytecodes",
+                required(className, "className"), required(methodName, "methodName"),
+                required(descriptor, "descriptor")));
+        try {
+            return Base64.getUrlDecoder().decode(encoded);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalStateException("Target returned invalid method bytecodes", exception);
+        }
+    }
+
+    public List<JvmtiLineNumber> lineNumberTable(
+            String className, String methodName, String descriptor) {
+        List<JvmtiLineNumber> result = new ArrayList<JvmtiLineNumber>();
+        for (String row : lines(executeForOutput(CommandLine.of("jvmti", "method.lines",
+                required(className, "className"), required(methodName, "methodName"),
+                required(descriptor, "descriptor"))))) {
+            List<String> fields = TextWireCodec.decode(row, 2);
+            result.add(new JvmtiLineNumber(Long.parseLong(fields.get(0)), Integer.parseInt(fields.get(1))));
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    public JvmtiFieldInfo fieldInfo(String className, String fieldName, String descriptor) {
+        List<String> fields = TextWireCodec.decode(executeForOutput(CommandLine.of(
+                "jvmti", "field.info", required(className, "className"),
+                required(fieldName, "fieldName"), required(descriptor, "descriptor"))), 7);
+        return new JvmtiFieldInfo(fields.get(0), fields.get(1), fields.get(2), fields.get(3),
+                Integer.parseInt(fields.get(4)), Boolean.parseBoolean(fields.get(5)), fields.get(6));
+    }
+
+    public String sourceDebugExtension(String className) {
+        return executeForOutput(CommandLine.of(
+                "jvmti", "class.source-debug", required(className, "className")));
+    }
+
+    public byte[] constantPool(String className) {
+        String encoded = executeForOutput(CommandLine.of(
+                "jvmti", "class.constant-pool", required(className, "className")));
+        try {
+            return Base64.getUrlDecoder().decode(encoded);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalStateException("Target returned an invalid constant pool", exception);
+        }
+    }
+
+    public JvmtiTimerInfo timerInfo() {
+        List<String> fields = TextWireCodec.decode(
+                executeForOutput(CommandLine.of("jvmti", "timer-info")), 4);
+        return new JvmtiTimerInfo(Long.parseLong(fields.get(0)), Boolean.parseBoolean(fields.get(1)),
+                Boolean.parseBoolean(fields.get(2)), Integer.parseInt(fields.get(3)));
+    }
+
+    public long currentThreadCpuTime() {
+        return Long.parseLong(executeForOutput(
+                CommandLine.of("jvmti", "current-thread.cpu-time")));
+    }
+
+    public void generateEvents(JvmtiEventType eventType) {
+        if (eventType == null) throw new IllegalArgumentException("eventType must not be null");
+        executeForOutput(CommandLine.of("jvmti", "events.generate", eventType.wireName()));
+    }
+
+    public void setVerboseFlag(String flagName, boolean enabled) {
+        executeForOutput(CommandLine.of("jvmti", "verbose", required(flagName, "flagName"),
+                enabled ? "enable" : "disable"));
+    }
+
+    private List<JvmtiCapabilityStatus> changeCapabilities(
+            String operation, JvmtiCapability... capabilities) {
+        if (capabilities == null || capabilities.length == 0) {
+            throw new IllegalArgumentException("At least one capability is required");
+        }
+        String[] command = new String[capabilities.length + 1];
+        command[0] = operation;
+        for (int index = 0; index < capabilities.length; index++) {
+            if (capabilities[index] == null) {
+                throw new IllegalArgumentException("Capability at index " + index + " is null");
+            }
+            command[index + 1] = capabilities[index].wireName();
+        }
+        return parseCapabilityStatuses(executeForOutput(CommandLine.of("jvmti", command)));
+    }
+
+    private static List<JvmtiCapabilityStatus> parseCapabilityStatuses(String output) {
         List<JvmtiCapabilityStatus> result = new ArrayList<JvmtiCapabilityStatus>();
-        for (String row : lines(executeForOutput(CommandLine.of("jvmti", "capability-status")))) {
+        for (String row : lines(output)) {
             List<String> fields = TextWireCodec.decode(row, 3);
             result.add(new JvmtiCapabilityStatus(JvmtiCapability.parse(fields.get(0)),
                     Boolean.parseBoolean(fields.get(1)), Boolean.parseBoolean(fields.get(2))));
@@ -221,6 +386,34 @@ public class RemoteJVMTIEnv extends RemoteHandle {
                 CommandLine.of("jvmti", "thread.state", objectId(thread))));
     }
 
+    public JvmtiThreadInfo threadInfo(RemoteObject thread) {
+        List<String> fields = TextWireCodec.decode(executeForOutput(
+                CommandLine.of("jvmti", "thread.info", objectId(thread))), 6);
+        return new JvmtiThreadInfo(fields.get(0), Integer.parseInt(fields.get(1)),
+                Boolean.parseBoolean(fields.get(2)), fields.get(3), fields.get(4),
+                Integer.parseInt(fields.get(5)));
+    }
+
+    public int frameCount(RemoteObject thread) {
+        return Integer.parseInt(executeForOutput(
+                CommandLine.of("jvmti", "thread.frame-count", objectId(thread))));
+    }
+
+    public long threadCpuTime(RemoteObject thread) {
+        return Long.parseLong(executeForOutput(
+                CommandLine.of("jvmti", "thread.cpu-time", objectId(thread))));
+    }
+
+    public List<RemoteObject> ownedMonitors(RemoteObject thread) {
+        return remoteObjects(executeForOutput(
+                CommandLine.of("jvmti", "thread.owned-monitors", objectId(thread))));
+    }
+
+    public RemoteObject currentContendedMonitor(RemoteObject thread) {
+        return object(RemoteObjectDescriptor.decode(executeForOutput(
+                CommandLine.of("jvmti", "thread.contended-monitor", objectId(thread)))));
+    }
+
     public List<String> stackTrace(RemoteObject thread, int maxFrames) {
         if (maxFrames < 1) throw new IllegalArgumentException("maxFrames must be positive");
         List<String> result = new ArrayList<String>();
@@ -244,12 +437,29 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         return Long.parseLong(executeForOutput(CommandLine.of("jvmti", "object.size", objectId(object))));
     }
 
+    public int objectHashCode(RemoteObject object) {
+        return Integer.parseInt(executeForOutput(
+                CommandLine.of("jvmti", "object.hash", objectId(object))));
+    }
+
+    public JvmtiMonitorUsage objectMonitorUsage(RemoteObject object) {
+        List<String> fields = TextWireCodec.decode(executeForOutput(
+                CommandLine.of("jvmti", "object.monitor-usage", objectId(object))), 4);
+        return new JvmtiMonitorUsage(fields.get(0), Integer.parseInt(fields.get(1)),
+                Integer.parseInt(fields.get(2)), Integer.parseInt(fields.get(3)));
+    }
+
     public long getTag(RemoteObject object) {
         return Long.parseLong(executeForOutput(CommandLine.of("jvmti", "tag.get", objectId(object))));
     }
 
     public void setTag(RemoteObject object, long tag) {
         executeForOutput(CommandLine.of("jvmti", "tag.set", objectId(object), Long.toString(tag)));
+    }
+
+    public List<RemoteObject> objectsWithTag(long tag) {
+        return remoteObjects(executeForOutput(
+                CommandLine.of("jvmti", "tag.objects", Long.toString(tag))));
     }
 
     public void forceGarbageCollection() {
@@ -319,6 +529,12 @@ public class RemoteJVMTIEnv extends RemoteHandle {
                 descriptor.className(), descriptor.nullValue(), descriptor.displayValue());
     }
 
+    private List<RemoteObject> remoteObjects(String output) {
+        List<RemoteObject> result = new ArrayList<RemoteObject>();
+        for (String row : lines(output)) result.add(object(RemoteObjectDescriptor.decode(row)));
+        return Collections.unmodifiableList(result);
+    }
+
     private String objectId(RemoteObject object) {
         if (object == null) throw new IllegalArgumentException("Remote object must not be null");
         if (object.server() != server()) throw new IllegalArgumentException("Remote object belongs to another session");
@@ -334,11 +550,24 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         return value == null || value.trim().isEmpty() ? "deployment" : value.trim();
     }
 
+    private static String required(String value, String name) {
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException(name + " must not be empty");
+        }
+        return value;
+    }
+
     private static List<String> lines(String output) {
         if (output == null || output.isEmpty()) return Collections.emptyList();
         List<String> result = new ArrayList<String>();
         Collections.addAll(result, output.split("\\r?\\n"));
         return result;
+    }
+
+    private static List<String> decodedLines(String output, int fieldCount) {
+        List<String> result = new ArrayList<String>();
+        for (String row : lines(output)) result.add(TextWireCodec.decode(row, fieldCount).get(0));
+        return Collections.unmodifiableList(result);
     }
 
     private static void requireClassBytes(byte[] bytes) {

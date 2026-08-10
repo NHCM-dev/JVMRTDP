@@ -170,6 +170,20 @@ std::string JvmtiErrorText(jvmtiError error) {
     return result;
 }
 
+std::string JvmtiPhaseText() {
+    if (gJvmti == nullptr) return "unavailable";
+    jvmtiPhase phase{};
+    if (gJvmti->GetPhase(&phase) != JVMTI_ERROR_NONE) return "unknown";
+    switch (phase) {
+    case JVMTI_PHASE_ONLOAD: return "ONLOAD";
+    case JVMTI_PHASE_PRIMORDIAL: return "PRIMORDIAL";
+    case JVMTI_PHASE_START: return "START";
+    case JVMTI_PHASE_LIVE: return "LIVE";
+    case JVMTI_PHASE_DEAD: return "DEAD";
+    default: return std::to_string(static_cast<int>(phase));
+    }
+}
+
 std::string ClassSignature(std::string className) {
     if (!className.empty() && className.front() == '[') {
         std::replace(className.begin(), className.end(), '.', '/');
@@ -1734,6 +1748,377 @@ jobjectArray JNICALL NativeCapabilityStatuses(JNIEnv* env, jclass) {
     return NewStringArray(env, rows);
 }
 
+bool SelectCapability(jvmtiCapabilities& capabilities, const std::string& name) {
+#define JVMRTDP_SELECT_CAPABILITY(field) if (name == #field) { capabilities.field = 1; return true; }
+    JVMRTDP_SELECT_CAPABILITY(can_tag_objects)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_field_modification_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_field_access_events)
+    JVMRTDP_SELECT_CAPABILITY(can_get_bytecodes)
+    JVMRTDP_SELECT_CAPABILITY(can_get_synthetic_attribute)
+    JVMRTDP_SELECT_CAPABILITY(can_get_owned_monitor_info)
+    JVMRTDP_SELECT_CAPABILITY(can_get_current_contended_monitor)
+    JVMRTDP_SELECT_CAPABILITY(can_get_monitor_info)
+    JVMRTDP_SELECT_CAPABILITY(can_pop_frame)
+    JVMRTDP_SELECT_CAPABILITY(can_redefine_classes)
+    JVMRTDP_SELECT_CAPABILITY(can_signal_thread)
+    JVMRTDP_SELECT_CAPABILITY(can_get_source_file_name)
+    JVMRTDP_SELECT_CAPABILITY(can_get_line_numbers)
+    JVMRTDP_SELECT_CAPABILITY(can_get_source_debug_extension)
+    JVMRTDP_SELECT_CAPABILITY(can_access_local_variables)
+    JVMRTDP_SELECT_CAPABILITY(can_maintain_original_method_order)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_single_step_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_frame_pop_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_breakpoint_events)
+    JVMRTDP_SELECT_CAPABILITY(can_suspend)
+    JVMRTDP_SELECT_CAPABILITY(can_redefine_any_class)
+    JVMRTDP_SELECT_CAPABILITY(can_get_current_thread_cpu_time)
+    JVMRTDP_SELECT_CAPABILITY(can_get_thread_cpu_time)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_method_entry_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_method_exit_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_all_class_hook_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_compiled_method_load_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_exception_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_monitor_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_vm_object_alloc_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_native_method_bind_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_garbage_collection_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_object_free_events)
+    JVMRTDP_SELECT_CAPABILITY(can_force_early_return)
+    JVMRTDP_SELECT_CAPABILITY(can_get_owned_monitor_stack_depth_info)
+    JVMRTDP_SELECT_CAPABILITY(can_get_constant_pool)
+    JVMRTDP_SELECT_CAPABILITY(can_set_native_method_prefix)
+    JVMRTDP_SELECT_CAPABILITY(can_retransform_classes)
+    JVMRTDP_SELECT_CAPABILITY(can_retransform_any_class)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_resource_exhaustion_heap_events)
+    JVMRTDP_SELECT_CAPABILITY(can_generate_resource_exhaustion_threads_events)
+#undef JVMRTDP_SELECT_CAPABILITY
+    return false;
+}
+
+void JNICALL NativeChangeCapabilities(
+        JNIEnv* env, jclass, jobjectArray capabilityNames, jboolean add) {
+    if (capabilityNames == nullptr || env->GetArrayLength(capabilityNames) == 0) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "At least one capability is required");
+        return;
+    }
+    jvmtiCapabilities requested{};
+    const jsize count = env->GetArrayLength(capabilityNames);
+    for (jsize index = 0; index < count; ++index) {
+        jstring value = static_cast<jstring>(env->GetObjectArrayElement(capabilityNames, index));
+        const std::string name = JStringToUtf8(env, value);
+        if (value != nullptr) env->DeleteLocalRef(value);
+        if (!SelectCapability(requested, name)) {
+            ThrowJava(env, "java/lang/IllegalArgumentException", "Unknown JVMTI capability: " + name);
+            return;
+        }
+    }
+    const jvmtiError error = add == JNI_TRUE
+        ? gJvmti->AddCapabilities(&requested)
+        : gJvmti->RelinquishCapabilities(&requested);
+    if (error != JVMTI_ERROR_NONE) {
+        std::string message = std::string(add == JNI_TRUE ? "AddCapabilities" : "RelinquishCapabilities")
+            + " failed in JVMTI phase " + JvmtiPhaseText() + ": " + JvmtiErrorText(error);
+        if (add == JNI_TRUE && error == JVMTI_ERROR_NOT_AVAILABLE) {
+            message += ". The requested capability is not potential in this phase; "
+                "load JVMRTDP with -agentpath during VM startup for OnLoad-only capabilities";
+        }
+        ThrowJava(env, "java/lang/UnsupportedOperationException", message);
+        return;
+    }
+    jvmtiCapabilities current{};
+    if (gJvmti->GetCapabilities(&current) == JVMTI_ERROR_NONE) {
+        gCanRetransform = current.can_retransform_classes != 0;
+    }
+}
+
+jint JNICALL NativePhase(JNIEnv* env, jclass) {
+    jvmtiPhase phase{};
+    const jvmtiError error = gJvmti->GetPhase(&phase);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetPhase", error);
+        return 0;
+    }
+    return static_cast<jint>(phase);
+}
+
+jlong JNICALL NativeTime(JNIEnv* env, jclass) {
+    jlong value = 0;
+    const jvmtiError error = gJvmti->GetTime(&value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetTime", error);
+        return 0;
+    }
+    return value;
+}
+
+jint JNICALL NativeAvailableProcessors(JNIEnv* env, jclass) {
+    jint value = 0;
+    const jvmtiError error = gJvmti->GetAvailableProcessors(&value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetAvailableProcessors", error);
+        return 0;
+    }
+    return value;
+}
+
+jint JNICALL NativeLocationFormat(JNIEnv* env, jclass) {
+    jvmtiJlocationFormat format{};
+    const jvmtiError error = gJvmti->GetJLocationFormat(&format);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetJLocationFormat", error);
+        return 0;
+    }
+    return static_cast<jint>(format);
+}
+
+std::string ObjectTypeName(JNIEnv* env, jobject object) {
+    if (object == nullptr) return "";
+    jclass type = env->GetObjectClass(object);
+    const std::string result = type == nullptr ? "" : BinaryClassName(type);
+    if (type != nullptr) env->DeleteLocalRef(type);
+    return result;
+}
+
+jobjectArray ClassArray(JNIEnv* env, jint count, jclass* classes) {
+    jclass classClass = env->FindClass("java/lang/Class");
+    jobjectArray result = classClass == nullptr ? nullptr : env->NewObjectArray(count, classClass, nullptr);
+    for (jint index = 0; result != nullptr && index < count; ++index) {
+        env->SetObjectArrayElement(result, index, classes[index]);
+        env->DeleteLocalRef(classes[index]);
+    }
+    if (classes != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(classes));
+    if (classClass != nullptr) env->DeleteLocalRef(classClass);
+    return result;
+}
+
+jobjectArray JNICALL NativeClassInfo(JNIEnv* env, jclass, jclass klass) {
+    if (klass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
+        return nullptr;
+    }
+    char* signature = nullptr;
+    char* generic = nullptr;
+    char* source = nullptr;
+    jint status = 0;
+    jint modifiers = 0;
+    jint minorVersion = -1;
+    jint majorVersion = -1;
+    jboolean interfaceType = JNI_FALSE;
+    jboolean arrayType = JNI_FALSE;
+    jboolean modifiable = JNI_FALSE;
+    jvmtiError error = gJvmti->GetClassSignature(klass, &signature, &generic);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetClassStatus(klass, &status);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetClassModifiers(klass, &modifiers);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->IsInterface(klass, &interfaceType);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->IsArrayClass(klass, &arrayType);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->IsModifiableClass(klass, &modifiable);
+    if (error == JVMTI_ERROR_NONE) {
+        const jvmtiError versionError = gJvmti->GetClassVersionNumbers(klass, &minorVersion, &majorVersion);
+        if (versionError != JVMTI_ERROR_NONE && versionError != JVMTI_ERROR_ABSENT_INFORMATION) {
+            error = versionError;
+        }
+    }
+    const jvmtiError sourceError = gJvmti->GetSourceFileName(klass, &source);
+    if (error == JVMTI_ERROR_NONE && sourceError != JVMTI_ERROR_NONE
+            && sourceError != JVMTI_ERROR_ABSENT_INFORMATION
+            && sourceError != JVMTI_ERROR_MUST_POSSESS_CAPABILITY) error = sourceError;
+    if (error != JVMTI_ERROR_NONE) ThrowJvmti(env, "Get class information", error);
+    std::vector<std::string> values = {
+        signature == nullptr ? "" : signature,
+        generic == nullptr ? "" : generic,
+        source == nullptr ? "" : source,
+        std::to_string(status), std::to_string(modifiers),
+        interfaceType == JNI_TRUE ? "true" : "false",
+        arrayType == JNI_TRUE ? "true" : "false",
+        modifiable == JNI_TRUE ? "true" : "false",
+        std::to_string(minorVersion), std::to_string(majorVersion)
+    };
+    if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    if (source != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(source));
+    return env->ExceptionCheck() ? nullptr : NewStringArray(env, values);
+}
+
+jobjectArray JNICALL NativeImplementedInterfaces(JNIEnv* env, jclass, jclass klass) {
+    jint count = 0;
+    jclass* interfaces = nullptr;
+    const jvmtiError error = gJvmti->GetImplementedInterfaces(klass, &count, &interfaces);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetImplementedInterfaces", error);
+        return nullptr;
+    }
+    return ClassArray(env, count, interfaces);
+}
+
+jobject JNICALL NativeClassLoader(JNIEnv* env, jclass, jclass klass) {
+    jobject loader = nullptr;
+    const jvmtiError error = gJvmti->GetClassLoader(klass, &loader);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetClassLoader", error);
+        return nullptr;
+    }
+    return loader;
+}
+
+jobjectArray JNICALL NativeClassLoaderClasses(JNIEnv* env, jclass, jobject loader) {
+    jint count = 0;
+    jclass* classes = nullptr;
+    const jvmtiError error = gJvmti->GetClassLoaderClasses(loader, &count, &classes);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetClassLoaderClasses", error);
+        return nullptr;
+    }
+    return ClassArray(env, count, classes);
+}
+
+jobjectArray JNICALL NativeMethodInfo(JNIEnv* env, jclass, jclass klass,
+        jstring nameValue, jstring descriptorValue) {
+    const std::string name = JStringToUtf8(env, nameValue);
+    const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    jmethodID method = ResolveMethod(env, klass, name, descriptor);
+    if (method == nullptr) return nullptr;
+    char* actualName = nullptr;
+    char* actualDescriptor = nullptr;
+    char* generic = nullptr;
+    jint modifiers = 0;
+    jint maxLocals = -1;
+    jint argumentSize = -1;
+    jlocation start = 0;
+    jlocation end = 0;
+    jboolean nativeMethod = JNI_FALSE;
+    jboolean synthetic = JNI_FALSE;
+    jboolean obsolete = JNI_FALSE;
+    jvmtiError error = gJvmti->GetMethodName(method, &actualName, &actualDescriptor, &generic);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetMethodModifiers(method, &modifiers);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->IsMethodNative(method, &nativeMethod);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->IsMethodObsolete(method, &obsolete);
+    const jvmtiError syntheticError = gJvmti->IsMethodSynthetic(method, &synthetic);
+    if (error == JVMTI_ERROR_NONE && syntheticError != JVMTI_ERROR_NONE
+            && syntheticError != JVMTI_ERROR_MUST_POSSESS_CAPABILITY) error = syntheticError;
+    if (nativeMethod != JNI_TRUE) {
+        const jvmtiError localsError = gJvmti->GetMaxLocals(method, &maxLocals);
+        const jvmtiError argumentsError = gJvmti->GetArgumentsSize(method, &argumentSize);
+        const jvmtiError locationError = gJvmti->GetMethodLocation(method, &start, &end);
+        if (error == JVMTI_ERROR_NONE && localsError != JVMTI_ERROR_NONE) error = localsError;
+        if (error == JVMTI_ERROR_NONE && argumentsError != JVMTI_ERROR_NONE) error = argumentsError;
+        if (error == JVMTI_ERROR_NONE && locationError != JVMTI_ERROR_NONE) error = locationError;
+    }
+    if (error != JVMTI_ERROR_NONE) ThrowJvmti(env, "Get method information", error);
+    std::vector<std::string> values = {
+        generic == nullptr ? "" : generic, std::to_string(modifiers),
+        std::to_string(maxLocals), std::to_string(argumentSize),
+        std::to_string(start), std::to_string(end),
+        nativeMethod == JNI_TRUE ? "true" : "false",
+        synthetic == JNI_TRUE ? "true" : "false",
+        obsolete == JNI_TRUE ? "true" : "false"
+    };
+    if (actualName != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(actualName));
+    if (actualDescriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(actualDescriptor));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    return env->ExceptionCheck() ? nullptr : NewStringArray(env, values);
+}
+
+jbyteArray JNICALL NativeMethodBytecodes(JNIEnv* env, jclass, jclass klass,
+        jstring nameValue, jstring descriptorValue) {
+    jmethodID method = ResolveMethod(env, klass, JStringToUtf8(env, nameValue),
+        JStringToUtf8(env, descriptorValue));
+    if (method == nullptr) return nullptr;
+    jint count = 0;
+    unsigned char* bytecodes = nullptr;
+    const jvmtiError error = gJvmti->GetBytecodes(method, &count, &bytecodes);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetBytecodes", error);
+        return nullptr;
+    }
+    jbyteArray result = env->NewByteArray(count);
+    if (result != nullptr && count > 0) env->SetByteArrayRegion(
+        result, 0, count, reinterpret_cast<jbyte*>(bytecodes));
+    if (bytecodes != nullptr) gJvmti->Deallocate(bytecodes);
+    return result;
+}
+
+jobjectArray JNICALL NativeLineNumberTable(JNIEnv* env, jclass, jclass klass,
+        jstring nameValue, jstring descriptorValue) {
+    jmethodID method = ResolveMethod(env, klass, JStringToUtf8(env, nameValue),
+        JStringToUtf8(env, descriptorValue));
+    if (method == nullptr) return nullptr;
+    jint count = 0;
+    jvmtiLineNumberEntry* table = nullptr;
+    const jvmtiError error = gJvmti->GetLineNumberTable(method, &count, &table);
+    if (error == JVMTI_ERROR_ABSENT_INFORMATION) return NewStringArray(env, {});
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetLineNumberTable", error);
+        return nullptr;
+    }
+    std::vector<std::string> values;
+    values.reserve(static_cast<std::size_t>(count));
+    for (jint index = 0; index < count; ++index) {
+        values.push_back(std::to_string(table[index].start_location) + "|"
+            + std::to_string(table[index].line_number));
+    }
+    if (table != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table));
+    return NewStringArray(env, values);
+}
+
+jobjectArray JNICALL NativeFieldInfo(JNIEnv* env, jclass, jclass klass,
+        jstring nameValue, jstring descriptorValue) {
+    const std::string name = JStringToUtf8(env, nameValue);
+    const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    jfieldID field = ResolveField(env, klass, name, descriptor);
+    if (field == nullptr) return nullptr;
+    char* actualName = nullptr;
+    char* actualDescriptor = nullptr;
+    char* generic = nullptr;
+    jint modifiers = 0;
+    jboolean synthetic = JNI_FALSE;
+    jclass declaring = nullptr;
+    jvmtiError error = gJvmti->GetFieldName(klass, field, &actualName, &actualDescriptor, &generic);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetFieldModifiers(klass, field, &modifiers);
+    if (error == JVMTI_ERROR_NONE) error = gJvmti->GetFieldDeclaringClass(klass, field, &declaring);
+    const jvmtiError syntheticError = gJvmti->IsFieldSynthetic(klass, field, &synthetic);
+    if (error == JVMTI_ERROR_NONE && syntheticError != JVMTI_ERROR_NONE
+            && syntheticError != JVMTI_ERROR_MUST_POSSESS_CAPABILITY) error = syntheticError;
+    if (error != JVMTI_ERROR_NONE) ThrowJvmti(env, "Get field information", error);
+    std::vector<std::string> values = {
+        generic == nullptr ? "" : generic, std::to_string(modifiers),
+        synthetic == JNI_TRUE ? "true" : "false",
+        declaring == nullptr ? "" : BinaryClassName(declaring)
+    };
+    if (actualName != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(actualName));
+    if (actualDescriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(actualDescriptor));
+    if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    if (declaring != nullptr) env->DeleteLocalRef(declaring);
+    return env->ExceptionCheck() ? nullptr : NewStringArray(env, values);
+}
+
+jstring JNICALL NativeSourceDebugExtension(JNIEnv* env, jclass, jclass klass) {
+    char* extension = nullptr;
+    const jvmtiError error = gJvmti->GetSourceDebugExtension(klass, &extension);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetSourceDebugExtension", error);
+        return nullptr;
+    }
+    jstring result = env->NewStringUTF(extension == nullptr ? "" : extension);
+    if (extension != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(extension));
+    return result;
+}
+
+jbyteArray JNICALL NativeConstantPool(JNIEnv* env, jclass, jclass klass) {
+    jint constantCount = 0;
+    jint byteCount = 0;
+    unsigned char* bytes = nullptr;
+    const jvmtiError error = gJvmti->GetConstantPool(klass, &constantCount, &byteCount, &bytes);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetConstantPool", error);
+        return nullptr;
+    }
+    jbyteArray result = env->NewByteArray(byteCount);
+    if (result != nullptr && byteCount > 0) env->SetByteArrayRegion(
+        result, 0, byteCount, reinterpret_cast<jbyte*>(bytes));
+    if (bytes != nullptr) gJvmti->Deallocate(bytes);
+    return result;
+}
+
 jobjectArray JNICALL NativeGetAllThreads(JNIEnv* env, jclass) {
     jint count = 0;
     jthread* threads = nullptr;
@@ -1790,6 +2175,79 @@ void JNICALL NativeThreadControl(JNIEnv* env, jclass, jthread thread, jint opera
     ThrowJvmti(env, name, error);
 }
 
+jobjectArray JNICALL NativeThreadInfo(JNIEnv* env, jclass, jthread thread) {
+    jvmtiThreadInfo info{};
+    const jvmtiError error = gJvmti->GetThreadInfo(thread, &info);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetThreadInfo", error);
+        return nullptr;
+    }
+    jint state = 0;
+    gJvmti->GetThreadState(thread, &state);
+    std::vector<std::string> values = {
+        info.name == nullptr ? "" : info.name,
+        std::to_string(info.priority), info.is_daemon == JNI_TRUE ? "true" : "false",
+        ObjectTypeName(env, info.thread_group), ObjectTypeName(env, info.context_class_loader),
+        std::to_string(state)
+    };
+    if (info.name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(info.name));
+    if (info.thread_group != nullptr) env->DeleteLocalRef(info.thread_group);
+    if (info.context_class_loader != nullptr) env->DeleteLocalRef(info.context_class_loader);
+    return NewStringArray(env, values);
+}
+
+jint JNICALL NativeFrameCount(JNIEnv* env, jclass, jthread thread) {
+    jint count = 0;
+    const jvmtiError error = gJvmti->GetFrameCount(thread, &count);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetFrameCount", error);
+        return 0;
+    }
+    return count;
+}
+
+jlong JNICALL NativeThreadCpuTime(JNIEnv* env, jclass, jthread thread) {
+    jlong value = 0;
+    const jvmtiError error = gJvmti->GetThreadCpuTime(thread, &value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetThreadCpuTime", error);
+        return 0;
+    }
+    return value;
+}
+
+jobjectArray ObjectArray(JNIEnv* env, jint count, jobject* objects) {
+    jobjectArray result = gObjectClass == nullptr ? nullptr
+        : env->NewObjectArray(count, gObjectClass, nullptr);
+    for (jint index = 0; result != nullptr && index < count; ++index) {
+        env->SetObjectArrayElement(result, index, objects[index]);
+        env->DeleteLocalRef(objects[index]);
+    }
+    if (objects != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(objects));
+    return result;
+}
+
+jobjectArray JNICALL NativeOwnedMonitors(JNIEnv* env, jclass, jthread thread) {
+    jint count = 0;
+    jobject* monitors = nullptr;
+    const jvmtiError error = gJvmti->GetOwnedMonitorInfo(thread, &count, &monitors);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetOwnedMonitorInfo", error);
+        return nullptr;
+    }
+    return ObjectArray(env, count, monitors);
+}
+
+jobject JNICALL NativeCurrentContendedMonitor(JNIEnv* env, jclass, jthread thread) {
+    jobject monitor = nullptr;
+    const jvmtiError error = gJvmti->GetCurrentContendedMonitor(thread, &monitor);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetCurrentContendedMonitor", error);
+        return nullptr;
+    }
+    return monitor;
+}
+
 jlong JNICALL NativeGetObjectSize(JNIEnv* env, jclass, jobject object) {
     jlong size = 0;
     const jvmtiError error = gJvmti->GetObjectSize(object, &size);
@@ -1798,6 +2256,54 @@ jlong JNICALL NativeGetObjectSize(JNIEnv* env, jclass, jobject object) {
         return 0;
     }
     return size;
+}
+
+jint JNICALL NativeGetObjectHashCode(JNIEnv* env, jclass, jobject object) {
+    jint value = 0;
+    const jvmtiError error = gJvmti->GetObjectHashCode(object, &value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetObjectHashCode", error);
+        return 0;
+    }
+    return value;
+}
+
+jobjectArray JNICALL NativeObjectMonitorUsage(JNIEnv* env, jclass, jobject object) {
+    jvmtiMonitorUsage usage{};
+    const jvmtiError error = gJvmti->GetObjectMonitorUsage(object, &usage);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetObjectMonitorUsage", error);
+        return nullptr;
+    }
+    std::vector<std::string> values = {
+        ObjectTypeName(env, usage.owner), std::to_string(usage.entry_count),
+        std::to_string(usage.waiter_count), std::to_string(usage.notify_waiter_count)
+    };
+    if (usage.owner != nullptr) env->DeleteLocalRef(usage.owner);
+    for (jint index = 0; index < usage.waiter_count; ++index) {
+        if (usage.waiters[index] != nullptr) env->DeleteLocalRef(usage.waiters[index]);
+    }
+    for (jint index = 0; index < usage.notify_waiter_count; ++index) {
+        if (usage.notify_waiters[index] != nullptr) env->DeleteLocalRef(usage.notify_waiters[index]);
+    }
+    if (usage.waiters != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(usage.waiters));
+    if (usage.notify_waiters != nullptr) {
+        gJvmti->Deallocate(reinterpret_cast<unsigned char*>(usage.notify_waiters));
+    }
+    return NewStringArray(env, values);
+}
+
+jobjectArray JNICALL NativeObjectsWithTag(JNIEnv* env, jclass, jlong tag) {
+    jint count = 0;
+    jobject* objects = nullptr;
+    jlong* tags = nullptr;
+    const jvmtiError error = gJvmti->GetObjectsWithTags(1, &tag, &count, &objects, &tags);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetObjectsWithTags", error);
+        return nullptr;
+    }
+    if (tags != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(tags));
+    return ObjectArray(env, count, objects);
 }
 
 jlong JNICALL NativeGetTag(JNIEnv* env, jclass, jobject object) {
@@ -1838,6 +2344,86 @@ jobjectArray JNICALL NativeSystemProperties(JNIEnv* env, jclass) {
     }
     if (properties != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(properties));
     return NewStringArray(env, values);
+}
+
+jstring JNICALL NativeGetSystemProperty(JNIEnv* env, jclass, jstring nameValue) {
+    const std::string name = JStringToUtf8(env, nameValue);
+    if (name.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Property name must not be empty");
+        return nullptr;
+    }
+    char* value = nullptr;
+    const jvmtiError error = gJvmti->GetSystemProperty(name.c_str(), &value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetSystemProperty", error);
+        return nullptr;
+    }
+    jstring result = env->NewStringUTF(value == nullptr ? "" : value);
+    if (value != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(value));
+    return result;
+}
+
+void JNICALL NativeSetSystemProperty(
+        JNIEnv* env, jclass, jstring nameValue, jstring propertyValue) {
+    const std::string name = JStringToUtf8(env, nameValue);
+    const std::string value = JStringToUtf8(env, propertyValue);
+    if (name.empty() || propertyValue == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Property name and value are required");
+        return;
+    }
+    ThrowJvmti(env, "SetSystemProperty", gJvmti->SetSystemProperty(name.c_str(), value.c_str()));
+}
+
+jlong JNICALL NativeCurrentThreadCpuTime(JNIEnv* env, jclass) {
+    jlong value = 0;
+    const jvmtiError error = gJvmti->GetCurrentThreadCpuTime(&value);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetCurrentThreadCpuTime", error);
+        return 0;
+    }
+    return value;
+}
+
+jobjectArray JNICALL NativeTimerInfo(JNIEnv* env, jclass) {
+    jvmtiTimerInfo info{};
+    const jvmtiError error = gJvmti->GetTimerInfo(&info);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetTimerInfo", error);
+        return nullptr;
+    }
+    return NewStringArray(env, {std::to_string(info.max_value),
+        info.may_skip_forward == JNI_TRUE ? "true" : "false",
+        info.may_skip_backward == JNI_TRUE ? "true" : "false",
+        std::to_string(static_cast<int>(info.kind))});
+}
+
+void JNICALL NativeGenerateEvents(JNIEnv* env, jclass, jstring eventNameValue) {
+    const std::string eventName = JStringToUtf8(env, eventNameValue);
+    jvmtiEvent event{};
+    if (!ResolveEvent(eventName, &event)) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Unsupported JVMTI event: " + eventName);
+        return;
+    }
+    ThrowJvmti(env, "GenerateEvents", gJvmti->GenerateEvents(event));
+}
+
+void JNICALL NativeSetVerboseFlag(
+        JNIEnv* env, jclass, jstring flagNameValue, jboolean enabled) {
+    std::string name = JStringToUtf8(env, flagNameValue);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    jvmtiVerboseFlag flag{};
+    if (name == "other") flag = JVMTI_VERBOSE_OTHER;
+    else if (name == "gc") flag = JVMTI_VERBOSE_GC;
+    else if (name == "class") flag = JVMTI_VERBOSE_CLASS;
+    else if (name == "jni") flag = JVMTI_VERBOSE_JNI;
+    else {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "Verbose flag must be other, gc, class or jni");
+        return;
+    }
+    ThrowJvmti(env, "SetVerboseFlag", gJvmti->SetVerboseFlag(flag, enabled));
 }
 
 JNINativeMethod kRuntimeMethods[] = {
@@ -1895,6 +2481,42 @@ JNINativeMethod kJvmtiMethods[] = {
      reinterpret_cast<void*>(&NativeCapabilities)},
     {const_cast<char*>("capabilityStatuses"), const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeCapabilityStatuses)},
+    {const_cast<char*>("changeCapabilities"), const_cast<char*>("([Ljava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeChangeCapabilities)},
+    {const_cast<char*>("phase"), const_cast<char*>("()I"),
+     reinterpret_cast<void*>(&NativePhase)},
+    {const_cast<char*>("time"), const_cast<char*>("()J"),
+     reinterpret_cast<void*>(&NativeTime)},
+    {const_cast<char*>("availableProcessors"), const_cast<char*>("()I"),
+     reinterpret_cast<void*>(&NativeAvailableProcessors)},
+    {const_cast<char*>("locationFormat"), const_cast<char*>("()I"),
+     reinterpret_cast<void*>(&NativeLocationFormat)},
+    {const_cast<char*>("classInfo"), const_cast<char*>("(Ljava/lang/Class;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeClassInfo)},
+    {const_cast<char*>("implementedInterfaces"), const_cast<char*>("(Ljava/lang/Class;)[Ljava/lang/Class;"),
+     reinterpret_cast<void*>(&NativeImplementedInterfaces)},
+    {const_cast<char*>("classLoader"), const_cast<char*>("(Ljava/lang/Class;)Ljava/lang/ClassLoader;"),
+     reinterpret_cast<void*>(&NativeClassLoader)},
+    {const_cast<char*>("classLoaderClasses"),
+     const_cast<char*>("(Ljava/lang/ClassLoader;)[Ljava/lang/Class;"),
+     reinterpret_cast<void*>(&NativeClassLoaderClasses)},
+    {const_cast<char*>("methodInfo"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeMethodInfo)},
+    {const_cast<char*>("methodBytecodes"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[B"),
+     reinterpret_cast<void*>(&NativeMethodBytecodes)},
+    {const_cast<char*>("lineNumberTable"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeLineNumberTable)},
+    {const_cast<char*>("fieldInfo"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeFieldInfo)},
+    {const_cast<char*>("sourceDebugExtension"),
+     const_cast<char*>("(Ljava/lang/Class;)Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeSourceDebugExtension)},
+    {const_cast<char*>("constantPool"), const_cast<char*>("(Ljava/lang/Class;)[B"),
+     reinterpret_cast<void*>(&NativeConstantPool)},
     {const_cast<char*>("getAllThreads"), const_cast<char*>("()[Ljava/lang/Thread;"),
      reinterpret_cast<void*>(&NativeGetAllThreads)},
     {const_cast<char*>("getThreadState"), const_cast<char*>("(Ljava/lang/Thread;)I"),
@@ -1903,8 +2525,26 @@ JNINativeMethod kJvmtiMethods[] = {
      reinterpret_cast<void*>(&NativeGetStackTrace)},
     {const_cast<char*>("threadControl"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeThreadControl)},
+    {const_cast<char*>("threadInfo"), const_cast<char*>("(Ljava/lang/Thread;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeThreadInfo)},
+    {const_cast<char*>("frameCount"), const_cast<char*>("(Ljava/lang/Thread;)I"),
+     reinterpret_cast<void*>(&NativeFrameCount)},
+    {const_cast<char*>("threadCpuTime"), const_cast<char*>("(Ljava/lang/Thread;)J"),
+     reinterpret_cast<void*>(&NativeThreadCpuTime)},
+    {const_cast<char*>("ownedMonitors"), const_cast<char*>("(Ljava/lang/Thread;)[Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeOwnedMonitors)},
+    {const_cast<char*>("currentContendedMonitor"),
+     const_cast<char*>("(Ljava/lang/Thread;)Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeCurrentContendedMonitor)},
     {const_cast<char*>("getObjectSize"), const_cast<char*>("(Ljava/lang/Object;)J"),
      reinterpret_cast<void*>(&NativeGetObjectSize)},
+    {const_cast<char*>("getObjectHashCode"), const_cast<char*>("(Ljava/lang/Object;)I"),
+     reinterpret_cast<void*>(&NativeGetObjectHashCode)},
+    {const_cast<char*>("objectMonitorUsage"),
+     const_cast<char*>("(Ljava/lang/Object;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeObjectMonitorUsage)},
+    {const_cast<char*>("objectsWithTag"), const_cast<char*>("(J)[Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeObjectsWithTag)},
     {const_cast<char*>("getTag"), const_cast<char*>("(Ljava/lang/Object;)J"),
      reinterpret_cast<void*>(&NativeGetTag)},
     {const_cast<char*>("setTag"), const_cast<char*>("(Ljava/lang/Object;J)V"),
@@ -1913,6 +2553,19 @@ JNINativeMethod kJvmtiMethods[] = {
      reinterpret_cast<void*>(&NativeForceGarbageCollection)},
     {const_cast<char*>("systemProperties"), const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeSystemProperties)},
+    {const_cast<char*>("getSystemProperty"), const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeGetSystemProperty)},
+    {const_cast<char*>("setSystemProperty"),
+     const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;)V"),
+     reinterpret_cast<void*>(&NativeSetSystemProperty)},
+    {const_cast<char*>("currentThreadCpuTime"), const_cast<char*>("()J"),
+     reinterpret_cast<void*>(&NativeCurrentThreadCpuTime)},
+    {const_cast<char*>("timerInfo"), const_cast<char*>("()[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeTimerInfo)},
+    {const_cast<char*>("generateEvents"), const_cast<char*>("(Ljava/lang/String;)V"),
+     reinterpret_cast<void*>(&NativeGenerateEvents)},
+    {const_cast<char*>("setVerboseFlag"), const_cast<char*>("(Ljava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeSetVerboseFlag)},
 };
 
 bool RequestAllCapabilities() {
