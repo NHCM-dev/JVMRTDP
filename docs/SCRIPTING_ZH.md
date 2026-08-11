@@ -234,7 +234,29 @@ export value @items output/items.txt
 release @items @first @second @added @count
 ```
 
-## 13. 错误语义
+## 13. 通过 Java 库运行脚本
+
+已连接的库会话可以执行相同的脚本命令并捕获结果：
+
+```java
+JvmRtdpCommandResult result = session.execute("script workflow.jrd");
+if (!result.successful()) {
+    throw new IllegalStateException(result.failureMessage());
+}
+System.out.print(result.standardOutput());
+```
+
+脚本中的 `command` 指令通过同一个持久会话上下文运行。远程变量会保留到被替换、释放或会话关闭。
+
+需要机器可读的调试数据时，可在脚本或 Java API 中使用：
+
+```text
+command debugger snapshot output/debugger.json json
+```
+
+会话所有权和线程安全规则见 [Java 库指南](LIBRARY_ZH.md)。
+
+## 14. 错误语义
 
 - 解析或执行遇到第一个错误时停止。
 - 解析错误包含源文件行号。

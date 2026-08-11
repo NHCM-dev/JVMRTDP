@@ -90,6 +90,21 @@ JVMRTDP 通过原生代理和 Java 桥接层提供常用 JVMTI 诊断与调试�
 
 这些接口需要额外的生命周期、回调和并发约束。JVMRTDP 优先通过受控的高层命令提供等价诊断结果。
 
+## Java 库 API
+
+已连接的 `JvmRtdpSession` 通过 `session.jvmti()` 提供类型化 `RemoteJVMTIEnv`。库代码无需解析 CLI 输出，即可查询 capability、枚举线程、检查栈与 local、配置断点和监视点、管理 tag、转换类并部署回调。
+
+```java
+try (JvmRtdpClient client = JvmRtdpClient.open();
+     JvmRtdpSession session = client.attach(pid)) {
+    for (JvmtiCapabilityStatus status : session.jvmti().capabilityStatuses()) {
+        System.out.println(status);
+    }
+}
+```
+
+线程、对象、回调和部署句柄应确定性关闭。关闭会话时，会先恢复由调试器分析冻结拥有的线程，再关闭协议连接。详见 [Java 库指南](LIBRARY_ZH.md)。
+
 ## 兼容性说明
 
 - 原生桥接以 Java 8 JVMTI ABI 为兼容基线。

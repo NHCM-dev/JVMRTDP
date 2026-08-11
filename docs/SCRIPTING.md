@@ -234,7 +234,29 @@ export value @items output/items.txt
 release @items @first @second @added @count
 ```
 
-## 13. Error Semantics
+## 13. Run Scripts from the Java Library
+
+An attached library session can run the same script command and capture its result:
+
+```java
+JvmRtdpCommandResult result = session.execute("script workflow.jrd");
+if (!result.successful()) {
+    throw new IllegalStateException(result.failureMessage());
+}
+System.out.print(result.standardOutput());
+```
+
+Script `command` instructions run through the same persistent session context. Remote variables remain in the session workspace until replaced, released, or the session closes.
+
+For machine-readable debugger data, use a command instruction or the Java API:
+
+```text
+command debugger snapshot output/debugger.json json
+```
+
+See the [Java Library Guide](LIBRARY.md) for session ownership and thread-safety rules.
+
+## 14. Error Semantics
 
 - Parsing or execution stops at the first error.
 - Errors include the source line number when parsing fails.

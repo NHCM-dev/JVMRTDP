@@ -1,6 +1,7 @@
 plugins {
-    id 'java'
+    id 'java-library'
     id 'application'
+    id 'maven-publish'
 }
 
 group = 'nhcm.jvmrtdp'
@@ -10,6 +11,8 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(8)
     }
+    withSourcesJar()
+    withJavadocJar()
 }
 
 application {
@@ -236,6 +239,18 @@ tasks.withType(JavaCompile).configureEach {
     targetCompatibility = JavaVersion.VERSION_1_8
 }
 
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.charSet = 'UTF-8'
+    options.docEncoding = 'UTF-8'
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+tasks.named('sourcesJar') {
+    dependsOn 'generateBuildInfo', 'copyNativeLibraries'
+    exclude 'natives/**'
+}
+
 tasks.named('test') {
     useJUnitPlatform()
 }
@@ -253,8 +268,62 @@ jar {
     manifest {
         attributes(
                 'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump',
+                'Automatic-Module-Name': 'nhcm.jvmrtdp',
                 'Implementation-Title': 'JVMRTDP',
                 'Implementation-Version': project.version
         )
+    }
+}
+
+tasks.register('libraryJar', Jar) {
+    group = 'build'
+    description = 'Builds the dependency-friendly JVMRTDP library without bundled third-party runtime dependencies.'
+    dependsOn tasks.named('classes'), tasks.named('compileCfrSources'),
+            tasks.named('compileProcyonCompilerSources')
+    archiveBaseName = 'jvmrtdp'
+    archiveClassifier = 'library'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from sourceSets.main.output
+    from cfrClasses
+    from procyonCoreClasses
+    from procyonCompilerClasses
+    manifest {
+        attributes(
+                'Automatic-Module-Name': 'nhcm.jvmrtdp',
+                'Implementation-Title': 'JVMRTDP Java Library',
+                'Implementation-Version': project.version
+        )
+    }
+}
+
+tasks.named('assemble') {
+    dependsOn tasks.named('libraryJar')
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifactId = 'jvmrtdp'
+            artifact(tasks.named('libraryJar')) {
+                classifier = null
+            }
+            artifact(tasks.named('sourcesJar'))
+            artifact(tasks.named('javadocJar'))
+            pom {
+                name = 'JVMRTDP'
+                description = 'Java API and terminal tools for diagnostics, analysis, and debugging of HotSpot JVMs.'
+            }
+            pom.withXml {
+                def dependenciesNode = asNode().appendNode('dependencies')
+                [['org.jline', 'jline', '3.30.0'],
+                 ['org.jline', 'jline-terminal-jni', '3.30.0']].each { coordinates ->
+                    def dependencyNode = dependenciesNode.appendNode('dependency')
+                    dependencyNode.appendNode('groupId', coordinates[0])
+                    dependencyNode.appendNode('artifactId', coordinates[1])
+                    dependencyNode.appendNode('version', coordinates[2])
+                    dependencyNode.appendNode('scope', 'runtime')
+                }
+            }
+        }
     }
 }

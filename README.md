@@ -39,8 +39,11 @@ Build outputs:
 
 ```text
 build/libs/JVMRTDP-2.0.0.jar
+build/libs/jvmrtdp-2.0.0-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
+
+`JVMRTDP-2.0.0.jar` is the self-contained executable. `jvmrtdp-2.0.0-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
 
 To publish the agent DLL to the conventional location:
 
@@ -226,6 +229,35 @@ script workflow.jrd
 
 See the [Scripting Guide](docs/SCRIPTING.md) for the full syntax. Use debugger snapshots in `json` or `jsonl` format when another program consumes debugger data.
 
+## Java Library
+
+Publish the current build to the local Maven repository:
+
+```powershell
+.\gradlew.bat publishToMavenLocal
+```
+
+```kotlin
+repositories { mavenLocal() }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0") }
+```
+
+Discover and attach to a JVM from Java:
+
+```java
+import nhcm.jvmrtdp.api.JvmRtdpClient;
+import nhcm.jvmrtdp.api.JvmRtdpCommandResult;
+import nhcm.jvmrtdp.api.JvmRtdpSession;
+
+try (JvmRtdpClient client = JvmRtdpClient.open();
+     JvmRtdpSession session = client.attach(pid)) {
+    JvmRtdpCommandResult result = session.execute("jvmti phase").requireSuccess();
+    System.out.print(result.standardOutput());
+}
+```
+
+The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, and direct access to JNI, JVMTI, contexts, remote objects, decompilation, and debugger services. See the [Java Library Guide](docs/LIBRARY.md).
+
 ## Safety and Behavior
 
 - The agent listens only on the loopback interface and generates a random token for each session.
@@ -240,3 +272,4 @@ See the [Scripting Guide](docs/SCRIPTING.md) for the full syntax. Use debugger s
 - [Command Reference](docs/COMMANDS.md)
 - [Scripting Guide](docs/SCRIPTING.md)
 - [JVMTI API Coverage](docs/JVMTI-API-COVERAGE.md)
+- [Java Library Guide](docs/LIBRARY.md)

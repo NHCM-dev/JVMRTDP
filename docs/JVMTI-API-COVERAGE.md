@@ -90,6 +90,21 @@ The following low-level interfaces are not regular user commands:
 
 These interfaces require additional lifecycle, callback, and concurrency guarantees. JVMRTDP favors controlled high-level commands that provide equivalent diagnostic results.
 
+## Java Library API
+
+An attached `JvmRtdpSession` exposes the typed `RemoteJVMTIEnv` through `session.jvmti()`. Library code can query capabilities, enumerate threads, inspect stacks and locals, configure breakpoints or watchpoints, manage tags, transform classes, and deploy callbacks without parsing CLI output.
+
+```java
+try (JvmRtdpClient client = JvmRtdpClient.open();
+     JvmRtdpSession session = client.attach(pid)) {
+    for (JvmtiCapabilityStatus status : session.jvmti().capabilityStatuses()) {
+        System.out.println(status);
+    }
+}
+```
+
+Close thread, object, callback, and deployment handles deterministically. Closing the session restores debugger-owned frozen threads before closing the protocol connection. See the [Java Library Guide](LIBRARY.md).
+
 ## Compatibility
 
 - The native bridge uses the Java 8 JVMTI ABI as its compatibility baseline.

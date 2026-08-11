@@ -419,7 +419,33 @@ script <file.jrd>
 
 A batch file contains one target command per line and stops when a command closes the session. Scripts add variables, conditional branches, labels, and reference management; see the [Scripting Guide](SCRIPTING.md).
 
-## 13. Common Errors
+## 13. Java Library API
+
+Every context-oriented command in this reference can be executed through an attached library session:
+
+```java
+JvmRtdpCommandResult result = session.execute(
+        "bytecode com.example.Application main ([Ljava/lang/String;)V");
+result.requireSuccess();
+System.out.print(result.standardOutput());
+```
+
+Use `session.executeAgent()` only for commands implemented directly by the target agent, such as `ping`, `info`, and `native`. Controller-side commands such as `context`, `find`, `decompile`, and `debugger` use `session.execute()` or the corresponding typed API.
+
+The following library accessors avoid textual output:
+
+```text
+session.jni()
+session.jvmti()
+session.operations()
+session.context()
+session.workspace()
+session.debugger()
+```
+
+See the [Java Library Guide](LIBRARY.md) for dependencies, lifecycle rules, async calls, and complete examples.
+
+## 14. Common Errors
 
 - `JNI/JVMTI bridge is unavailable`: the JAR and native agent do not match, or the target did not load the agent correctly.
 - `capability is not potential`: the capability cannot be acquired in the current phase; load the agent at startup with `-agentpath`.

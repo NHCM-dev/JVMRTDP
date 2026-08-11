@@ -419,7 +419,33 @@ script <file.jrd>
 
 批处理文件每行是一条目标命令，并在命令关闭会话时停止。脚本提供变量、条件分支、标签和引用管理，详见[脚本指南](SCRIPTING_ZH.md)。
 
-## 13. 常见错误
+## 13. Java 库 API
+
+本参考中的所有上下文命令都可以通过已连接的库会话执行：
+
+```java
+JvmRtdpCommandResult result = session.execute(
+        "bytecode com.example.Application main ([Ljava/lang/String;)V");
+result.requireSuccess();
+System.out.print(result.standardOutput());
+```
+
+`session.executeAgent()` 只用于目标 agent 直接实现的命令，例如 `ping`、`info` 和 `native`。`context`、`find`、`decompile` 和 `debugger` 等控制端命令使用 `session.execute()` 或对应类型化 API。
+
+以下入口可避免解析文本输出：
+
+```text
+session.jni()
+session.jvmti()
+session.operations()
+session.context()
+session.workspace()
+session.debugger()
+```
+
+依赖、生命周期、异步调用和完整示例见 [Java 库指南](LIBRARY_ZH.md)。
+
+## 14. 常见错误
 
 - `JNI/JVMTI bridge is unavailable`：JAR 与原生代理不匹配，或目标未正确加载代理。
 - `capability is not potential`：当前阶段无法获取该 capability；使用 `-agentpath` 在启动阶段加载。

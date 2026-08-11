@@ -125,11 +125,23 @@ public class InteractiveCli {
     /** Executes one command or an unquoted {@code ->} temporary reference chain. */
     boolean execute(TargetSession session, String rawLine) {
         try {
-            return executePipeline(session, rawLine);
+            return executeCommand(session, rawLine);
         } catch (Exception exception) {
             session.error().println("Command failed: " + exception.getMessage());
             return session.server().isOpen();
         }
+    }
+
+    /**
+     * Executes one context command without entering the interactive prompt.
+     *
+     * <p>This method is intended for embedded/library use. Failures are propagated to the caller,
+     * while normal command output is written through the supplied {@link TargetSession}.</p>
+     */
+    public boolean executeCommand(TargetSession session, String rawLine) throws Exception {
+        Objects.requireNonNull(session, "session");
+        Objects.requireNonNull(rawLine, "rawLine");
+        return executePipeline(session, rawLine);
     }
 
     private boolean executePipeline(TargetSession session, String rawLine) throws Exception {

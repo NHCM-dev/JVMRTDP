@@ -16,7 +16,7 @@ public class TargetSession implements AutoCloseable {
     private final RemoteJVMTIEnv jvmti;
     private final PrintStream baseOutput;
     private PrintStream output;
-    private final PrintStream error;
+    private PrintStream error;
     private final RemoteWorkspace workspace;
     private final RemoteOperations operations;
     private final RemoteContext context;
@@ -110,6 +110,23 @@ public class TargetSession implements AutoCloseable {
             return action.run();
         } finally {
             output = previous;
+        }
+    }
+
+    /** Temporarily redirects both output streams for an embedded command invocation. */
+    public <T> T withStreams(
+            PrintStream temporaryOutput,
+            PrintStream temporaryError,
+            OutputAction<T> action) throws Exception {
+        PrintStream previousOutput = output;
+        PrintStream previousError = error;
+        output = Objects.requireNonNull(temporaryOutput, "temporaryOutput");
+        error = Objects.requireNonNull(temporaryError, "temporaryError");
+        try {
+            return action.run();
+        } finally {
+            output = previousOutput;
+            error = previousError;
         }
     }
 

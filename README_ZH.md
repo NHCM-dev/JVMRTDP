@@ -39,8 +39,11 @@ JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析�
 
 ```text
 build/libs/JVMRTDP-2.0.0.jar
+build/libs/jvmrtdp-2.0.0-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
+
+`JVMRTDP-2.0.0.jar` 是自包含可执行程序；`jvmrtdp-2.0.0-library.jar` 是适合作为依赖的库产物，终端相关依赖保持外置。
 
 如需将代理 DLL 发布到传统目录：
 
@@ -226,6 +229,35 @@ script workflow.jrd
 
 详细语法见[脚本指南](docs/SCRIPTING_ZH.md)。需要供其他程序读取调试数据时，使用 `json` 或 `jsonl` 格式的调试器快照。
 
+## Java 库
+
+将当前构建发布到本地 Maven 仓库：
+
+```powershell
+.\gradlew.bat publishToMavenLocal
+```
+
+```kotlin
+repositories { mavenLocal() }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0") }
+```
+
+在 Java 中发现并连接 JVM：
+
+```java
+import nhcm.jvmrtdp.api.JvmRtdpClient;
+import nhcm.jvmrtdp.api.JvmRtdpCommandResult;
+import nhcm.jvmrtdp.api.JvmRtdpSession;
+
+try (JvmRtdpClient client = JvmRtdpClient.open();
+     JvmRtdpSession session = client.attach(pid)) {
+    JvmRtdpCommandResult result = session.execute("jvmti phase").requireSuccess();
+    System.out.print(result.standardOutput());
+}
+```
+
+库 API 提供进程发现、可配置连接、命令结果捕获、异步 agent 命令，以及 JNI、JVMTI、上下文、远程对象、反编译和调试器服务的直接访问。详见 [Java 库指南](docs/LIBRARY_ZH.md)。
+
 ## 安全与行为说明
 
 - 代理仅监听回环地址，并为每次会话生成随机令牌。
@@ -240,3 +272,4 @@ script workflow.jrd
 - [命令参考](docs/COMMANDS_ZH.md)
 - [脚本指南](docs/SCRIPTING_ZH.md)
 - [JVMTI API 覆盖范围](docs/JVMTI-API-COVERAGE_ZH.md)
+- [Java 库指南](docs/LIBRARY_ZH.md)
