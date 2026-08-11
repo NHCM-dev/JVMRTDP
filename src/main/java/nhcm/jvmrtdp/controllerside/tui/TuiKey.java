@@ -15,6 +15,7 @@ final class TuiKey {
     static final int F7 = 0x1017;
     static final int F8 = 0x1018;
     static final int F9 = 0x1019;
+    static final int SHIFT_F9 = 0x1119;
     static final int F10 = 0x1020;
     static final int HOME = 0x1030;
     static final int END = 0x1031;

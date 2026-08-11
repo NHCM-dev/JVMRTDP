@@ -30,7 +30,7 @@ public class JvmtiCommand implements RemoteCommand {
                 + "class.info|class.interfaces|class.loader-classes|class.source-debug|class.constant-pool|"
                 + "method.info|method.bytecodes|method.lines|field.info|events|events.generate|verbose|retransform|redefine|"
                 + "breakpoint|debug.enable|debug.disable|debug.status|debug.status-all|debug.continue|"
-                + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.locals|"
+                + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.locals|debug.set-local|"
                 + "watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
                 + "thread.cpu-time|thread.owned-monitors|thread.contended-monitor|thread.suspend|thread.resume|"
                 + "thread.interrupt|thread.frame-pop|object.size|object.hash|object.monitor-usage|"
@@ -167,10 +167,18 @@ public class JvmtiCommand implements RemoteCommand {
                     Base64.getUrlDecoder().decode(arguments.get(2)));
             return success("ok");
         }
-        if ("breakpoint".equals(operation) && arguments.size() == 6) {
+        if ("breakpoint".equals(operation)
+                && (arguments.size() == 6 || arguments.size() == 11)) {
             boolean enabled = toggle(arguments.get(1));
+            String registrationId = arguments.size() == 11 ? arguments.get(6)
+                    : arguments.get(2) + '|' + arguments.get(3) + '|'
+                            + arguments.get(4) + '|' + arguments.get(5);
+            Object receiver = arguments.size() == 11 && !"0".equals(arguments.get(7))
+                    ? handle.targetObjects().resolveExternal(Long.parseLong(arguments.get(7))) : null;
             NativeAgent.setBreakpoint(NativeAgent.findLoadedClass(arguments.get(2)), arguments.get(3),
-                    arguments.get(4), Long.parseLong(arguments.get(5)), enabled);
+                    arguments.get(4), Long.parseLong(arguments.get(5)), enabled, registrationId,
+                    receiver, optionalPattern(arguments, 8), optionalPattern(arguments, 9),
+                    optionalPattern(arguments, 10));
             return success("ok");
         }
         if ("debug.enable".equals(operation) && arguments.size() == 1) {
@@ -225,14 +233,26 @@ public class JvmtiCommand implements RemoteCommand {
             }
             return success(join(rows));
         }
-        if ("watch".equals(operation) && arguments.size() == 6) {
+        if ("debug.set-local".equals(operation) && arguments.size() == 6) {
+            NativeAgent.setDebuggerLocal(thread(handle, arguments.get(1)),
+                    Integer.parseInt(arguments.get(2)), Integer.parseInt(arguments.get(3)),
+                    arguments.get(4), handle.targetObjects().resolveExternal(
+                            Long.parseLong(arguments.get(5))));
+            return success("ok");
+        }
+        if ("watch".equals(operation) && (arguments.size() == 6 || arguments.size() == 8)) {
             boolean modification;
             if ("access".equalsIgnoreCase(arguments.get(1))) modification = false;
             else if ("modification".equalsIgnoreCase(arguments.get(1))) modification = true;
             else throw new IllegalArgumentException("Watch kind must be access or modification");
             boolean enabled = toggle(arguments.get(2));
+            String registrationId = arguments.size() == 8 ? arguments.get(6)
+                    : arguments.get(3) + '|' + arguments.get(4) + '|'
+                            + arguments.get(5) + '|' + arguments.get(1);
+            Object receiver = arguments.size() == 8 && !"0".equals(arguments.get(7))
+                    ? handle.targetObjects().resolveExternal(Long.parseLong(arguments.get(7))) : null;
             NativeAgent.setFieldWatch(NativeAgent.findLoadedClass(arguments.get(3)), arguments.get(4),
-                    arguments.get(5), modification, enabled);
+                    arguments.get(5), modification, enabled, registrationId, receiver);
             return success("ok");
         }
         if ("threads".equals(operation) && arguments.size() == 1) {
@@ -385,5 +405,11 @@ public class JvmtiCommand implements RemoteCommand {
         if ("set".equalsIgnoreCase(value) || "enable".equalsIgnoreCase(value)) return true;
         if ("clear".equalsIgnoreCase(value) || "disable".equalsIgnoreCase(value)) return false;
         throw new IllegalArgumentException("Operation must be set/enable or clear/disable");
+    }
+
+    private static String optionalPattern(List<String> arguments, int index) {
+        if (index >= arguments.size()) return "";
+        String value = arguments.get(index);
+        return "-".equals(value) ? "" : value;
     }
 }

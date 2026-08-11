@@ -15,7 +15,8 @@ public final class NativeJvmtiBridge {
     public static native void setEventNotification(String eventName, boolean enabled);
 
     public static native void setBreakpoint(Class<?> type, String methodName,
-            String descriptor, long location, boolean enabled);
+            String descriptor, long location, boolean enabled, String registrationId,
+            Object receiver, String callerClass, String callerMethod, String callerDescriptor);
 
     public static native void debuggerConfigure(boolean enabled);
 
@@ -35,8 +36,13 @@ public final class NativeJvmtiBridge {
     /** Active local-variable table entries for a frame in a paused debugger thread. */
     public static native Object[][] debuggerLocals(Thread thread, int depth);
 
+    /** Replaces one live local in a paused debugger frame. */
+    public static native void debuggerSetLocal(Thread thread, int depth, int slot,
+            String descriptor, Object value);
+
     public static native void setFieldWatch(Class<?> type, String fieldName,
-            String descriptor, boolean modification, boolean enabled);
+            String descriptor, boolean modification, boolean enabled,
+            String registrationId, Object receiver);
 
     public static native void notifyFramePop(Thread thread, int depth);
 

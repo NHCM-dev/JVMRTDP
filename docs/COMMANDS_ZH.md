@@ -46,7 +46,7 @@ exit
 
 ## 3. TUI 快捷键
 
-页脚始终按当前视图显示有效操作。常用按键如下：
+页脚始终按当前视图显示有效操作。CLI 与 TUI 是同一目标会话的两种交互方式，切换时会保留上下文和 TUI 的分析、调试视图。常用按键如下：
 
 | 按键 | 操作 |
 | --- | --- |
@@ -61,10 +61,13 @@ exit
 | `0` | 重置水平位置 |
 | `/` | 过滤当前列表；`Esc` 取消 |
 | `F` | 查找类、字段或方法 |
+| `@` | 在 Fields/Methods 中显示或隐藏静态成员 |
+| `#` | 在 Fields/Methods 中显示或隐藏实例字段和虚方法 |
 | `n` / `N` | 下一个或上一个匹配项 |
 | `P` | 输入包名 |
 | `J` | 显示或隐藏 JDK 类型 |
-| `A` | 显示或隐藏数组类型 |
+| `a` | 在 Browse 中显示或隐藏数组类型 |
+| `A` | 反编译选中或当前类 |
 | `K` | 显示或隐藏 `<init>` / `<clinit>` |
 | `O` | 导出当前内容 |
 | `F2` | 切换到 CLI |
@@ -74,7 +77,8 @@ exit
 
 | 按键 | 操作 |
 | --- | --- |
-| `F9` | 设置或清除当前 BCI 的断点 |
+| `F9` | 设置或清除当前 BCI 的普通断点 |
+| `Shift+F9` | 设置或清除仅限当前对象 Context 的断点 |
 | `F7` | 单步执行 |
 | `F8` | 继续当前线程 |
 | `F6` | 暂停选中的线程 |
@@ -257,6 +261,8 @@ debugger locations
 ```text
 debugger break <class> <method> <descriptor> <bci>
 debugger clear <class> <method> <descriptor> <bci>
+debugger break-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]
+debugger clear-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]
 debugger breakpoints
 debugger breakpoints clear-all
 ```
@@ -284,6 +290,7 @@ debugger frames [paused-index] [max]
 debugger stack [paused-index] [max]
 debugger locals [paused-index] [depth]
 debugger local-context <paused-index> <depth> <slot>
+debugger local-set <paused-index> <depth> <local-index> <value>
 debugger current [paused-index] [depth] [radius]
 debugger sample <all-thread-index> [depth] [radius]
 ```
@@ -402,6 +409,9 @@ code run <deployment-id> <class> <method> <descriptor> <static|this|object-ref> 
 code close <deployment-id>
 code callback add <deployment-id> <handler-class> <event,event,...> [sync|async]
 code callback remove <callback-id>
+code callback enable <callback-id>
+code callback disable <callback-id>
+code callback reset <callback-id>
 code callback list
 code callback stats
 ```
@@ -453,3 +463,4 @@ session.debugger()
 - `NATIVE_METHOD`：当前帧为原生方法，没有 Java 局部变量或 BCI。
 - `OPAQUE_FRAME`：当前帧不能执行所请求的栈操作。
 - `INVALID_SLOT` / `TYPE_MISMATCH`：局部变量槽无效、已经失活或类型不匹配。
+<!-- English COMMANDS.md is canonical. -->

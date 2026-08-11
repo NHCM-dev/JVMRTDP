@@ -114,7 +114,7 @@ Class names may use dotted or JVM internal slash notation.
 
 ## TUI Navigation
 
-The TUI browses by package and hides common JDK implementation types by default. The footer lists actions available in the current view.
+The TUI browses by package and hides common JDK implementation types by default. The footer lists actions available in the current view. CLI and TUI switches preserve the same session context, decompiled content, bytecode view, debugger state, and managed breakpoints.
 
 | Key | Action |
 | --- | --- |
@@ -127,10 +127,16 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `Left` / `Right` | Scroll horizontally |
 | `[` / `]` | Scroll horizontally faster |
 | `/` | Filter the current list; `Esc` cancels |
-| `F` | Find classes, fields, or methods |
+| `f` / `F` | Find in the displayed list / search all loaded classes and members |
+| `:` | Open an exact class, package, field, or method target |
+| `@` | Show or hide static members in Fields/Methods |
+| `#` | Show or hide instance fields and virtual methods in Fields/Methods |
+| `=` | Set a selected field, paused local, or writable context source |
+| `x` / `X` | Invoke the selected method virtually / invoke its declaring implementation |
 | `P` | Enter a package name |
 | `J` | Show or hide JDK types |
-| `A` | Show or hide array types |
+| `a` | Show or hide array types in Browse |
+| `A` | Decompile the selected or current class |
 | `K` | Show or hide `<init>` / `<clinit>` |
 | `F2` | Switch to the CLI |
 | `Q` | Go back or exit |
@@ -164,8 +170,12 @@ Set and inspect breakpoints:
 ```text
 debugger enable
 debugger break com.example.Application run "()V" 0
+context class com.example.Application
+debugger break-context run "()V" 0
 debugger breakpoints
 ```
+
+In the TUI, `F9` always creates a normal breakpoint and `Shift+F9` explicitly limits it to the object currently selected in Context. CLI/library callers can use `break-context` or `JvmBreakpointCondition` for receiver and caller conditions. TUI field watchpoints apply to every instance.
 
 Inspect and control threads:
 

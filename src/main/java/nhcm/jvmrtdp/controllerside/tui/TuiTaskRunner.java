@@ -40,12 +40,16 @@ final class TuiTaskRunner implements AutoCloseable {
         return true;
     }
 
-    /** Queues one foreground action behind a silent debugger poll. */
+    /** Queues one user action behind the operation already in flight. */
     <T> boolean submitOrQueue(String operationLabel, Callable<T> operation,
             Consumer<T> onSuccess, Consumer<Throwable> onFailure) {
         Objects.requireNonNull(operation, "operation");
         if (!busy()) return submit(operationLabel, operation, onSuccess, onFailure);
-        if (!label.isEmpty() || pendingOperation != null) return false;
+        // A context/member navigation must not be lost behind a queued silent debugger poll.
+        // Replace only background work; never reorder two explicit user operations.
+        if (pendingOperation != null && (!pendingLabel.isEmpty() || operationLabel.isEmpty())) {
+            return false;
+        }
         pendingLabel = Objects.requireNonNull(operationLabel, "operationLabel");
         @SuppressWarnings("unchecked")
         Callable<Object> convertedOperation = (Callable<Object>) (Callable<?>) operation;
@@ -73,15 +77,25 @@ final class TuiTaskRunner implements AutoCloseable {
 
     boolean busy() { return future != null; }
 
+    /** True only for an explicit user operation, not for a silent background poll. */
+    boolean userOperationBusy() {
+        return future != null && !label.isEmpty() || pendingOperation != null;
+    }
+
     String activity() {
         if (!busy()) return "";
-        if (label.isEmpty()) return "";
+        String visibleLabel = label;
+        if (!pendingLabel.isEmpty()) {
+            visibleLabel = label.isEmpty() ? "Queued: " + pendingLabel
+                    : label + " | next: " + pendingLabel;
+        }
+        if (visibleLabel.isEmpty()) return "";
         String[] frames = {"|", "/", "-", "\\"};
         long elapsedMillis = System.currentTimeMillis() - startedAt;
         int frame = (int) (elapsedMillis / 160L % frames.length);
         String elapsed = elapsedMillis < 1000L ? ""
                 : " [" + (elapsedMillis / 1000L) + "s]";
-        return frames[frame] + " " + label + elapsed;
+        return frames[frame] + " " + visibleLabel + elapsed;
     }
 
     void poll() {
@@ -93,6 +107,10 @@ final class TuiTaskRunner implements AutoCloseable {
         success = null;
         failure = null;
         label = "";
+        // Promote the already accepted user action before callbacks enqueue follow-up
+        // work. This preserves input order and prevents a stale refresh callback from
+        // jumping ahead of the user's selection.
+        startPendingIfIdle();
         try {
             completedSuccess.accept(completed.get());
         } catch (InterruptedException interrupted) {
@@ -103,8 +121,6 @@ final class TuiTaskRunner implements AutoCloseable {
             completedFailure.accept(cause);
         } catch (RuntimeException failed) {
             completedFailure.accept(failed);
-        } finally {
-            startPendingIfIdle();
         }
     }
 

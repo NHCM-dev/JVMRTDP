@@ -125,17 +125,33 @@ struct DebuggerStop {
 std::vector<std::shared_ptr<DebuggerStop>> gDebuggerStops;
 
 struct PersistentBreakpoint {
+    std::string id;
     jobject klass = nullptr;
     jmethodID method = nullptr;
     std::string methodName;
     std::string descriptor;
     jlocation location = 0;
+    jobject receiver = nullptr;
+    std::string callerClass;
+    std::string callerMethod;
+    std::string callerDescriptor;
 };
 
 std::mutex gBreakpointMutex;
 std::vector<PersistentBreakpoint> gPersistentBreakpoints;
 
-bool SamePersistentBreakpoint(JNIEnv* env, const PersistentBreakpoint& breakpoint,
+struct PersistentFieldWatch {
+    std::string id;
+    jobject klass = nullptr;
+    jfieldID field = nullptr;
+    bool modification = false;
+    jobject receiver = nullptr;
+};
+
+std::mutex gFieldWatchMutex;
+std::vector<PersistentFieldWatch> gPersistentFieldWatches;
+
+bool SamePhysicalBreakpoint(JNIEnv* env, const PersistentBreakpoint& breakpoint,
         jclass klass, jmethodID method, jlocation location) {
     return breakpoint.method == method && breakpoint.location == location
         && breakpoint.klass != nullptr && env->IsSameObject(breakpoint.klass, klass) == JNI_TRUE;
@@ -150,27 +166,94 @@ bool HasPersistentBreakpoint(JNIEnv* env, jmethodID method, jlocation location) 
 }
 
 void RememberPersistentBreakpoint(JNIEnv* env, jclass klass, jmethodID method,
-        const std::string& methodName, const std::string& descriptor, jlocation location) {
+        const std::string& id, const std::string& methodName, const std::string& descriptor,
+        jlocation location, jobject receiver, const std::string& callerClass,
+        const std::string& callerMethod, const std::string& callerDescriptor) {
     std::lock_guard<std::mutex> guard(gBreakpointMutex);
     for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
-        if (SamePersistentBreakpoint(env, breakpoint, klass, method, location)) return;
+        if (breakpoint.id == id) return;
     }
     jobject reference = env->NewGlobalRef(klass);
     if (reference == nullptr) return;
+    jobject receiverReference = receiver == nullptr ? nullptr : env->NewGlobalRef(receiver);
+    if (receiver != nullptr && receiverReference == nullptr) {
+        env->DeleteGlobalRef(reference);
+        return;
+    }
     gPersistentBreakpoints.push_back(
-        {reference, method, methodName, descriptor, location});
+        {id, reference, method, methodName, descriptor, location, receiverReference,
+            callerClass, callerMethod, callerDescriptor});
 }
 
-void ForgetPersistentBreakpoint(JNIEnv* env, jclass klass, jmethodID method, jlocation location) {
+bool ForgetPersistentBreakpoint(JNIEnv* env, const std::string& id,
+        jclass klass, jmethodID method, jlocation location) {
     std::lock_guard<std::mutex> guard(gBreakpointMutex);
     for (auto iterator = gPersistentBreakpoints.begin(); iterator != gPersistentBreakpoints.end();) {
-        if (!SamePersistentBreakpoint(env, *iterator, klass, method, location)) {
+        if (iterator->id != id) {
             ++iterator;
             continue;
         }
         env->DeleteGlobalRef(iterator->klass);
+        if (iterator->receiver != nullptr) env->DeleteGlobalRef(iterator->receiver);
         iterator = gPersistentBreakpoints.erase(iterator);
     }
+    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (SamePhysicalBreakpoint(env, breakpoint, klass, method, location)) return true;
+    }
+    return false;
+}
+
+bool SamePhysicalFieldWatch(JNIEnv* env, const PersistentFieldWatch& watch,
+        jclass klass, jfieldID field, bool modification) {
+    return watch.field == field && watch.modification == modification
+        && watch.klass != nullptr && env->IsSameObject(watch.klass, klass) == JNI_TRUE;
+}
+
+void RememberPersistentFieldWatch(JNIEnv* env, const std::string& id, jclass klass,
+        jfieldID field, bool modification, jobject receiver) {
+    std::lock_guard<std::mutex> guard(gFieldWatchMutex);
+    for (const PersistentFieldWatch& watch : gPersistentFieldWatches) {
+        if (watch.id == id) return;
+    }
+    jobject klassReference = env->NewGlobalRef(klass);
+    if (klassReference == nullptr) return;
+    jobject receiverReference = receiver == nullptr ? nullptr : env->NewGlobalRef(receiver);
+    if (receiver != nullptr && receiverReference == nullptr) {
+        env->DeleteGlobalRef(klassReference);
+        return;
+    }
+    gPersistentFieldWatches.push_back(
+        {id, klassReference, field, modification, receiverReference});
+}
+
+bool ForgetPersistentFieldWatch(JNIEnv* env, const std::string& id, jclass klass,
+        jfieldID field, bool modification) {
+    std::lock_guard<std::mutex> guard(gFieldWatchMutex);
+    for (auto iterator = gPersistentFieldWatches.begin();
+            iterator != gPersistentFieldWatches.end();) {
+        if (iterator->id != id) { ++iterator; continue; }
+        env->DeleteGlobalRef(iterator->klass);
+        if (iterator->receiver != nullptr) env->DeleteGlobalRef(iterator->receiver);
+        iterator = gPersistentFieldWatches.erase(iterator);
+    }
+    for (const PersistentFieldWatch& watch : gPersistentFieldWatches) {
+        if (SamePhysicalFieldWatch(env, watch, klass, field, modification)) return true;
+    }
+    return false;
+}
+
+bool MatchesPersistentFieldWatch(JNIEnv* env, jclass klass, jfieldID field,
+        bool modification, jobject receiver) {
+    std::lock_guard<std::mutex> guard(gFieldWatchMutex);
+    bool physicalRegistration = false;
+    for (const PersistentFieldWatch& watch : gPersistentFieldWatches) {
+        if (!SamePhysicalFieldWatch(env, watch, klass, field, modification)) continue;
+        physicalRegistration = true;
+        if (watch.receiver == nullptr
+                || (receiver != nullptr
+                    && env->IsSameObject(receiver, watch.receiver) == JNI_TRUE)) return true;
+    }
+    return !physicalRegistration;
 }
 
 jvmtiError ReapplyPersistentBreakpoints(JNIEnv* env, jclass klass) {
@@ -555,6 +638,69 @@ MethodDetails DescribeMethod(JNIEnv* env, jmethodID method) {
     if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
     if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
     return result;
+}
+
+bool GlobMatches(const std::string& pattern, const std::string& value) {
+    if (pattern.empty() || pattern == "*") return true;
+    std::size_t source = 0, candidate = 0, star = std::string::npos, retry = 0;
+    while (candidate < value.size()) {
+        if (source < pattern.size()
+                && (pattern[source] == '?' || pattern[source] == value[candidate])) {
+            ++source;
+            ++candidate;
+        } else if (source < pattern.size() && pattern[source] == '*') {
+            star = source++;
+            retry = candidate;
+        } else if (star != std::string::npos) {
+            source = star + 1;
+            candidate = ++retry;
+        } else return false;
+    }
+    while (source < pattern.size() && pattern[source] == '*') ++source;
+    return source == pattern.size();
+}
+
+/** Returns true when any logical registration at this physical BCI accepts the hit. */
+bool MatchesPersistentBreakpoint(JNIEnv* env, jthread thread,
+        jmethodID method, jlocation location) {
+    std::lock_guard<std::mutex> guard(gBreakpointMutex);
+    bool physicalRegistration = false;
+    bool receiverLoaded = false;
+    jobject receiver = nullptr;
+    bool callerLoaded = false;
+    MethodDetails caller;
+    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (breakpoint.method != method || breakpoint.location != location) continue;
+        physicalRegistration = true;
+        if (breakpoint.receiver != nullptr) {
+            if (!receiverLoaded) {
+                receiverLoaded = true;
+                if (gJvmti->GetLocalInstance(thread, 0, &receiver) != JVMTI_ERROR_NONE) {
+                    receiver = nullptr;
+                }
+            }
+            if (receiver == nullptr
+                    || env->IsSameObject(receiver, breakpoint.receiver) != JNI_TRUE) continue;
+        }
+        if (!breakpoint.callerClass.empty() || !breakpoint.callerMethod.empty()
+                || !breakpoint.callerDescriptor.empty()) {
+            if (!callerLoaded) {
+                callerLoaded = true;
+                jvmtiFrameInfo frame{};
+                jint count = 0;
+                if (gJvmti->GetStackTrace(thread, 1, 1, &frame, &count) == JVMTI_ERROR_NONE
+                        && count == 1) caller = DescribeMethod(env, frame.method);
+            }
+            if (!GlobMatches(breakpoint.callerClass, caller.className)
+                    || !GlobMatches(breakpoint.callerMethod, caller.name)
+                    || !GlobMatches(breakpoint.callerDescriptor, caller.descriptor)) continue;
+        }
+        if (receiver != nullptr) env->DeleteLocalRef(receiver);
+        return true;
+    }
+    if (receiver != nullptr) env->DeleteLocalRef(receiver);
+    // Startup/foreign breakpoints have no logical registration and keep legacy behavior.
+    return !physicalRegistration;
 }
 
 jint LineAtLocation(jmethodID method, jlocation location) {
@@ -1116,6 +1262,8 @@ void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
         gStartupClinitMethod = nullptr;
         gStartupClinitLocation = 0;
     }
+    if (!startupMain && !startupClinit
+            && !MatchesPersistentBreakpoint(env, thread, method, location)) return;
     DebuggerTrap(env, thread, method, location,
         startupMain ? "main_entry" : startupClinit ? "class_init" : "breakpoint");
 }
@@ -1125,6 +1273,7 @@ void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID metho
     const FieldDetails details = DescribeField(fieldClass, field);
     DispatchEvent(env, "field_access", thread, fieldClass, method, location, object, 0,
         nullptr, 0, details.name.c_str(), details.descriptor.c_str());
+    if (!MatchesPersistentFieldWatch(env, fieldClass, field, false, object)) return;
     DebuggerTrap(env, thread, method, location,
         ("field_read:" + details.name + details.descriptor).c_str());
 }
@@ -1137,6 +1286,7 @@ void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID
     const jlong bits = ValueBits(signatureType, newValue, &newObject);
     DispatchEvent(env, "field_modification", thread, fieldClass, method, location, object, bits,
         nullptr, 0, details.name.c_str(), details.descriptor.c_str(), newObject);
+    if (!MatchesPersistentFieldWatch(env, fieldClass, field, true, object)) return;
     DebuggerTrap(env, thread, method, location,
         ("field_write:" + details.name + details.descriptor).c_str());
 }
@@ -1817,28 +1967,42 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
 }
 
 void JNICALL NativeSetBreakpoint(JNIEnv* env, jclass, jclass klass, jstring methodNameValue,
-        jstring descriptorValue, jlong location, jboolean enabled) {
+        jstring descriptorValue, jlong location, jboolean enabled, jstring registrationIdValue,
+        jobject receiver, jstring callerClassValue, jstring callerMethodValue,
+        jstring callerDescriptorValue) {
     if (klass == nullptr) {
         ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
         return;
     }
     const std::string methodName = JStringToUtf8(env, methodNameValue);
     const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    const std::string registrationId = JStringToUtf8(env, registrationIdValue);
+    const std::string callerClass = JStringToUtf8(env, callerClassValue);
+    const std::string callerMethod = JStringToUtf8(env, callerMethodValue);
+    const std::string callerDescriptor = JStringToUtf8(env, callerDescriptorValue);
+    if (registrationId.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Breakpoint registration id must not be empty");
+        return;
+    }
     jmethodID method = ResolveMethod(env, klass, methodName, descriptor);
     if (method == nullptr) return;
-    const jvmtiError error = enabled == JNI_TRUE
-        ? gJvmti->SetBreakpoint(method, static_cast<jlocation>(location))
-        : gJvmti->ClearBreakpoint(method, static_cast<jlocation>(location));
-    if (enabled == JNI_TRUE && (error == JVMTI_ERROR_NONE || error == JVMTI_ERROR_DUPLICATE)) {
-        RememberPersistentBreakpoint(env, klass, method, methodName, descriptor,
-            static_cast<jlocation>(location));
+    if (enabled == JNI_TRUE) {
+        const jvmtiError error = gJvmti->SetBreakpoint(method, static_cast<jlocation>(location));
+        if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) {
+            ThrowJvmti(env, "SetBreakpoint", error);
+            return;
+        }
+        RememberPersistentBreakpoint(env, klass, method, registrationId, methodName, descriptor,
+            static_cast<jlocation>(location), receiver, callerClass, callerMethod, callerDescriptor);
         return;
     }
-    if (enabled != JNI_TRUE && error == JVMTI_ERROR_NONE) {
-        ForgetPersistentBreakpoint(env, klass, method, static_cast<jlocation>(location));
-        return;
+    const bool remaining = ForgetPersistentBreakpoint(env, registrationId, klass, method,
+        static_cast<jlocation>(location));
+    if (remaining) return;
+    const jvmtiError error = gJvmti->ClearBreakpoint(method, static_cast<jlocation>(location));
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_NOT_FOUND) {
+        ThrowJvmti(env, "ClearBreakpoint", error);
     }
-    ThrowJvmti(env, enabled == JNI_TRUE ? "SetBreakpoint" : "ClearBreakpoint", error);
 }
 
 void JNICALL NativeDebuggerConfigure(JNIEnv* env, jclass, jboolean enabled) {
@@ -2033,6 +2197,121 @@ static void SetDebuggerLocalText(JNIEnv* env, jobjectArray row, jsize index,
     if (text == nullptr) return;
     env->SetObjectArrayElement(row, index, text);
     env->DeleteLocalRef(text);
+}
+
+static bool UnboxDebuggerLocal(JNIEnv* env, jobject value, char kind, jvalue* result) {
+    if (value == nullptr || result == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "A primitive debugger local requires a non-null boxed value");
+        return false;
+    }
+    const char* method = nullptr;
+    const char* signature = nullptr;
+    switch (kind) {
+    case 'Z': method = "booleanValue"; signature = "()Z"; break;
+    case 'B': method = "byteValue"; signature = "()B"; break;
+    case 'C': method = "charValue"; signature = "()C"; break;
+    case 'S': method = "shortValue"; signature = "()S"; break;
+    case 'I': method = "intValue"; signature = "()I"; break;
+    case 'J': method = "longValue"; signature = "()J"; break;
+    case 'F': method = "floatValue"; signature = "()F"; break;
+    case 'D': method = "doubleValue"; signature = "()D"; break;
+    default:
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Unsupported primitive local descriptor");
+        return false;
+    }
+    jclass valueClass = env->GetObjectClass(value);
+    jmethodID converter = valueClass == nullptr ? nullptr
+        : env->GetMethodID(valueClass, method, signature);
+    if (valueClass != nullptr) env->DeleteLocalRef(valueClass);
+    if (converter == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "Replacement value is incompatible with the debugger local descriptor");
+        return false;
+    }
+    switch (kind) {
+    case 'Z': result->z = env->CallBooleanMethod(value, converter); break;
+    case 'B': result->b = env->CallByteMethod(value, converter); break;
+    case 'C': result->c = env->CallCharMethod(value, converter); break;
+    case 'S': result->s = env->CallShortMethod(value, converter); break;
+    case 'I': result->i = env->CallIntMethod(value, converter); break;
+    case 'J': result->j = env->CallLongMethod(value, converter); break;
+    case 'F': result->f = env->CallFloatMethod(value, converter); break;
+    case 'D': result->d = env->CallDoubleMethod(value, converter); break;
+    }
+    return !env->ExceptionCheck();
+}
+
+void JNICALL NativeDebuggerSetLocal(JNIEnv* env, jclass, jobject requestedThread,
+        jint depth, jint slot, jstring descriptorText, jobject value) {
+    if (requestedThread == nullptr || depth < 0 || slot < 0 || descriptorText == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "A paused thread, non-negative depth/slot and descriptor are required");
+        return;
+    }
+    const std::string descriptor = JStringToUtf8(env, descriptorText);
+    if (descriptor.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Local descriptor must not be empty");
+        return;
+    }
+
+    jthread thread = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop->paused && stop->thread != nullptr
+                    && env->IsSameObject(requestedThread, stop->thread)) {
+                thread = static_cast<jthread>(env->NewLocalRef(stop->thread));
+                break;
+            }
+        }
+    }
+    if (thread == nullptr) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "Selected debugger thread is no longer paused");
+        return;
+    }
+
+    bool suspendedHere = false;
+    jint threadState = 0;
+    jvmtiError error = gJvmti->GetThreadState(thread, &threadState);
+    if (error == JVMTI_ERROR_NONE && (threadState & JVMTI_THREAD_STATE_SUSPENDED) == 0) {
+        error = gJvmti->SuspendThread(thread);
+        if (error == JVMTI_ERROR_NONE) suspendedHere = true;
+    }
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_THREAD_SUSPENDED) {
+        env->DeleteLocalRef(thread);
+        ThrowJvmti(env, "Suspend debugger thread for local write", error);
+        return;
+    }
+
+    const char kind = descriptor[0];
+    jvalue primitive{};
+    if (kind == 'L' || kind == '[') {
+        error = gJvmti->SetLocalObject(thread, depth, slot, value);
+    } else if (!UnboxDebuggerLocal(env, value, kind, &primitive)) {
+        error = JVMTI_ERROR_NONE;
+    } else {
+        switch (kind) {
+        case 'Z': error = gJvmti->SetLocalInt(thread, depth, slot, primitive.z); break;
+        case 'B': error = gJvmti->SetLocalInt(thread, depth, slot, primitive.b); break;
+        case 'C': error = gJvmti->SetLocalInt(thread, depth, slot, primitive.c); break;
+        case 'S': error = gJvmti->SetLocalInt(thread, depth, slot, primitive.s); break;
+        case 'I': error = gJvmti->SetLocalInt(thread, depth, slot, primitive.i); break;
+        case 'J': error = gJvmti->SetLocalLong(thread, depth, slot, primitive.j); break;
+        case 'F': error = gJvmti->SetLocalFloat(thread, depth, slot, primitive.f); break;
+        case 'D': error = gJvmti->SetLocalDouble(thread, depth, slot, primitive.d); break;
+        default: error = JVMTI_ERROR_TYPE_MISMATCH; break;
+        }
+    }
+    const jvmtiError resumeError = suspendedHere ? gJvmti->ResumeThread(thread) : JVMTI_ERROR_NONE;
+    env->DeleteLocalRef(thread);
+    if (!env->ExceptionCheck() && error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Set debugger local", error);
+    } else if (!env->ExceptionCheck() && resumeError != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Resume debugger thread after local write", resumeError);
+    }
 }
 
 jobjectArray JNICALL NativeDebuggerLocals(JNIEnv* env, jclass, jobject requestedThread, jint depth) {
@@ -2318,32 +2597,51 @@ void JNICALL NativeDebuggerResumeThread(JNIEnv* env, jclass, jobject thread, jin
 }
 
 void JNICALL NativeSetFieldWatch(JNIEnv* env, jclass, jclass klass, jstring fieldNameValue,
-        jstring descriptorValue, jboolean modification, jboolean enabled) {
+        jstring descriptorValue, jboolean modification, jboolean enabled,
+        jstring registrationIdValue, jobject receiver) {
     if (klass == nullptr) {
         ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
         return;
     }
     const std::string fieldName = JStringToUtf8(env, fieldNameValue);
     const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    const std::string registrationId = JStringToUtf8(env, registrationIdValue);
+    if (registrationId.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Field watch registration id must not be empty");
+        return;
+    }
     jfieldID field = ResolveField(env, klass, fieldName, descriptor);
     if (field == nullptr) return;
+    const bool isModification = modification == JNI_TRUE;
+    if (enabled != JNI_TRUE) {
+        const bool remaining = ForgetPersistentFieldWatch(
+            env, registrationId, klass, field, isModification);
+        if (remaining) return;
+        const jvmtiError clearError = isModification
+            ? gJvmti->ClearFieldModificationWatch(klass, field)
+            : gJvmti->ClearFieldAccessWatch(klass, field);
+        if (clearError != JVMTI_ERROR_NONE && clearError != JVMTI_ERROR_NOT_FOUND) {
+            ThrowJvmti(env, isModification
+                ? "ClearFieldModificationWatch" : "ClearFieldAccessWatch", clearError);
+        }
+        return;
+    }
     jvmtiError error;
     const char* operation;
-    if (modification == JNI_TRUE && enabled == JNI_TRUE) {
+    if (isModification) {
         error = gJvmti->SetFieldModificationWatch(klass, field);
         operation = "SetFieldModificationWatch";
-    } else if (modification == JNI_TRUE) {
-        error = gJvmti->ClearFieldModificationWatch(klass, field);
-        operation = "ClearFieldModificationWatch";
-    } else if (enabled == JNI_TRUE) {
+    } else {
         error = gJvmti->SetFieldAccessWatch(klass, field);
         operation = "SetFieldAccessWatch";
-    } else {
-        error = gJvmti->ClearFieldAccessWatch(klass, field);
-        operation = "ClearFieldAccessWatch";
     }
-    if (error == JVMTI_ERROR_NONE && enabled == JNI_TRUE) {
-        const jvmtiEvent event = modification == JNI_TRUE
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) {
+        ThrowJvmti(env, operation, error);
+        return;
+    }
+    RememberPersistentFieldWatch(env, registrationId, klass, field, isModification, receiver);
+    {
+        const jvmtiEvent event = isModification
             ? JVMTI_EVENT_FIELD_MODIFICATION : JVMTI_EVENT_FIELD_ACCESS;
         const jvmtiError eventError = gJvmti->SetEventNotificationMode(JVMTI_ENABLE, event, nullptr);
         if (eventError != JVMTI_ERROR_NONE) {
@@ -2351,7 +2649,6 @@ void JNICALL NativeSetFieldWatch(JNIEnv* env, jclass, jclass klass, jstring fiel
             return;
         }
     }
-    ThrowJvmti(env, operation, error);
 }
 
 void JNICALL NativeNotifyFramePop(JNIEnv* env, jclass, jthread thread, jint depth) {
@@ -3233,7 +3530,7 @@ JNINativeMethod kJvmtiMethods[] = {
      const_cast<char*>("(Ljava/lang/String;Z)V"),
      reinterpret_cast<void*>(&NativeSetEventNotification)},
     {const_cast<char*>("setBreakpoint"),
-     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZ)V"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZLjava/lang/String;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
     {const_cast<char*>("debuggerConfigure"), const_cast<char*>("(Z)V"),
      reinterpret_cast<void*>(&NativeDebuggerConfigure)},
@@ -3250,8 +3547,11 @@ JNINativeMethod kJvmtiMethods[] = {
      reinterpret_cast<void*>(&NativeDebuggerPauseThread)},
     {const_cast<char*>("debuggerLocals"), const_cast<char*>("(Ljava/lang/Thread;I)[[Ljava/lang/Object;"),
      reinterpret_cast<void*>(&NativeDebuggerLocals)},
+    {const_cast<char*>("debuggerSetLocal"),
+     const_cast<char*>("(Ljava/lang/Thread;IILjava/lang/String;Ljava/lang/Object;)V"),
+     reinterpret_cast<void*>(&NativeDebuggerSetLocal)},
     {const_cast<char*>("setFieldWatch"),
-     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZ)V"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;Ljava/lang/Object;)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatch)},
     {const_cast<char*>("notifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeNotifyFramePop)},
@@ -3597,8 +3897,17 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
             std::lock_guard<std::mutex> guard(gBreakpointMutex);
             for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
                 if (breakpoint.klass != nullptr) env->DeleteGlobalRef(breakpoint.klass);
+                if (breakpoint.receiver != nullptr) env->DeleteGlobalRef(breakpoint.receiver);
             }
             gPersistentBreakpoints.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(gFieldWatchMutex);
+            for (const PersistentFieldWatch& watch : gPersistentFieldWatches) {
+                if (watch.klass != nullptr) env->DeleteGlobalRef(watch.klass);
+                if (watch.receiver != nullptr) env->DeleteGlobalRef(watch.receiver);
+            }
+            gPersistentFieldWatches.clear();
         }
         if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
         ReleaseCallbackTypes(env);

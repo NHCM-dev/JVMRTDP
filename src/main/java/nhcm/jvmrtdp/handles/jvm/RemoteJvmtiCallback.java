@@ -17,6 +17,19 @@ public class RemoteJvmtiCallback implements AutoCloseable {
     public String id() { return id; }
     public boolean isClosed() { return closed.get(); }
 
+    public boolean setEnabled(boolean enabled) {
+        if (closed.get()) throw new IllegalStateException("Callback is closed");
+        return jvmti.setCallbackEnabled(id, enabled);
+    }
+
+    public boolean enable() { return setEnabled(true); }
+    public boolean disable() { return setEnabled(false); }
+
+    public boolean resetStatistics() {
+        if (closed.get()) throw new IllegalStateException("Callback is closed");
+        return jvmti.resetCallback(id);
+    }
+
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) jvmti.unregisterCallback(id);

@@ -173,6 +173,14 @@ public class TargetCodeService implements AutoCloseable {
         return JvmtiCallbackDispatcher.unregister(callbackId);
     }
 
+    public boolean setCallbackEnabled(String callbackId, boolean enabled) {
+        return JvmtiCallbackDispatcher.setEnabled(callbackId, enabled);
+    }
+
+    public boolean resetCallback(String callbackId) {
+        return JvmtiCallbackDispatcher.reset(callbackId);
+    }
+
     public List<String> callbacks() {
         return JvmtiCallbackDispatcher.registrations();
     }

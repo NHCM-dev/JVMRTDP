@@ -116,6 +116,7 @@ Use the typed API when output parsing is undesirable:
 
 ```java
 import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 
 RemoteClass service = session.findClass("com.example.Service");
@@ -165,9 +166,17 @@ session.jvmti().configureDebugger(true);
 session.jvmti().setBreakpoint(
         "com.example.Service", "run", "()V", 0, true);
 
+// Stop only when this exact receiver is invoked by a matching caller.
+JvmBreakpointCondition condition = JvmBreakpointCondition.receiver(serviceObject)
+        .calledFrom("com.example.web.*", "dispatch*", "*");
+session.jvmti().setBreakpoint(
+        "com.example.Service", "run", "()V", 0, condition, true);
+
 session.execute("debugger snapshot output/debugger.json json")
         .requireSuccess();
 ```
+
+`managedBreakpoints()` and debugger JSON/JSONL exports include the registration ID, receiver identity, and condition summary. Use `clearBreakpoint(info)` to clear a listed registration even after its original object handle is no longer selected. Callback handles support `enable()`, `disable()`, and `resetStatistics()` in addition to `close()`.
 
 Capabilities depend on the JVM phase. Use `-agentpath` at target startup when an `OnLoad`-only capability is required. Dynamic attach cannot force capabilities that HotSpot no longer reports as potential.
 

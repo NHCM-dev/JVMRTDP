@@ -40,6 +40,7 @@ import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
@@ -263,7 +264,10 @@ public class InteractiveCli {
                 return true;
             }
             if ("index".equals(operation) && arguments.size() == 2) {
-                selectResult(session, session.context().remoteObject().arrayGet(integer(arguments.get(1), "index")));
+                int index = integer(arguments.get(1), "index");
+                RemoteObject array = session.context().remoteObject();
+                selectResult(session, array.arrayGet(index),
+                        session.operations().arrayAssignment(array, index));
                 return true;
             }
             if ("value".equals(operation) && (arguments.size() == 2 || arguments.size() == 3)) {
@@ -358,8 +362,21 @@ public class InteractiveCli {
         @Override
         public boolean execute(TargetSession session, List<String> arguments) {
             if (arguments.size() != 1) return InteractiveCli.usage(session, this);
-            selectResult(session, readVirtual(session.context().remoteClass(), session.context().remoteObject(),
-                    FieldSelection.parse(arguments.get(0))));
+            RemoteObject receiver = session.context().remoteObject();
+            FieldSelection selection = FieldSelection.parse(arguments.get(0));
+            RemoteField field = selection.resolveVirtual(session.context().remoteClass());
+            if (selection.index == null) {
+                selectResult(session, field.read(receiver),
+                        session.operations().fieldAssignment(field, receiver));
+            } else {
+                int index = selection.index.intValue();
+                RemoteObject element;
+                try (RemoteObject array = field.read(receiver)) {
+                    element = array.arrayGet(index);
+                }
+                selectResult(session, element,
+                        session.operations().fieldArrayAssignment(field, receiver, index));
+            }
             return true;
         }
     }
@@ -474,7 +491,20 @@ public class InteractiveCli {
                 RemoteClass type = arguments.size() == 3
                         ? session.findClass(arguments.get(1)) : session.context().remoteClass();
                 String field = arguments.get(arguments.size() - 1);
-                selectResult(session, readStatic(type, FieldSelection.parse(field)));
+                FieldSelection selection = FieldSelection.parse(field);
+                RemoteField selected = selection.resolveStatic(type);
+                if (selection.index == null) {
+                    selectResult(session, selected.readStatic(),
+                            session.operations().fieldAssignment(selected, null));
+                } else {
+                    int index = selection.index.intValue();
+                    RemoteObject element;
+                    try (RemoteObject array = selected.readStatic()) {
+                        element = array.arrayGet(index);
+                    }
+                    selectResult(session, element,
+                            session.operations().fieldArrayAssignment(selected, null, index));
+                }
                 return true;
             }
             if ("invoke".equals(operation) && arguments.size() >= 3) {
@@ -531,13 +561,24 @@ public class InteractiveCli {
 
     private static class SetCommand extends ShellCommand<TargetSession> {
         private SetCommand() {
-            super("set", "set [field] [declaring.Class::]<name> <value> | set index <n> <value>",
-                    "Writes a field on the current context object, or an element of the current array.");
+            super("set", "set context <value> | set [field] [declaring.Class::]<name> <value> | set index <n> <value>",
+                    "Writes the current writable context, a field, or an array element.");
         }
 
         @Override
         public boolean execute(TargetSession session, List<String> arguments) {
             if (arguments.size() != 2 && arguments.size() != 3) return InteractiveCli.usage(session, this);
+            if (arguments.size() == 2 && "context".equalsIgnoreCase(arguments.get(0))) {
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(1)))) {
+                    RemoteObject replacement = values.only();
+                    session.context().assign(replacement);
+                    values.transferOnly();
+                }
+                session.output().println("context source updated: "
+                        + session.context().assignmentDescription());
+                return true;
+            }
             boolean shorthandField = arguments.size() == 2;
             String valueExpression = arguments.get(arguments.size() - 1);
             try (RemoteArgumentList values = RemoteArgumentList.resolve(
@@ -571,7 +612,10 @@ public class InteractiveCli {
                 return true;
             }
             if (arguments.size() == 2 && "get".equalsIgnoreCase(arguments.get(0))) {
-                selectResult(session, session.context().remoteObject().arrayGet(integer(arguments.get(1), "index")));
+                int index = integer(arguments.get(1), "index");
+                RemoteObject array = session.context().remoteObject();
+                selectResult(session, array.arrayGet(index),
+                        session.operations().arrayAssignment(array, index));
                 return true;
             }
             if (arguments.size() == 3 && "set".equalsIgnoreCase(arguments.get(0))) {
@@ -898,7 +942,7 @@ public class InteractiveCli {
             super("code", "code source <name> <file|dir> [options] | code methods <name> <class> <file> "
                             + "[options] | code jar <name> <jar> [options] | code list | code close <id> | "
                             + "code run <id> <class> <method> <descriptor> <static|this|object-ref> [args ...] | "
-                            + "code callback <add|remove|list|stats> ...",
+                            + "code callback <add|remove|enable|disable|reset|list|stats> ...",
                     "Compiles and deploys Java source/method fragments, loads JARs and manages Java JVMTI handlers.");
         }
 
@@ -977,14 +1021,29 @@ public class InteractiveCli {
                 session.output().println(session.jvmti().unregisterCallback(arguments.get(1)) ? "removed" : "not found");
                 return true;
             }
+            if (("enable".equals(operation) || "disable".equals(operation))
+                    && arguments.size() == 2) {
+                boolean changed = session.jvmti().setCallbackEnabled(
+                        arguments.get(1), "enable".equals(operation));
+                session.output().println(changed ? operation + "d" : "not found");
+                return true;
+            }
+            if ("reset".equals(operation) && arguments.size() == 2) {
+                session.output().println(session.jvmti().resetCallback(arguments.get(1))
+                        ? "reset" : "not found");
+                return true;
+            }
             if ("list".equals(operation) && arguments.size() == 1) {
                 List<JvmtiCallbackRegistration> callbacks = session.jvmti().callbacks();
                 if (callbacks.isEmpty()) session.output().println("No callbacks.");
                 for (JvmtiCallbackRegistration callback : callbacks) {
-                    session.output().printf("%s handler=%s events=%s delivery=%s delivered=%d failed=%d%s%n",
-                            callback.id(), callback.handlerClass(), callback.events(), callback.delivery(),
+                    session.output().printf("%s state=%s handler=%s events=%s delivery=%s delivered=%d failed=%d%s%s%n",
+                            callback.id(), callback.enabled() ? "enabled" : "disabled",
+                            callback.handlerClass(), callback.events(), callback.delivery(),
                             callback.delivered(), callback.failed(), callback.lastFailure().isEmpty()
-                                    ? "" : " lastFailure=" + callback.lastFailure());
+                                    ? "" : " lastFailure=" + callback.lastFailure(),
+                            callback.lastEvent().isEmpty() ? "" : " lastEvent=" + callback.lastEvent()
+                                    + "@" + callback.lastEventAt());
                 }
                 return true;
             }
@@ -998,7 +1057,7 @@ public class InteractiveCli {
                 return true;
             }
             throw new IllegalArgumentException("Usage: code callback add <deployment> <handler-class> "
-                    + "<event,event,...> [sync|async] | remove <id> | list | stats");
+                    + "<event,event,...> [sync|async] | remove|enable|disable|reset <id> | list | stats");
         }
 
         private static RemoteCodeDeployment findDeployment(TargetSession session, String id) {
@@ -1496,8 +1555,11 @@ public class InteractiveCli {
                             + "sample <all-thread-index> [depth] [radius]|"
                             + "current [paused-index] [depth] [radius]|"
                             + "stack [max]|stack <paused-index> <max>|locals [thread-index] [depth]|"
-                            + "local-context [thread-index] [depth] [local-index]|enable|disable|"
-                            + "break|clear <class> <method> <descriptor> <bci>|breakpoints [clear-all]|"
+                            + "local-context [thread-index] [depth] [local-index]|"
+                            + "local-set <thread-index> <depth> <local-index> <value>|enable|disable|"
+                            + "break|clear <class> <method> <descriptor> <bci>|"
+                            + "break-context|clear-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]|"
+                            + "breakpoints [clear-all]|"
                             + "watch <read|write> <set|clear> <class> <field> <descriptor>|watches [clear-all]|"
                             + "continue [thread-index|all]|step [thread-index]|"
                             + "snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]> ...",
@@ -1662,6 +1724,13 @@ public class InteractiveCli {
                 selectDebuggerLocalContext(session, threadIndex, depth, localIndex);
                 return true;
             }
+            if (arguments.size() == 5 && "local-set".equalsIgnoreCase(arguments.get(0))) {
+                setDebuggerLocal(session,
+                        integer(arguments.get(1), "thread index"),
+                        integer(arguments.get(2), "frame depth"),
+                        integer(arguments.get(3), "local index"), arguments.get(4));
+                return true;
+            }
             if (arguments.size() == 1 && ("enable".equalsIgnoreCase(arguments.get(0))
                     || "disable".equalsIgnoreCase(arguments.get(0)))) {
                 boolean enabled = "enable".equalsIgnoreCase(arguments.get(0));
@@ -1677,6 +1746,29 @@ public class InteractiveCli {
                 session.jvmti().setBreakpoint(arguments.get(1), arguments.get(2), arguments.get(3),
                         Long.parseLong(arguments.get(4)), enabled);
                 session.output().println("ok");
+                return true;
+            }
+            if (arguments.size() >= 4 && arguments.size() <= 7
+                    && ("break-context".equalsIgnoreCase(arguments.get(0))
+                    || "clear-context".equalsIgnoreCase(arguments.get(0)))) {
+                boolean enabled = "break-context".equalsIgnoreCase(arguments.get(0));
+                RemoteClass type = session.context().remoteClass();
+                String methodName = arguments.get(1);
+                String descriptor = arguments.get(2);
+                boolean staticMethod = "<clinit>".equals(methodName)
+                        || isStaticMethod(type, methodName, descriptor);
+                JvmBreakpointCondition condition = !staticMethod && session.context().isObject()
+                        ? JvmBreakpointCondition.receiver(session.context().remoteObject())
+                        : JvmBreakpointCondition.any();
+                if (arguments.size() > 4) {
+                    condition = condition.calledFrom(arguments.get(4),
+                            arguments.size() > 5 ? arguments.get(5) : "",
+                            arguments.size() > 6 ? arguments.get(6) : "");
+                }
+                if (enabled) session.jvmti().configureDebugger(true);
+                session.jvmti().setBreakpoint(type.className(), methodName, descriptor,
+                        Long.parseLong(arguments.get(3)), condition, enabled);
+                session.output().println("ok: " + condition.summary());
                 return true;
             }
             if (!arguments.isEmpty() && "breakpoints".equalsIgnoreCase(arguments.get(0))
@@ -1942,8 +2034,9 @@ public class InteractiveCli {
             List<JvmBreakpointInfo> values = session.jvmti().managedBreakpoints();
             for (int index = 0; index < values.size(); index++) {
                 JvmBreakpointInfo value = values.get(index);
-                session.output().printf("[%d] %s.%s%s @%d%n", index, value.className(),
-                        value.methodName(), value.descriptor(), value.location());
+                session.output().printf("[%d] %s.%s%s @%d  %s%n", index, value.className(),
+                        value.methodName(), value.descriptor(), value.location(),
+                        value.conditionSummary());
             }
             if (values.isEmpty()) session.output().println("<no managed breakpoints>");
         }
@@ -1952,8 +2045,9 @@ public class InteractiveCli {
             List<JvmFieldWatchInfo> values = session.jvmti().managedFieldWatches();
             for (int index = 0; index < values.size(); index++) {
                 JvmFieldWatchInfo value = values.get(index);
-                session.output().printf("[%d] %s %s.%s %s%n", index, value.kind(),
-                        value.className(), value.fieldName(), value.descriptor());
+                session.output().printf("[%d] %s %s.%s %s  %s%n", index, value.kind(),
+                        value.className(), value.fieldName(), value.descriptor(),
+                        value.objectSpecific() ? "receiver#" + value.receiverId() : "all instances");
             }
             if (values.isEmpty()) session.output().println("<no managed field watches>");
         }
@@ -1972,10 +2066,47 @@ public class InteractiveCli {
                 if (!selected.available() || selected.value() == null) {
                     throw new IllegalStateException("Local is unavailable: " + selected.error());
                 }
-                session.context().select(selected.value());
+                session.context().select(selected.value(), null,
+                        session.operations().debuggerLocalAssignment(state.sequence(), depth,
+                                selected.slot(), selected.descriptor()));
                 locals.remove(localIndex); // Context now owns the selected remote value handle.
                 session.output().println("context <- local " + selected.name()
                         + " slot=" + selected.slot() + " = " + selected.value().displayValue());
+            } finally {
+                for (JvmDebuggerLocal local : locals) local.close();
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static boolean isStaticMethod(RemoteClass type, String name, String descriptor) {
+            for (RemoteMethod method : type.getStaticMethods()) {
+                if (method.name().equals(name) && method.descriptor().equals(descriptor)) return true;
+            }
+            return false;
+        }
+
+        private static void setDebuggerLocal(TargetSession session, int threadIndex,
+                int depth, int localIndex, String expression) {
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            List<JvmDebuggerLocal> locals = new ArrayList<JvmDebuggerLocal>();
+            try {
+                JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                locals.addAll(session.jvmti().debuggerLocals(state.thread(), depth));
+                if (localIndex < 0 || localIndex >= locals.size()) {
+                    throw new IllegalArgumentException("No local at index " + localIndex);
+                }
+                JvmDebuggerLocal selected = locals.get(localIndex);
+                if (selected.descriptor() == null || selected.descriptor().isEmpty()
+                        || "?".equals(selected.descriptor())) {
+                    throw new IllegalStateException("Local type is unknown; select a typed local slot");
+                }
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(expression))) {
+                    session.jvmti().setDebuggerLocal(state.thread(), depth, selected.slot(),
+                            selected.descriptor(), values.only());
+                }
+                session.output().printf("local updated: frame=%d slot=%d %s%n",
+                        depth, selected.slot(), selected.name());
             } finally {
                 for (JvmDebuggerLocal local : locals) local.close();
                 closeDebuggerStates(states);
@@ -2203,6 +2334,12 @@ public class InteractiveCli {
 
     private static void selectResult(TargetSession session, RemoteObject value) {
         session.context().select(value);
+        printContext(session);
+    }
+
+    private static void selectResult(TargetSession session, RemoteObject value,
+            RemoteContext.Assignment assignment) {
+        session.context().select(value, null, assignment);
         printContext(session);
     }
 

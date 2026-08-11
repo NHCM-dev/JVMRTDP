@@ -21,7 +21,7 @@ public class CodeCommand implements RemoteCommand {
     public String usage() {
         return "code <upload.begin|upload.chunk|upload.abort|deploy.upload|jar.upload|deploy|jar|"
                 + "execute|deployments|close|callback.register|callback.unregister|"
-                + "callback.list|callback.stats> ...";
+                + "callback.enable|callback.disable|callback.reset|callback.list|callback.stats> ...";
     }
 
     @Override
@@ -82,6 +82,14 @@ public class CodeCommand implements RemoteCommand {
         }
         if ("callback.unregister".equals(operation) && arguments.size() == 2) {
             return success(Boolean.toString(code.unregisterCallback(arguments.get(1))));
+        }
+        if (("callback.enable".equals(operation) || "callback.disable".equals(operation))
+                && arguments.size() == 2) {
+            return success(Boolean.toString(code.setCallbackEnabled(arguments.get(1),
+                    "callback.enable".equals(operation))));
+        }
+        if ("callback.reset".equals(operation) && arguments.size() == 2) {
+            return success(Boolean.toString(code.resetCallback(arguments.get(1))));
         }
         if ("callback.list".equals(operation) && arguments.size() == 1) {
             return success(join(code.callbacks()));

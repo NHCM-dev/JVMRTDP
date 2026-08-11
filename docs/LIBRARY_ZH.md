@@ -165,6 +165,11 @@ session.jvmti().configureDebugger(true);
 session.jvmti().setBreakpoint(
         "com.example.Service", "run", "()V", 0, true);
 
+JvmBreakpointCondition condition = JvmBreakpointCondition.receiver(serviceObject)
+        .calledFrom("com.example.web.*", "dispatch*", "*");
+session.jvmti().setBreakpoint(
+        "com.example.Service", "run", "()V", 0, condition, true);
+
 session.execute("debugger snapshot output/debugger.json json")
         .requireSuccess();
 ```
@@ -185,3 +190,4 @@ Capability 取决于 JVM 阶段。需要仅限 `OnLoad` 的能力时，应在目
 - 嵌入式命令返回 `JvmRtdpCommandResult`；需要异常处理方式时调用 `requireSuccess()`。
 - 类型化 API 会针对目标错误、成员缺失、句柄失效和不支持的 JVMTI 操作抛出运行时异常。
 - 客户端、会话和可关闭远程句柄应始终使用 try-with-resources。
+<!-- English LIBRARY.md is canonical. -->

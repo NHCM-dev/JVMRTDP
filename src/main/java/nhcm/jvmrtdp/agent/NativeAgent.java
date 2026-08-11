@@ -89,11 +89,26 @@ public class NativeAgent {
 
     public static void setBreakpoint(Class<?> type, String methodName, String descriptor,
             long location, boolean enabled) {
+        if (type == null) throw new IllegalArgumentException("type must not be null");
+        setBreakpoint(type, methodName, descriptor, location, enabled,
+                type.getName() + '|' + methodName + '|' + descriptor + '|' + location,
+                null, "", "", "");
+    }
+
+    public static void setBreakpoint(Class<?> type, String methodName, String descriptor,
+            long location, boolean enabled, String registrationId, Object receiver,
+            String callerClass, String callerMethod, String callerDescriptor) {
         requireAvailable();
         if (type == null) throw new IllegalArgumentException("type must not be null");
         if (methodName == null || methodName.isEmpty()) throw new IllegalArgumentException("methodName must not be empty");
         if (descriptor == null || descriptor.isEmpty()) throw new IllegalArgumentException("descriptor must not be empty");
-        NativeJvmtiBridge.setBreakpoint(type, methodName, descriptor, location, enabled);
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setBreakpoint(type, methodName, descriptor, location, enabled,
+                registrationId, receiver, callerClass == null ? "" : callerClass,
+                callerMethod == null ? "" : callerMethod,
+                callerDescriptor == null ? "" : callerDescriptor);
     }
 
     public static void configureDebugger(boolean enabled) {
@@ -142,13 +157,36 @@ public class NativeAgent {
         return NativeJvmtiBridge.debuggerLocals(thread, depth);
     }
 
+    public static void setDebuggerLocal(Thread thread, int depth, int slot,
+            String descriptor, Object value) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        if (depth < 0 || slot < 0) throw new IllegalArgumentException("depth and slot must not be negative");
+        if (descriptor == null || descriptor.isEmpty()) {
+            throw new IllegalArgumentException("descriptor must not be empty");
+        }
+        NativeJvmtiBridge.debuggerSetLocal(thread, depth, slot, descriptor, value);
+    }
+
     public static void setFieldWatch(Class<?> type, String fieldName, String descriptor,
             boolean modification, boolean enabled) {
+        if (type == null) throw new IllegalArgumentException("type must not be null");
+        setFieldWatch(type, fieldName, descriptor, modification, enabled,
+                type.getName() + '|' + fieldName + '|' + descriptor + '|'
+                        + (modification ? "write" : "read"), null);
+    }
+
+    public static void setFieldWatch(Class<?> type, String fieldName, String descriptor,
+            boolean modification, boolean enabled, String registrationId, Object receiver) {
         requireAvailable();
         if (type == null) throw new IllegalArgumentException("type must not be null");
         if (fieldName == null || fieldName.isEmpty()) throw new IllegalArgumentException("fieldName must not be empty");
         if (descriptor == null || descriptor.isEmpty()) throw new IllegalArgumentException("descriptor must not be empty");
-        NativeJvmtiBridge.setFieldWatch(type, fieldName, descriptor, modification, enabled);
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setFieldWatch(type, fieldName, descriptor, modification, enabled,
+                registrationId, receiver);
     }
 
     public static void notifyFramePop(Thread thread, int depth) {

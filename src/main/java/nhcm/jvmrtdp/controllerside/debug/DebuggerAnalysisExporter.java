@@ -283,7 +283,11 @@ public final class DebuggerAnalysisExporter {
         field(out, "class", value.className(), true, 0);
         field(out, "method", value.methodName(), false, 0);
         field(out, "descriptor", value.descriptor(), false, 0);
-        out.append(",\"bci\":").append(value.location()).append('}');
+        out.append(",\"bci\":").append(value.location());
+        field(out, "registrationId", value.registrationId(), false, 0);
+        out.append(",\"receiverId\":").append(value.receiverId());
+        field(out, "condition", value.conditionSummary(), false, 0);
+        out.append('}');
     }
 
     private static void appendWatch(StringBuilder out, JvmFieldWatchInfo value) {
@@ -292,7 +296,8 @@ public final class DebuggerAnalysisExporter {
         field(out, "field", value.fieldName(), false, 0);
         field(out, "descriptor", value.descriptor(), false, 0);
         field(out, "kind", value.kind(), false, 0);
-        out.append('}');
+        field(out, "registrationId", value.registrationId(), false, 0);
+        out.append(",\"receiverId\":").append(value.receiverId()).append('}');
     }
 
     private static void strings(StringBuilder out, List<String> values) {

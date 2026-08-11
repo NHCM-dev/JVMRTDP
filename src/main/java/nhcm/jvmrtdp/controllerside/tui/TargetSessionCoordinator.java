@@ -24,11 +24,12 @@ public final class TargetSessionCoordinator {
     /** Returns true to return to the controller, false to terminate it. */
     public boolean run(ServerHandle server, boolean startInTui) {
         TuiResult mode = startInTui ? TuiResult.TUI : TuiResult.CLI;
-        try (TargetSession session = new TargetSession(server, output, error)) {
+        try (TargetSession session = new TargetSession(server, output, error);
+                TargetTui tui = new TargetTui(session)) {
             while (server.isOpen()) {
                 if (mode == TuiResult.TUI) {
                     try (TerminalScreen screen = TerminalScreen.open()) {
-                        mode = new TargetTui(session, screen).run();
+                        mode = tui.run(screen);
                     } catch (IOException | RuntimeException failure) {
                         error.println("TUI unavailable, returning to CLI: " + failure.getMessage());
                         mode = TuiResult.CLI;

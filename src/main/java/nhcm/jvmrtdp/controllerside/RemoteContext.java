@@ -23,6 +23,7 @@ public class RemoteContext implements AutoCloseable {
             Collections.newSetFromMap(new IdentityHashMap<RemoteObject, Boolean>());
     private Value current;
     private int temporaryScopeDepth;
+    private long revision;
 
     public void select(RemoteClass value) {
         select(Value.of(value));
@@ -33,6 +34,11 @@ public class RemoteContext implements AutoCloseable {
     }
 
     public void select(RemoteObject value, RemoteClass viewClass) {
+        select(value, viewClass, null);
+    }
+
+    /** Selects a value while retaining the writable field/array/local that produced it. */
+    public void select(RemoteObject value, RemoteClass viewClass, Assignment assignment) {
         if (value == null) throw new IllegalArgumentException("Context object must not be null");
         if (viewClass != null && viewClass.server() != value.server()) {
             throw new IllegalArgumentException("Context type belongs to another target session");
@@ -41,17 +47,19 @@ public class RemoteContext implements AutoCloseable {
             throw new IllegalArgumentException(value.className() + " is not assignable to " + viewClass.className());
         }
         retainedObjects.add(value);
-        select(Value.of(value, viewClass));
+        select(Value.of(value, viewClass, assignment));
     }
 
     public void viewAs(RemoteClass viewClass) {
+        Assignment assignment = requireCurrent().assignment;
         RemoteObject object = remoteObject();
-        select(object, viewClass);
+        select(object, viewClass, assignment);
     }
 
     public void runtimeView() {
+        Assignment assignment = requireCurrent().assignment;
         RemoteObject object = remoteObject();
-        select(object, null);
+        select(object, null, assignment);
     }
 
     public boolean isSet() {
@@ -80,6 +88,28 @@ public class RemoteContext implements AutoCloseable {
         return value.remoteObject;
     }
 
+    public boolean canAssign() {
+        return current != null && current.remoteObject != null && current.assignment != null;
+    }
+
+    public String assignmentDescription() {
+        return canAssign() ? current.assignment.description() : "<read-only snapshot>";
+    }
+
+    /** Writes a replacement through the current field/array/local and keeps that l-value selected. */
+    public void assign(RemoteObject replacement) {
+        if (!canAssign()) {
+            throw new IllegalStateException(
+                    "Current context is not backed by a writable field, array element, or debugger local");
+        }
+        if (replacement == null) throw new IllegalArgumentException("Replacement value must not be null");
+        Value previous = current;
+        previous.assignment.write(replacement);
+        retainedObjects.add(replacement);
+        current = Value.of(replacement, previous.viewClass, previous.assignment);
+        revision++;
+    }
+
     public void back() {
         pop(1);
     }
@@ -92,11 +122,13 @@ public class RemoteContext implements AutoCloseable {
                     "Cannot pop " + count + " context(s); stack contains " + depth());
         }
         for (int index = 0; index < count; index++) current = history.pop();
+        revision++;
     }
 
     public void duplicate() {
         Value value = requireCurrent();
         pushHistory(value);
+        revision++;
     }
 
     public void swap() {
@@ -105,6 +137,7 @@ public class RemoteContext implements AutoCloseable {
         Value previous = current;
         current = history.pop();
         history.push(previous);
+        revision++;
     }
 
     /** Copies a stack item to the top. Zero means the current context. */
@@ -112,6 +145,7 @@ public class RemoteContext implements AutoCloseable {
         Value selected = valueAt(stackIndex);
         pushHistory(requireCurrent());
         current = selected;
+        revision++;
     }
 
     /** Moves an existing stack item to the top without duplicating it. */
@@ -127,6 +161,7 @@ public class RemoteContext implements AutoCloseable {
         history.clear();
         history.addAll(rebuilt);
         current = selected;
+        revision++;
     }
 
     /** Removes one stack item. Removing the top promotes the next item. */
@@ -135,10 +170,12 @@ public class RemoteContext implements AutoCloseable {
         if (depth() == 1) {
             if (stackIndex != 0) valueAt(stackIndex);
             current = null;
+            revision++;
             return;
         }
         if (stackIndex == 0) {
             current = history.pop();
+            revision++;
             return;
         }
         valueAt(stackIndex);
@@ -149,10 +186,21 @@ public class RemoteContext implements AutoCloseable {
         }
         history.clear();
         history.addAll(rebuilt);
+        revision++;
     }
 
     public int depth() {
         return current == null ? 0 : history.size() + 1;
+    }
+
+    /**
+     * Changes whenever the persistent context or its stack changes. Temporary command
+     * pipelines restore the previous token together with their context snapshot.
+     * Interaction layers use this to invalidate only their derived views instead of
+     * maintaining a second, unsynchronised notion of the current context.
+     */
+    public long revision() {
+        return revision;
     }
 
     public String peek(int stackIndex) {
@@ -176,6 +224,7 @@ public class RemoteContext implements AutoCloseable {
         current = null;
         history.clear();
         bookmarks.clear();
+        revision++;
         // A -> chain owns only a temporary navigation view. Handles reachable before the
         // chain must remain alive so its snapshot can be restored when the chain finishes.
         if (temporaryScopeDepth > 0) return;
@@ -196,11 +245,12 @@ public class RemoteContext implements AutoCloseable {
     public TemporaryScope temporaryScope() {
         temporaryScopeDepth++;
         return new TemporaryScope(current, new ArrayDeque<Value>(history),
-                new LinkedHashMap<String, Value>(bookmarks));
+                new LinkedHashMap<String, Value>(bookmarks), revision);
     }
 
     public void save(String name) {
         bookmarks.put(RemoteWorkspace.normalize(name), requireCurrent());
+        revision++;
     }
 
     public void use(String name) {
@@ -251,10 +301,12 @@ public class RemoteContext implements AutoCloseable {
     private void select(Value value) {
         if (temporaryScopeDepth > 0) {
             current = value;
+            revision++;
             return;
         }
         if (current != null && current != value) pushHistory(current);
         current = value;
+        revision++;
     }
 
     private void pushHistory(Value value) {
@@ -283,12 +335,15 @@ public class RemoteContext implements AutoCloseable {
         private final Value savedCurrent;
         private final Deque<Value> savedHistory;
         private final Map<String, Value> savedBookmarks;
+        private final long savedRevision;
         private boolean closed;
 
-        private TemporaryScope(Value savedCurrent, Deque<Value> savedHistory, Map<String, Value> savedBookmarks) {
+        private TemporaryScope(Value savedCurrent, Deque<Value> savedHistory,
+                Map<String, Value> savedBookmarks, long savedRevision) {
             this.savedCurrent = savedCurrent;
             this.savedHistory = savedHistory;
             this.savedBookmarks = savedBookmarks;
+            this.savedRevision = savedRevision;
         }
 
         @Override
@@ -300,6 +355,7 @@ public class RemoteContext implements AutoCloseable {
             history.addAll(savedHistory);
             bookmarks.clear();
             bookmarks.putAll(savedBookmarks);
+            revision = savedRevision;
             temporaryScopeDepth--;
         }
     }
@@ -308,19 +364,26 @@ public class RemoteContext implements AutoCloseable {
         private final RemoteClass remoteClass;
         private final RemoteObject remoteObject;
         private final RemoteClass viewClass;
+        private final Assignment assignment;
 
-        private Value(RemoteClass remoteClass, RemoteObject remoteObject, RemoteClass viewClass) {
+        private Value(RemoteClass remoteClass, RemoteObject remoteObject, RemoteClass viewClass,
+                Assignment assignment) {
             this.remoteClass = remoteClass;
             this.remoteObject = remoteObject;
             this.viewClass = viewClass;
+            this.assignment = assignment;
         }
 
         private static Value of(RemoteClass value) {
-            return new Value(value, null, null);
+            return new Value(value, null, null, null);
         }
 
         private static Value of(RemoteObject value, RemoteClass viewClass) {
-            return new Value(null, value, viewClass);
+            return of(value, viewClass, null);
+        }
+
+        private static Value of(RemoteObject value, RemoteClass viewClass, Assignment assignment) {
+            return new Value(null, value, viewClass, assignment);
         }
 
         private String description() {
@@ -331,5 +394,11 @@ public class RemoteContext implements AutoCloseable {
             }
             return description;
         }
+    }
+
+    /** A writable source retained by a context value. */
+    public interface Assignment {
+        void write(RemoteObject value);
+        String description();
     }
 }

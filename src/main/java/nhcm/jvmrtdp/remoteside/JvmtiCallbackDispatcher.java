@@ -88,7 +88,43 @@ public class JvmtiCallbackDispatcher {
         Registration registration = REGISTRATIONS.remove(id);
         if (registration == null) return false;
         ORDERED.remove(registration);
-        for (JvmtiEventType event : registration.events) release(event);
+        if (registration.enabled) for (JvmtiEventType event : registration.events) release(event);
+        return true;
+    }
+
+    public static boolean setEnabled(String id, boolean enabled) {
+        Registration registration = REGISTRATIONS.get(id);
+        if (registration == null) return false;
+        synchronized (registration) {
+            if (registration.enabled == enabled) return true;
+            if (enabled) {
+                List<JvmtiEventType> retained = new ArrayList<JvmtiEventType>();
+                try {
+                    for (JvmtiEventType event : registration.events) {
+                        retain(event);
+                        retained.add(event);
+                    }
+                } catch (RuntimeException failure) {
+                    for (JvmtiEventType event : retained) release(event);
+                    throw failure;
+                }
+                registration.enabled = true;
+            } else {
+                registration.enabled = false;
+                for (JvmtiEventType event : registration.events) release(event);
+            }
+        }
+        return true;
+    }
+
+    public static boolean reset(String id) {
+        Registration registration = REGISTRATIONS.get(id);
+        if (registration == null) return false;
+        registration.delivered.set(0L);
+        registration.failed.set(0L);
+        registration.lastFailure = "";
+        registration.lastEvent = "";
+        registration.lastEventAt = 0L;
         return true;
     }
 
@@ -101,8 +137,9 @@ public class JvmtiCallbackDispatcher {
         for (Registration registration : REGISTRATIONS.values()) {
             result.add(TextWireCodec.encode(registration.id, registration.handler.getClass().getName(),
                     eventNames(registration.events), registration.delivery.name().toLowerCase(Locale.ROOT),
-                    Long.toString(registration.delivered.get()), Long.toString(registration.failed.get()),
-                    registration.lastFailure));
+                    Boolean.toString(registration.enabled), Long.toString(registration.delivered.get()),
+                    Long.toString(registration.failed.get()), registration.lastFailure,
+                    registration.lastEvent, Long.toString(registration.lastEventAt)));
         }
         Collections.sort(result);
         return result;
@@ -182,7 +219,7 @@ public class JvmtiCallbackDispatcher {
 
     private static void dispatch(final JvmtiEvent event) {
         for (final Registration registration : ORDERED) {
-            if (!registration.events.contains(event.type())
+            if (!registration.enabled || !registration.events.contains(event.type())
                     || !(registration.handler instanceof JvmtiEventHandler)) continue;
             if (registration.delivery == Delivery.SYNC) deliver(registration, event);
             else {
@@ -205,7 +242,8 @@ public class JvmtiCallbackDispatcher {
                 null, null, 0, originalEvent, bytes.length));
         byte[] current = bytes;
         for (Registration registration : ORDERED) {
-            if (!(registration.handler instanceof JvmtiClassFileTransformer)) continue;
+            if (!registration.enabled
+                    || !(registration.handler instanceof JvmtiClassFileTransformer)) continue;
             try {
                 byte[] replacement = ((JvmtiClassFileTransformer) registration.handler).transform(
                         new JvmtiClassFileEvent(loader, className, classBeingRedefined,
@@ -215,6 +253,8 @@ public class JvmtiCallbackDispatcher {
                     current = replacement;
                 }
                 registration.delivered.incrementAndGet();
+                registration.lastEvent = JvmtiEventType.CLASS_FILE_LOAD_HOOK.wireName();
+                registration.lastEventAt = System.currentTimeMillis();
                 DELIVERED.incrementAndGet();
             } catch (ThreadDeath | VirtualMachineError fatal) {
                 throw fatal;
@@ -229,6 +269,8 @@ public class JvmtiCallbackDispatcher {
         try {
             ((JvmtiEventHandler) registration.handler).onEvent(event);
             registration.delivered.incrementAndGet();
+            registration.lastEvent = event.type().wireName();
+            registration.lastEventAt = System.currentTimeMillis();
             DELIVERED.incrementAndGet();
         } catch (ThreadDeath | VirtualMachineError fatal) {
             throw fatal;
@@ -308,7 +350,10 @@ public class JvmtiCallbackDispatcher {
         private final Delivery delivery;
         private final AtomicLong delivered = new AtomicLong();
         private final AtomicLong failed = new AtomicLong();
+        private volatile boolean enabled = true;
         private volatile String lastFailure = "";
+        private volatile String lastEvent = "";
+        private volatile long lastEventAt;
 
         private Registration(String id, Object handler, EnumSet<JvmtiEventType> events, Delivery delivery) {
             this.id = id;

@@ -46,7 +46,7 @@ exit
 
 ## 3. TUI Keys
 
-The footer lists actions available in the current view.
+The footer lists actions available in the current view. CLI and TUI are two interaction layers over one target session, so switching between them preserves context and TUI analysis/debugger views.
 
 | Key | Action |
 | --- | --- |
@@ -60,11 +60,18 @@ The footer lists actions available in the current view.
 | `[` / `]` | Scroll horizontally faster |
 | `0` | Reset horizontal position |
 | `/` | Filter the current list; `Esc` cancels |
-| `F` | Find classes, fields, or methods |
+| `f` | Find only in the currently displayed Browse/Fields/Methods list |
+| `F` | Search all loaded classes, fields, methods, and packages |
+| `:` | Enter an exact class, package, field, or method target |
+| `@` | Show or hide static members in Fields/Methods |
+| `#` | Show or hide instance fields and virtual methods in Fields/Methods |
+| `=` | Set a field, paused local, or writable context source |
+| `x` / `X` | Invoke a selected method virtually / exact declaring implementation |
 | `n` / `N` | Next or previous match |
 | `P` | Enter a package name |
 | `J` | Show or hide JDK types |
-| `A` | Show or hide array types |
+| `a` | Show or hide array types in Browse |
+| `A` | Decompile the selected or current class |
 | `K` | Show or hide `<init>` / `<clinit>` |
 | `O` | Export the current content |
 | `F2` | Switch to the CLI |
@@ -74,7 +81,8 @@ Debugger keys:
 
 | Key | Action |
 | --- | --- |
-| `F9` | Set or clear a breakpoint at the selected BCI |
+| `F9` | Set or clear a normal breakpoint at the selected BCI |
+| `Shift+F9` | Set or clear a breakpoint limited to the current object Context |
 | `F7` | Step |
 | `F8` | Continue the current thread |
 | `F6` | Pause the selected thread |
@@ -257,9 +265,13 @@ Startup `break-main` and `break-clinit` stops are one-shot entry pauses. Normal 
 ```text
 debugger break <class> <method> <descriptor> <bci>
 debugger clear <class> <method> <descriptor> <bci>
+debugger break-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]
+debugger clear-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]
 debugger breakpoints
 debugger breakpoints clear-all
 ```
+
+Explicit class breakpoints apply to every receiver. `break-context` uses the current object as an identity condition for instance methods; from a class context (and for static methods) it applies globally. Caller patterns accept `*` and `?`. The same typed condition is available to library clients as `JvmBreakpointCondition`.
 
 ### 9.3 Field Watchpoints
 
@@ -284,11 +296,12 @@ debugger frames [paused-index] [max]
 debugger stack [paused-index] [max]
 debugger locals [paused-index] [depth]
 debugger local-context <paused-index> <depth> <slot>
+debugger local-set <paused-index> <depth> <local-index> <value>
 debugger current [paused-index] [depth] [radius]
 debugger sample <all-thread-index> [depth] [radius]
 ```
 
-`all-thread-index` comes from the complete `debugger threads` list; `paused-index` comes from the paused-thread list. `local-context` stores a local value as the current object context.
+`all-thread-index` comes from the complete `debugger threads` list; `paused-index` comes from the paused-thread list. `local-context` stores a local value as a writable current context; `set context` or `local-set` writes through to the paused frame.
 
 Without a `LocalVariableTable`, JVMRTDP attempts to read slots up to `maxLocals`. Dead slots, continuation slots for two-slot values, and values with unknown types are reported with a reason.
 
@@ -402,11 +415,14 @@ code run <deployment-id> <class> <method> <descriptor> <static|this|object-ref> 
 code close <deployment-id>
 code callback add <deployment-id> <handler-class> <event,event,...> [sync|async]
 code callback remove <callback-id>
+code callback enable <callback-id>
+code callback disable <callback-id>
+code callback reset <callback-id>
 code callback list
 code callback stats
 ```
 
-Callbacks cover thread, class, method, exception, field, monitor, GC, compilation, and resource events. Handlers must be static and use a descriptor compatible with the event payload. Apply narrow filters and keep high-frequency handlers lightweight.
+Callbacks cover thread, class, method, exception, field, monitor, GC, compilation, and resource events. Registrations can be enabled, disabled, reset, listed, and removed without redeploying the handler. Lists include delivery counters, the last event, and the last failure. Apply narrow conditions and keep high-frequency handlers lightweight.
 
 Deployment options include `--anchor`, `--same-loader`, `--child`, `--scope`, `--classpath`, `--javac`, and Java compiler source/release options.
 

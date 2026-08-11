@@ -114,7 +114,7 @@ java -agentpath:<path-to-jvmrtdp-agent.dll>=break-main=com.example.Application,b
 
 ## TUI 导航
 
-TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据当前视图显示可用操作。
+TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据当前视图显示可用操作。CLI 与 TUI 使用同一会话上下文；切换界面会保留反编译内容、字节码视图、调试状态和托管断点。
 
 | 按键 | 操作 |
 | --- | --- |
@@ -128,9 +128,12 @@ TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据�
 | `[` / `]` | 快速水平滚动 |
 | `/` | 过滤当前列表；`Esc` 取消 |
 | `F` | 全局查找类、字段或方法 |
+| `@` | 在 Fields/Methods 中显示或隐藏静态成员 |
+| `#` | 在 Fields/Methods 中显示或隐藏实例字段和虚方法 |
 | `P` | 输入包名 |
 | `J` | 显示或隐藏 JDK 类型 |
-| `A` | 显示或隐藏数组类型 |
+| `a` | 在 Browse 中显示或隐藏数组类型 |
+| `A` | 反编译选中或当前类 |
 | `K` | 显示或隐藏 `<init>` / `<clinit>` |
 | `F2` | 切换到 CLI |
 | `Q` | 返回或退出 |
@@ -195,6 +198,8 @@ debugger thaw
 `freeze` 会排除代理服务线程等敏感线程，并仅恢复由本次冻结暂停的线程。
 
 TUI 中 `F8` 继续当前线程；目标运行时，调试视图会定期短暂停线程以刷新当前方法、BCI、栈和局部变量。该行为可以通过 `F4` 关闭。
+
+TUI 中 `F9` 始终设置普通断点；只有 `Shift+F9` 才会把断点限制为当前 Context 中的对象。字段监视点默认作用于所有实例。
 
 ## JVMTI 能力
 
@@ -273,3 +278,4 @@ try (JvmRtdpClient client = JvmRtdpClient.open();
 - [脚本指南](docs/SCRIPTING_ZH.md)
 - [JVMTI API 覆盖范围](docs/JVMTI-API-COVERAGE_ZH.md)
 - [Java 库指南](docs/LIBRARY_ZH.md)
+<!-- English is the canonical documentation; this file is the Chinese translation. -->

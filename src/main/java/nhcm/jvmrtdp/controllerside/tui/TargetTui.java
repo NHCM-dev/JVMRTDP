@@ -3,9 +3,11 @@ package nhcm.jvmrtdp.controllerside.tui;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.controllerside.TargetSession;
+import nhcm.jvmrtdp.controllerside.RemoteArgumentList;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
 import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
 import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
@@ -46,13 +48,13 @@ import java.util.concurrent.Callable;
 import java.util.function.Consumer;
 
 /** Context-oriented package browser and bytecode debugger for one attached JVM. */
-public final class TargetTui {
+public final class TargetTui implements AutoCloseable {
     private enum Tab {
         BROWSE, CONTEXT, FIELDS, METHODS, SOURCE, BYTECODE, DEBUG, FRAMES, LOCALS, BREAKPOINTS, THREADS
     }
 
     private final TargetSession session;
-    private final TerminalScreen screen;
+    private TerminalScreen screen;
     private final TuiTaskRunner tasks = new TuiTaskRunner("JVMRTDP-TUI-worker");
     private final int[] selections = new int[Tab.values().length];
     private final int[] scrolls = new int[Tab.values().length];
@@ -73,7 +75,8 @@ public final class TargetTui {
     private final List<String> lastDebuggerStack = new ArrayList<String>();
     private final List<String> lastDebuggerLocals = new ArrayList<String>();
     private final Map<String, BreakpointSpec> breakpoints = new LinkedHashMap<String, BreakpointSpec>();
-    private final Map<String, String> fieldWatches = new LinkedHashMap<String, String>();
+    private final Map<String, JvmFieldWatchInfo> fieldWatches =
+            new LinkedHashMap<String, JvmFieldWatchInfo>();
     private final Deque<String> errors = new ArrayDeque<String>();
 
     private Tab tab = Tab.BROWSE;
@@ -82,12 +85,18 @@ public final class TargetTui {
     private String browserFilter = "";
     private String memberFilter = "";
     private String lastSearch = "";
+    private String listSearch = "";
     private String viewSearch = "";
     private boolean searchMode;
     private boolean showRuntime;
     private boolean showArrays;
     private boolean showSpecialMethods;
-    private boolean hideInheritedObjectMethods;
+    /** Unoverridden java.lang.Object methods are noise in most application classes. */
+    private boolean hideInheritedObjectMethods = true;
+    /** Static members are visible by default and can be hidden independently with @. */
+    private boolean showStaticMembers = true;
+    /** Instance fields and virtual methods are visible by default; # toggles them independently. */
+    private boolean showVirtualMembers = true;
     private TuiBrowserEntry pendingMemberResult;
     private RemoteClass contextClass;
     private boolean classContext;
@@ -128,27 +137,39 @@ public final class TargetTui {
     private int statusPage;
     private String pagedStatus = "";
     private String status = "Opening root package...";
+    private long synchronizedContextRevision = -1L;
+    private long scheduledContextRevision = -1L;
+    private boolean browserInitialized;
+    private boolean closed;
 
-    public TargetTui(TargetSession session, TerminalScreen screen) {
+    public TargetTui(TargetSession session) {
         this.session = session;
+        synchronizeManagedControls();
+    }
+
+    /** Compatibility constructor for callers that run one TUI screen directly. */
+    public TargetTui(TargetSession session, TerminalScreen screen) {
+        this(session);
         this.screen = screen;
-        for (JvmBreakpointInfo breakpoint : session.jvmti().managedBreakpoints()) {
-            BreakpointSpec spec = new BreakpointSpec(breakpoint.className(), breakpoint.methodName(),
-                    breakpoint.descriptor(), breakpoint.location(), -1);
-            breakpoints.put(spec.id(), spec);
-        }
-        for (JvmFieldWatchInfo watch : session.jvmti().managedFieldWatches()) {
-            String id = watch.kind() + "|" + watch.className() + "|" + watch.fieldName()
-                    + "|" + watch.descriptor();
-            fieldWatches.put(id, watch.kind() + " " + watch.className() + "." + watch.fieldName());
-        }
     }
 
     public TuiResult run() throws IOException {
-        requestPackage("");
+        if (screen == null) throw new IllegalStateException("No terminal screen is configured");
+        return run(screen);
+    }
+
+    /** Runs this session-scoped TUI on a newly opened terminal screen. */
+    public TuiResult run(TerminalScreen activeScreen) throws IOException {
+        if (closed) throw new IllegalStateException("TUI is closed");
+        screen = activeScreen;
+        synchronizeSessionState();
         try {
             while (session.server().isOpen() && !Thread.currentThread().isInterrupted()) {
                 tasks.poll();
+                // A refresh request can be temporarily rejected when a background poll and
+                // one queued action already occupy the runner. Reconcile every idle frame so
+                // CLI -> TUI context changes can never leave empty derived member panes.
+                maybeSynchronizeContext();
                 maybeAutoRefreshDebugger();
                 render();
                 int key = screen.readKey(90L);
@@ -166,14 +187,66 @@ public final class TargetTui {
             }
             return TuiResult.BACK;
         } finally {
-            tasks.close();
-            closeDebuggerStates();
+            screen = null;
         }
+    }
+
+    private void synchronizeSessionState() {
+        synchronizeManagedControls();
+        if (session.context().revision() != synchronizedContextRevision) {
+            memberFilter = "";
+            listSearch = "";
+            if (session.context().isSet()) requestContextRefresh();
+            else {
+                clearContextView();
+                synchronizedContextRevision = session.context().revision();
+            }
+        }
+        if (!browserInitialized && !session.context().isSet()) requestPackage("");
+        requestDebuggerRefresh();
+    }
+
+    private void maybeSynchronizeContext() {
+        long revision = session.context().revision();
+        if (revision == synchronizedContextRevision || tasks.busy()) return;
+        memberFilter = "";
+        listSearch = "";
+        if (session.context().isSet()) requestContextRefresh();
+        else {
+            clearContextView();
+            synchronizedContextRevision = revision;
+        }
+    }
+
+    private void synchronizeManagedControls() {
+        Map<String, BreakpointSpec> currentBreakpoints =
+                new LinkedHashMap<String, BreakpointSpec>(breakpoints);
+        breakpoints.clear();
+        for (JvmBreakpointInfo breakpoint : session.jvmti().managedBreakpoints()) {
+            String id = breakpoint.id();
+            BreakpointSpec existing = currentBreakpoints.get(id);
+            breakpoints.put(id, existing != null ? existing
+                    : new BreakpointSpec(breakpoint.className(), breakpoint.methodName(),
+                            breakpoint.descriptor(), breakpoint.location(), -1,
+                            breakpoint.registrationId(), breakpoint.receiverId(),
+                            breakpoint.conditionSummary()));
+        }
+        fieldWatches.clear();
+        for (JvmFieldWatchInfo watch : session.jvmti().managedFieldWatches()) {
+            fieldWatches.put(watch.id(), watch);
+        }
+    }
+
+    @Override public void close() {
+        if (closed) return;
+        closed = true;
+        tasks.close();
+        closeDebuggerStates();
     }
 
     private TuiResult handleKey(int key) throws IOException {
         if (key == TuiKey.F2 || key == 'c' || key == 'C') {
-            if (tasks.busy()) { status = "Operation is still running; switch to CLI when it finishes."; return null; }
+            if (tasks.userOperationBusy()) { status = "Operation is still running; switch to CLI when it finishes."; return null; }
             return TuiResult.CLI;
         }
         if (key == 'q' || key == 'Q' || key == TuiKey.F10) {
@@ -205,18 +278,23 @@ public final class TargetTui {
         else if (key == '!') statusPage++;
         else if (key == '[') moveHorizontal(-8);
         else if (key == ']') moveHorizontal(8);
-        else if (key == 'f' || key == 'F') find();
+        else if (key == 'f') findCurrentList();
+        else if (key == 'F') findGlobal();
+        else if (key == ':') openExact();
         else if (key == 'p' || key == 'P') goPackage();
         else if (key == 'l' || key == 'L') forceLoadClass();
         else if (key == 'j' || key == 'J') toggleRuntime();
         else if (key == 'k' || key == 'K') toggleSpecialMethods();
         else if (key == 'h' || key == 'H') toggleInheritedObjectMethods();
+        else if (key == '@' && (tab == Tab.FIELDS || tab == Tab.METHODS)) toggleStaticMembers();
+        else if (key == '#' && (tab == Tab.FIELDS || tab == Tab.METHODS)) toggleVirtualMembers();
         else if (key == 'r' || key == 'R' || key == TuiKey.F5) refresh();
         else if ((key == 's' || key == 'S') && tab == Tab.CONTEXT) swapContextTop();
         else if (key == 's' || key == 'S') requestSource(false);
         else if (key == 'a' || key == 'A') {
             if (tab == Tab.BREAKPOINTS) clearAllBreakpoints();
-            else if (tab == Tab.BROWSE) toggleArrays();
+            else if (tab == Tab.BROWSE && key == 'a') toggleArrays();
+            else if (tab == Tab.BROWSE) requestBrowserClassSource();
             else requestSource(true);
         }
         else if (key == 'b' || key == 'B') requestSelectedBytecode(Tab.BYTECODE);
@@ -233,9 +311,12 @@ public final class TargetTui {
         else if (key == '*') toggleAnalysisFreeze();
         else if (key == 'G') jumpToCurrentExecution();
         else if (key == 'e' || key == 'E') toggleEngine();
+        else if (key == '=') setSelectedValue();
+        else if ((key == 'x' || key == 'X') && tab == Tab.METHODS) invokeSelectedMethod(key == 'X');
         else if (key == '0') resetHorizontal();
         else if (key == 'x' || key == 'X') clearContext();
-        else if (key == TuiKey.F9) toggleBreakpoint();
+        else if (key == TuiKey.F9) toggleBreakpoint(false);
+        else if (key == TuiKey.SHIFT_F9) toggleBreakpoint(true);
         else if (key == TuiKey.F4) toggleLiveFollow();
         else if (key == TuiKey.F6) pauseSelectedThread();
         else if (key == TuiKey.F7) step();
@@ -261,6 +342,7 @@ public final class TargetTui {
                     }
                 }, new Consumer<RemotePackage>() {
                     @Override public void accept(RemotePackage value) {
+                        browserInitialized = true;
                         packageName = normalized;
                         searchMode = false;
                         browserTitle = "package:" + (normalized.isEmpty() ? "<root>" : normalized);
@@ -273,7 +355,7 @@ public final class TargetTui {
                 });
     }
 
-    private void find() throws IOException {
+    private void findGlobal() throws IOException {
         if (tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG) {
             editViewSearch();
             return;
@@ -283,6 +365,41 @@ public final class TargetTui {
         if (query == null || query.trim().isEmpty()) return;
         lastSearch = query.trim();
         requestSearch(lastSearch);
+    }
+
+    /** Finds only inside the rows already displayed by the active list. */
+    private void findCurrentList() throws IOException {
+        if (tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG) {
+            editViewSearch();
+            return;
+        }
+        if (tab != Tab.BROWSE && tab != Tab.FIELDS && tab != Tab.METHODS) {
+            status = "List Find is available in Browse, Fields, Methods, Decompile, Bytecode, and Debug.";
+            return;
+        }
+        String value = editText("Find in current list", listSearch);
+        if (value == null || value.trim().isEmpty()) return;
+        listSearch = value.trim();
+        findNextInView(1);
+    }
+
+    /** Direct input entry point; exact class/package opens immediately, members use typed search. */
+    private void openExact() throws IOException {
+        String value = editText("Open: class <name> | package <name> | field <owner>#<name> | method <owner>#<name>", "");
+        if (value == null || value.trim().isEmpty()) return;
+        String command = value.trim();
+        int separator = command.indexOf(' ');
+        String kind = separator < 0 ? "class" : command.substring(0, separator).toLowerCase(Locale.ROOT);
+        String target = separator < 0 ? command : command.substring(separator + 1).trim();
+        if (target.isEmpty()) { status = "An exact target is required."; return; }
+        if ("package".equals(kind)) requestPackage(target);
+        else if ("field".equals(kind) || "method".equals(kind)) requestSearch(kind + ":" + target);
+        else if ("class".equals(kind)) {
+            session.context().select(session.findClass(target));
+            tab = Tab.CONTEXT;
+            status = "Context <- class " + target + "; loading members...";
+            requestContextRefresh();
+        } else status = "Unknown exact target kind: " + kind;
     }
 
     private void requestSearch(final String query) {
@@ -362,14 +479,28 @@ public final class TargetTui {
     private void requestContextRefresh() {
         if (!session.context().isSet()) {
             clearContextView();
+            synchronizedContextRevision = session.context().revision();
             return;
         }
         final boolean includeSpecialMethods = showSpecialMethods;
-        submit("Loading context " + session.context().description() + "...",
+        final long requestedRevision = session.context().revision();
+        // Context navigation and member filtering are different pieces of state. A TUI
+        // instance survives CLI round-trips, so retaining the previous class' member
+        // filter would make a correctly loaded new class appear to have no fields or
+        // methods. Clear it at the refresh boundary itself; this covers immediate,
+        // queued and CLI-triggered refreshes alike.
+        if (requestedRevision != synchronizedContextRevision) {
+            memberFilter = "";
+            listSearch = "";
+        }
+        final RemoteClass requestedType = session.context().remoteClass();
+        final boolean requestedStaticContext = session.context().isClass();
+        final String requestedDescription = session.context().description();
+        boolean scheduled = submit("Loading context " + requestedDescription + "...",
                 new Callable<ContextSnapshot>() {
                     @Override public ContextSnapshot call() {
-                        RemoteClass type = session.context().remoteClass();
-                        boolean staticContext = session.context().isClass();
+                        RemoteClass type = requestedType;
+                        boolean staticContext = requestedStaticContext;
                         List<RemoteField> loadedFields = new ArrayList<RemoteField>();
                         List<RemoteMethod> loadedMethods = new ArrayList<RemoteMethod>();
                         if (staticContext) {
@@ -380,7 +511,9 @@ public final class TargetTui {
                             addUniqueMethods(loadedMethods, type.getStaticMethods());
                             addUniqueMethods(loadedMethods, type.getVirtualMethods());
                         } else {
+                            addUniqueFields(loadedFields, type.getStaticFields());
                             addUniqueFields(loadedFields, type.getVirtualFields());
+                            addUniqueMethods(loadedMethods, type.getStaticMethods());
                             addUniqueMethods(loadedMethods, type.getVirtualMethods());
                         }
                         String specialError = "";
@@ -393,6 +526,13 @@ public final class TargetTui {
                     }
                 }, new Consumer<ContextSnapshot>() {
                     @Override public void accept(ContextSnapshot value) {
+                        scheduledContextRevision = -1L;
+                        if (session.context().revision() != requestedRevision) {
+                            status = "Context changed while members were loading; opening the latest context...";
+                            if (scheduledContextRevision <= requestedRevision) requestContextRefresh();
+                            return;
+                        }
+                        synchronizedContextRevision = requestedRevision;
                         contextClass = value.type;
                         classContext = value.classContext;
                         fields.clear();
@@ -413,8 +553,10 @@ public final class TargetTui {
                                 + (showSpecialMethods ? " | <init>/<clinit> visible" : "")
                                 + (value.specialError.isEmpty() ? ""
                                         : " | special methods unavailable: " + value.specialError);
+                        if (!browserInitialized) requestPackage("");
                     }
                 });
+        if (scheduled) scheduledContextRevision = requestedRevision;
     }
 
     private static void addUniqueFields(List<RemoteField> target, List<RemoteField> source) {
@@ -437,14 +579,16 @@ public final class TargetTui {
             RemoteField wanted = entry.field();
             if (!containsField(fields, wanted)) fields.add(wanted);
             sortMembers();
-            selections[Tab.FIELDS.ordinal()] = indexOfField(fields, wanted);
+            selections[Tab.FIELDS.ordinal()] = Math.max(0, indexOfField(visibleFields(), wanted));
             tab = Tab.FIELDS;
         } else if (entry.kind() == TuiBrowserEntry.Kind.METHOD) {
             RemoteMethod wanted = entry.method();
             if (!containsMethod(methods, wanted)) methods.add(wanted);
             sortMembers();
-            selections[Tab.METHODS.ordinal()] = indexOfMethod(methods, wanted);
-            selectedMethod = methods.get(selections[Tab.METHODS.ordinal()]);
+            selections[Tab.METHODS.ordinal()] = Math.max(0, indexOfMethod(visibleMethods(), wanted));
+            List<RemoteMethod> visible = visibleMethods();
+            selectedMethod = visible.isEmpty() ? null
+                    : visible.get(selections[Tab.METHODS.ordinal()]);
             tab = Tab.METHODS;
         }
     }
@@ -562,7 +706,12 @@ public final class TargetTui {
     }
 
     private void activate() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        // Context navigation is versioned and may safely queue behind a member load.
+        // This keeps Enter responsive when the previous class is still refreshing.
+        if (tasks.userOperationBusy() && tab != Tab.BROWSE && tab != Tab.CONTEXT) {
+            status = busyMessage();
+            return;
+        }
         if (tab == Tab.BROWSE) selectBrowserEntry();
         else if (tab == Tab.CONTEXT) selectContextStackItem();
         else if (tab == Tab.FIELDS) readSelectedField();
@@ -572,7 +721,7 @@ public final class TargetTui {
         else if (tab == Tab.LOCALS) selectLocalAsContext();
         else if (tab == Tab.BREAKPOINTS) openSelectedBreakpoint();
         else if (tab == Tab.THREADS) selectOrPauseThread();
-        else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) toggleBreakpoint();
+        else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) toggleBreakpoint(false);
     }
 
     private void jumpSourceLineToBytecode() {
@@ -716,7 +865,11 @@ public final class TargetTui {
         // Transfer this remote handle out of the refresh-owned locals list. Otherwise the
         // next debugger snapshot would close the object now retained by RemoteContext.
         debuggerLocals.remove(index);
-        session.context().select(local.value());
+        if (debuggerState != null && debuggerState.paused()) {
+            session.context().select(local.value(), null,
+                    session.operations().debuggerLocalAssignment(debuggerState.sequence(),
+                            debuggerFrameDepth, local.slot(), local.descriptor()));
+        } else session.context().select(local.value());
         tab = Tab.CONTEXT;
         selections[Tab.CONTEXT.ordinal()] = 0;
         status = "Context <- local [" + local.slot() + "] " + local.name();
@@ -752,8 +905,7 @@ public final class TargetTui {
         submit("Clearing breakpoint " + selected.methodName + " @" + selected.bci + "...",
                 new Callable<Boolean>() {
                     @Override public Boolean call() {
-                        session.jvmti().setBreakpoint(selected.className, selected.methodName,
-                                selected.descriptor, selected.bci, false);
+                        session.jvmti().clearBreakpoint(selected.info());
                         return Boolean.TRUE;
                     }
                 }, new Consumer<Boolean>() {
@@ -777,8 +929,7 @@ public final class TargetTui {
                 List<String> failures = new ArrayList<String>();
                 for (BreakpointSpec selected : values) {
                     try {
-                        session.jvmti().setBreakpoint(selected.className, selected.methodName,
-                                selected.descriptor, selected.bci, false);
+                        session.jvmti().clearBreakpoint(selected.info());
                         cleared.add(selected.id());
                     } catch (RuntimeException failure) {
                         failures.add(selected.methodName + " @" + selected.bci + ": "
@@ -813,10 +964,13 @@ public final class TargetTui {
         final RemoteObject receiver = field.isStatic() ? null : session.context().remoteObject();
         submit("Reading " + field.declaringClass() + "." + field.name() + "...",
                 new Callable<RemoteObject>() {
-                    @Override public RemoteObject call() { return field.read(receiver); }
+                    @Override public RemoteObject call() {
+                        return session.operations().read(field, receiver);
+                    }
                 }, new Consumer<RemoteObject>() {
                     @Override public void accept(RemoteObject value) {
-                        session.context().select(value);
+                        session.context().select(value, null,
+                                session.operations().fieldAssignment(field, receiver));
                         tab = Tab.CONTEXT;
                         status = "Context <- " + field.declaringClass() + "." + field.name();
                         requestContextRefresh();
@@ -824,14 +978,159 @@ public final class TargetTui {
                 });
     }
 
+    private void setSelectedValue() throws IOException {
+        if (tab == Tab.FIELDS) setSelectedField();
+        else if (tab == Tab.LOCALS) setSelectedLocal();
+        else if (tab == Tab.CONTEXT) setCurrentContext();
+        else status = "Use = in Context, Fields, or Locals. Methods/classes use redefine instead.";
+    }
+
+    private void setSelectedField() throws IOException {
+        final List<RemoteField> visible = visibleFields();
+        if (visible.isEmpty()) { status = "No field is selected."; return; }
+        final RemoteField field = visible.get(selection());
+        if (!field.isStatic() && session.context().isClass()) {
+            status = "An object context is required to set this instance field.";
+            return;
+        }
+        final RemoteObject receiver = field.isStatic() ? null : session.context().remoteObject();
+        final String expression = editText("Set " + field.declaringClass() + "."
+                + field.name() + " = (literal, @reference, or {expression})", "");
+        if (expression == null) return;
+        submit("Writing " + field.declaringClass() + "." + field.name() + "...",
+                new Callable<String>() {
+                    @Override public String call() {
+                        try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                                session, Collections.singletonList(expression))) {
+                            session.operations().write(field, receiver, values.only());
+                        }
+                        return field.declaringClass() + "." + field.name();
+                    }
+                }, new Consumer<String>() {
+                    @Override public void accept(String value) {
+                        status = "Updated " + value;
+                        requestContextRefresh();
+                    }
+                });
+    }
+
+    private void setCurrentContext() throws IOException {
+        if (!session.context().isSet() || !session.context().canAssign()) {
+            status = "Current context is a read-only snapshot; select a field, array element, or paused local first.";
+            return;
+        }
+        final String source = session.context().assignmentDescription();
+        final String expression = editText("Set context source " + source + " =", "");
+        if (expression == null) return;
+        submit("Updating " + source + "...", new Callable<String>() {
+            @Override public String call() {
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(expression))) {
+                    session.context().assign(values.only());
+                    values.transferOnly();
+                }
+                return source;
+            }
+        }, new Consumer<String>() {
+            @Override public void accept(String value) {
+                status = "Updated " + value;
+                requestContextRefresh();
+                requestDebuggerRefresh();
+            }
+        });
+    }
+
+    private void setSelectedLocal() throws IOException {
+        if (debuggerState == null || !debuggerState.paused() || debuggerLocals.isEmpty()) {
+            status = "Writing locals requires a currently paused debugger thread (live samples are read-only).";
+            return;
+        }
+        final JvmDebuggerLocal local = debuggerLocals.get(clamp(selection(), 0,
+                debuggerLocals.size() - 1));
+        if (local.descriptor() == null || local.descriptor().isEmpty()
+                || "?".equals(local.descriptor())) {
+            status = "This inferred slot has no reliable descriptor and cannot be written safely.";
+            return;
+        }
+        final long sequence = debuggerState.sequence();
+        final int depth = debuggerFrameDepth;
+        final int slot = local.slot();
+        final String descriptor = local.descriptor();
+        final String expression = editText("Set local " + local.name() + " [slot " + slot + "] =", "");
+        if (expression == null) return;
+        submit("Writing local slot " + slot + "...", new Callable<String>() {
+            @Override public String call() {
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(expression))) {
+                    session.operations().debuggerLocalAssignment(sequence, depth, slot, descriptor)
+                            .write(values.only());
+                }
+                return local.name();
+            }
+        }, new Consumer<String>() {
+            @Override public void accept(String value) {
+                status = "Updated local " + value + " in frame #" + depth;
+                requestDebuggerRefresh();
+            }
+        });
+    }
+
+    private void invokeSelectedMethod(final boolean exactDispatch) throws IOException {
+        final List<RemoteMethod> visible = visibleMethods();
+        if (visible.isEmpty()) { status = "No method is selected."; return; }
+        final RemoteMethod method = visible.get(selection());
+        if (method.isJvmSpecial()) {
+            status = method.name() + " is a lifecycle method; use construction/Class.forName or redefine.";
+            return;
+        }
+        if (!method.isStatic() && session.context().isClass()) {
+            status = "An object context is required to invoke this instance method.";
+            return;
+        }
+        final RemoteObject receiver = method.isStatic() ? null : session.context().remoteObject();
+        final List<String> expressions = new ArrayList<String>();
+        List<String> parameterTypes = method.parameterTypeNames();
+        for (int index = 0; index < parameterTypes.size(); index++) {
+            String value = editText("Argument " + index + " (" + parameterTypes.get(index)
+                    + "): literal, @reference, or {expression}", "");
+            if (value == null) { status = "Invocation cancelled."; return; }
+            expressions.add(value);
+        }
+        submit("Invoking " + method.declaringClass() + "." + method.name() + "...",
+                new Callable<RemoteObject>() {
+                    @Override public RemoteObject call() {
+                        try (RemoteArgumentList values = RemoteArgumentList.resolve(session, expressions)) {
+                            return session.operations().invoke(
+                                    method, receiver, exactDispatch, values.values());
+                        }
+                    }
+                }, new Consumer<RemoteObject>() {
+                    @Override public void accept(RemoteObject value) {
+                        if ("void".equals(value.className())) {
+                            value.close();
+                            status = "Invocation completed: void (context unchanged)";
+                        } else {
+                            session.context().select(value);
+                            tab = Tab.CONTEXT;
+                            status = "Context <- invocation result of " + method.name();
+                            requestContextRefresh();
+                        }
+                    }
+                });
+    }
+
     private void requestSource(boolean wholeClass) {
-        final DecompilerEngine selectedEngine = engine;
         final RemoteClass type;
         final String methodName;
         final String descriptor;
         if (wholeClass) {
-            if (!requireContext()) return;
-            type = contextClass;
+            if (tab == Tab.SOURCE && !sourceClass.isEmpty()) type = session.findClass(sourceClass);
+            else if ((tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty()) {
+                type = session.findClass(bytecodeClass);
+            } else {
+                if (!requireContext()) return;
+                type = contextClass;
+            }
             methodName = "";
             descriptor = "";
         } else if (((tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty())
@@ -852,6 +1151,27 @@ public final class TargetTui {
             methodName = method.name();
             descriptor = method.descriptor();
         }
+        startDecompile(type, methodName, descriptor);
+    }
+
+    /** Decompiles the class owning the selected browser row without requiring a context first. */
+    private void requestBrowserClassSource() {
+        if (visibleBrowserEntries.isEmpty()) {
+            status = "Select a class, field, or method row before decompiling its class.";
+            return;
+        }
+        TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+        if (entry.kind() == TuiBrowserEntry.Kind.PARENT
+                || entry.kind() == TuiBrowserEntry.Kind.PACKAGE) {
+            status = "Class decompile needs a class row; Enter opens this package first.";
+            return;
+        }
+        startDecompile(session.findClass(entry.ownerName()), "", "");
+    }
+
+    private void startDecompile(final RemoteClass type, final String methodName,
+            final String descriptor) {
+        final DecompilerEngine selectedEngine = engine;
         final String title = methodName.isEmpty() ? type.className()
                 : type.className() + "." + methodName + descriptor;
         if (!submit("Decompiling " + title + " with " + selectedEngine + "...",
@@ -992,13 +1312,15 @@ public final class TargetTui {
 
     private void requestDebuggerRefresh() {
         final boolean followLocation = tab == Tab.DEBUG;
-        submit("Refreshing debugger state...", new Callable<DebuggerSnapshot>() {
+        tasks.submit("", new Callable<DebuggerSnapshot>() {
             @Override public DebuggerSnapshot call() { return debuggerSnapshot(); }
         }, new Consumer<DebuggerSnapshot>() {
             @Override public void accept(DebuggerSnapshot value) {
                 lastDebuggerFullRefreshAt = System.currentTimeMillis();
                 applyDebuggerSnapshot(value, followLocation);
             }
+        }, new Consumer<Throwable>() {
+            @Override public void accept(Throwable failure) { recordError(failure); }
         });
     }
 
@@ -1571,7 +1893,7 @@ public final class TargetTui {
     }
 
     private void switchDebuggerThread() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         List<JvmDebuggerState> paused = new ArrayList<JvmDebuggerState>();
         for (JvmDebuggerState state : debuggerStates) if (state.paused()) paused.add(state);
         if (paused.isEmpty()) {
@@ -1729,17 +2051,17 @@ public final class TargetTui {
         liveSampleAvailable = false;
     }
 
-    private void toggleBreakpoint() {
+    private void toggleBreakpoint(boolean receiverOnly) {
         if (tab == Tab.BREAKPOINTS) {
             clearSelectedBreakpoint();
             return;
         }
         if (tab == Tab.SOURCE) {
-            toggleSourceBreakpoint();
+            toggleSourceBreakpoint(receiverOnly);
             return;
         }
         if (tab == Tab.METHODS) {
-            toggleMethodEntryBreakpoint();
+            toggleMethodEntryBreakpoint(receiverOnly);
             return;
         }
         if (bytecode == null || bytecode.instructions().isEmpty()) {
@@ -1749,28 +2071,11 @@ public final class TargetTui {
         final BytecodeInstruction instruction = bytecode.instructions().get(bytecodeCursor());
         final BreakpointSpec spec = new BreakpointSpec(
                 bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset(), instruction.sourceLine());
-        final boolean set = !breakpoints.containsKey(spec.id());
-        submit((set ? "Setting" : "Clearing") + " breakpoint at BCI " + spec.bci + "...",
-                new Callable<Boolean>() {
-                    @Override public Boolean call() {
-                        if (set) session.jvmti().configureDebugger(true);
-                        session.jvmti().setBreakpoint(spec.className, spec.methodName,
-                                spec.descriptor, spec.bci, set);
-                        return set;
-                    }
-                }, new Consumer<Boolean>() {
-                    @Override public void accept(Boolean enabled) {
-                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
-                        else breakpoints.remove(spec.id());
-                        boolean invoke = instruction.mnemonic().startsWith("invoke");
-                        status = (enabled.booleanValue() ? "Breakpoint set" : "Breakpoint cleared")
-                                + (invoke ? " before invoke" : "")
-                                + " at " + spec.className + "." + spec.methodName + " BCI " + spec.bci;
-                    }
-                });
+        toggleBreakpointSpec(spec, instruction.mnemonic().startsWith("invoke") ? " before invoke" : "",
+                receiverOnly);
     }
 
-    private void toggleMethodEntryBreakpoint() {
+    private void toggleMethodEntryBreakpoint(boolean receiverOnly) {
         RemoteMethod method = selectedMethodForAction();
         if (method == null) {
             status = "Select a method first.";
@@ -1782,26 +2087,7 @@ public final class TargetTui {
         }
         final BreakpointSpec spec = new BreakpointSpec(method.declaringClass(), method.name(),
                 method.descriptor(), 0L, -1);
-        final boolean set = !breakpoints.containsKey(spec.id());
-        submit((set ? "Setting" : "Clearing") + " method-entry breakpoint on "
-                        + method.declaringClass() + "." + method.name() + "...",
-                new Callable<Boolean>() {
-                    @Override public Boolean call() {
-                        if (set) session.jvmti().configureDebugger(true);
-                        session.jvmti().setBreakpoint(spec.className, spec.methodName,
-                                spec.descriptor, spec.bci, set);
-                        return Boolean.valueOf(set);
-                    }
-                }, new Consumer<Boolean>() {
-                    @Override public void accept(Boolean enabled) {
-                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
-                        else breakpoints.remove(spec.id());
-                        status = (enabled.booleanValue() ? "Method-entry breakpoint set: "
-                                : "Method-entry breakpoint cleared: ")
-                                + spec.className + "." + spec.methodName + spec.descriptor
-                                + " @BCI 0; no object reference required";
-                    }
-                });
+        toggleBreakpointSpec(spec, " at method entry", receiverOnly);
     }
 
     private void toggleSelectedFieldWatch(final boolean modification) {
@@ -1813,22 +2099,25 @@ public final class TargetTui {
         if (visible.isEmpty()) return;
         final RemoteField field = visible.get(selection());
         final String kind = modification ? "write" : "read";
-        final String id = kind + "|" + field.declaringClass() + "|" + field.name()
-                + "|" + field.descriptor();
-        final boolean set = !fieldWatches.containsKey(id);
+        // TUI watchpoints target the field for every instance. Receiver-specific watches
+        // remain available only through the explicit CLI/library condition APIs.
+        final JvmFieldWatchInfo existing = findFieldWatch(field, modification, 0L);
+        final boolean set = existing == null;
         submit((set ? "Setting " : "Clearing ") + kind + " watchpoint on " + field.name() + "...",
                 new Callable<Boolean>() {
                     @Override public Boolean call() {
                         if (set) session.jvmti().configureDebugger(true);
-                        session.jvmti().setFieldWatch(field.declaringClass(), field.name(),
-                                field.descriptor(), modification, set);
+                        if (set) session.jvmti().setFieldWatch(field.declaringClass(), field.name(),
+                                field.descriptor(), modification, null, true);
+                        else {
+                            // Clear by the stable registration id even if its original object handle closed.
+                            session.jvmti().clearFieldWatch(existing);
+                        }
                         return Boolean.valueOf(set);
                     }
                 }, new Consumer<Boolean>() {
                     @Override public void accept(Boolean enabled) {
-                        if (enabled.booleanValue()) fieldWatches.put(id,
-                                kind + " " + field.declaringClass() + "." + field.name());
-                        else fieldWatches.remove(id);
+                        synchronizeManagedControls();
                         status = kind + " watchpoint "
                                 + (enabled.booleanValue() ? "set" : "cleared") + " on "
                                 + field.declaringClass() + "." + field.name();
@@ -1836,7 +2125,7 @@ public final class TargetTui {
                 });
     }
 
-    private void toggleSourceBreakpoint() {
+    private void toggleSourceBreakpoint(boolean receiverOnly) {
         if (sourceMethod.isEmpty()) {
             status = "F9 in Decompile requires a single-method result; press S from Methods or Debug.";
             return;
@@ -1855,25 +2144,97 @@ public final class TargetTui {
         if (best == null) { status = "No mapped bytecode exists near this decompiled line."; return; }
         final BreakpointSpec spec = new BreakpointSpec(sourceClass, sourceMethod, sourceDescriptor,
                 best.getKey(), best.getValue());
-        final boolean set = !breakpoints.containsKey(spec.id());
         final int mappedLine = best.getValue();
-        submit((set ? "Setting" : "Clearing") + " decompiled-line breakpoint at line " + selectedLine + "...",
+        toggleBreakpointSpec(spec, " at decompiled line " + mappedLine
+                + (mappedLine == selectedLine ? "" : " (nearest mapped line)"), receiverOnly);
+    }
+
+    private void toggleBreakpointSpec(final BreakpointSpec requested, final String detail,
+            boolean receiverOnly) {
+        final JvmBreakpointCondition condition;
+        if (receiverOnly) {
+            if (!session.context().isObject()) {
+                status = "Shift+F9 needs an object Context; F9 creates a normal breakpoint.";
+                return;
+            }
+            if (isStaticBreakpointTarget(requested)) {
+                status = "A static method has no receiver; use F9 for a normal breakpoint.";
+                return;
+            }
+            condition = JvmBreakpointCondition.receiver(session.context().remoteObject());
+        } else {
+            condition = JvmBreakpointCondition.any();
+        }
+        final long receiverId = condition.receiverId();
+        final BreakpointSpec existing = findBreakpoint(requested.className, requested.methodName,
+                requested.descriptor, requested.bci, receiverId);
+        final boolean set = existing == null;
+        submit((set ? "Setting" : "Clearing") + " breakpoint at BCI " + requested.bci + "...",
                 new Callable<Boolean>() {
                     @Override public Boolean call() {
-                        session.jvmti().setBreakpoint(spec.className, spec.methodName, spec.descriptor,
-                                spec.bci, set);
-                        if (set) session.jvmti().configureDebugger(true);
+                        if (set) {
+                            session.jvmti().configureDebugger(true);
+                            session.jvmti().setBreakpoint(requested.className, requested.methodName,
+                                    requested.descriptor, requested.bci, condition, true);
+                        } else session.jvmti().clearBreakpoint(existing.info());
                         return Boolean.valueOf(set);
                     }
                 }, new Consumer<Boolean>() {
                     @Override public void accept(Boolean enabled) {
-                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
-                        else breakpoints.remove(spec.id());
+                        synchronizeManagedControls();
                         status = (enabled.booleanValue() ? "Breakpoint set" : "Breakpoint cleared")
-                                + " at decompiled line " + mappedLine + " / BCI " + spec.bci
-                                + (mappedLine == selectedLine ? "" : " (nearest mapped line)");
+                                + detail + " at " + requested.className + "." + requested.methodName
+                                + " BCI " + requested.bci
+                                + (receiverOnly ? " for the current object only" : "");
                     }
                 });
+    }
+
+    private boolean isStaticBreakpointTarget(BreakpointSpec requested) {
+        if ("<clinit>".equals(requested.methodName)) return true;
+        if (bytecode != null && requested.className.equals(bytecodeClass)
+                && requested.methodName.equals(bytecodeMethod)
+                && requested.descriptor.equals(bytecodeDescriptor)) {
+            return Modifier.isStatic(bytecode.accessFlags());
+        }
+        for (RemoteMethod method : methods) {
+            if (method.declaringClass().equals(requested.className)
+                    && method.name().equals(requested.methodName)
+                    && method.descriptor().equals(requested.descriptor)) return method.isStatic();
+        }
+        return false;
+    }
+
+    private BreakpointSpec findBreakpoint(String className, String methodName,
+            String descriptor, long bci, long receiverId) {
+        for (BreakpointSpec value : breakpoints.values()) {
+            if (value.className.equals(className) && value.methodName.equals(methodName)
+                    && value.descriptor.equals(descriptor) && value.bci == bci
+                    && value.receiverId == receiverId) return value;
+        }
+        return null;
+    }
+
+    /** Matches the physical bytecode location regardless of optional SDK conditions. */
+    private boolean hasBreakpointAt(String className, String methodName,
+            String descriptor, long bci) {
+        for (BreakpointSpec value : breakpoints.values()) {
+            if (value.className.equals(className) && value.methodName.equals(methodName)
+                    && value.descriptor.equals(descriptor) && value.bci == bci) return true;
+        }
+        return false;
+    }
+
+    private JvmFieldWatchInfo findFieldWatch(
+            RemoteField field, boolean modification, long receiverId) {
+        for (JvmFieldWatchInfo value : fieldWatches.values()) {
+            if (value.className().equals(field.declaringClass())
+                    && value.fieldName().equals(field.name())
+                    && value.descriptor().equals(field.descriptor())
+                    && value.modification() == modification
+                    && value.receiverId() == receiverId) return value;
+        }
+        return null;
     }
 
     private void dumpContextClass() {
@@ -1894,7 +2255,7 @@ public final class TargetTui {
     }
 
     private void exportCurrentView() throws IOException {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         final ExportPayload payload = exportPayload();
         if (payload == null) {
             status = "Nothing is loaded in the current view.";
@@ -2077,7 +2438,7 @@ public final class TargetTui {
     }
 
     private void navigateBack() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         if (tab == Tab.FRAMES || tab == Tab.LOCALS || tab == Tab.BREAKPOINTS) {
             tab = Tab.DEBUG;
             alignDebuggerLocation(Tab.DEBUG);
@@ -2097,7 +2458,7 @@ public final class TargetTui {
     }
 
     private void clearContext() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         session.context().clear();
         selectedMethod = null;
         clearContextView();
@@ -2116,7 +2477,7 @@ public final class TargetTui {
     }
 
     private void refresh() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         if (tab == Tab.BROWSE) {
             if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
             else requestPackage(packageName);
@@ -2134,7 +2495,7 @@ public final class TargetTui {
     }
 
     private void toggleArrays() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         showArrays = !showArrays;
         status = showArrays
                 ? "Array classes enabled; opening package root (arrays have no Java package or <clinit>)"
@@ -2144,12 +2505,12 @@ public final class TargetTui {
     }
 
     private void toggleSpecialMethods() {
-        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         showSpecialMethods = !showSpecialMethods;
         status = showSpecialMethods
                 ? "JVM lifecycle methods enabled: loading <init> and <clinit> from class bytes"
                 : "JVM lifecycle methods hidden";
-        if (session.context().isSet() && !tasks.busy()) requestContextRefresh();
+        if (session.context().isSet() && !tasks.userOperationBusy()) requestContextRefresh();
         else if (!session.context().isSet()) tab = Tab.BROWSE;
     }
 
@@ -2165,6 +2526,31 @@ public final class TargetTui {
         status = hideInheritedObjectMethods
                 ? "Hidden unoverridden java.lang.Object methods; real overrides remain visible"
                 : "Inherited java.lang.Object methods are visible";
+    }
+
+    private void toggleStaticMembers() {
+        showStaticMembers = !showStaticMembers;
+        clampMemberSelections();
+        if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+        }
+        status = showStaticMembers
+                ? "Static members are visible (@ toggles); virtual members are "
+                        + (showVirtualMembers ? "visible" : "hidden") + " (# toggles)"
+                : "Static members are hidden; press @ to show them again";
+    }
+
+    private void toggleVirtualMembers() {
+        showVirtualMembers = !showVirtualMembers;
+        clampMemberSelections();
+        if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+        }
+        status = showVirtualMembers
+                ? "Instance fields and virtual methods are visible (# toggles)"
+                : "Instance fields and virtual methods are hidden; press # to show them again";
     }
 
     private void toggleEngine() {
@@ -2202,6 +2588,26 @@ public final class TargetTui {
     }
 
     private void findNextInView(int direction) {
+        if (tab == Tab.BROWSE || tab == Tab.FIELDS || tab == Tab.METHODS) {
+            if (listSearch.isEmpty()) { status = "Press f to find within the current list first."; return; }
+            List<String> rows = new ArrayList<String>();
+            if (tab == Tab.BROWSE) {
+                for (TuiBrowserEntry entry : visibleBrowserEntries) rows.add(entry.displayName());
+            } else if (tab == Tab.FIELDS) {
+                for (RemoteField field : visibleFields()) rows.add(fieldLabel(field));
+            } else {
+                for (RemoteMethod method : visibleMethods()) rows.add(methodLabel(method));
+            }
+            int match = nextTextMatch(rows, selections[tab.ordinal()], listSearch, direction);
+            if (match < 0) status = "No current-list match for: " + listSearch;
+            else {
+                selections[tab.ordinal()] = match;
+                if (tab == Tab.METHODS) selectedMethod = visibleMethods().get(match);
+                status = "Current-list match " + (match + 1) + "/" + rows.size()
+                        + " (N previous, n next)";
+            }
+            return;
+        }
         if (viewSearch.isEmpty() || (tab != Tab.SOURCE && tab != Tab.BYTECODE && tab != Tab.DEBUG)) {
             status = "Press / to enter a Decompile/Bytecode search first.";
             return;
@@ -2333,7 +2739,7 @@ public final class TargetTui {
     }
 
     private String editText(String prompt, String initial) throws IOException {
-        if (tasks.busy()) { status = busyMessage(); return null; }
+        if (tasks.userOperationBusy()) { status = busyMessage(); return null; }
         final String previousStatus = status;
         StringBuilder value = new StringBuilder(initial == null ? "" : initial);
         while (true) {
@@ -2413,6 +2819,8 @@ public final class TargetTui {
         List<RemoteField> result = new ArrayList<RemoteField>();
         String needle = memberFilter.toLowerCase(Locale.ROOT);
         for (RemoteField field : fields) {
+            if (!showStaticMembers && field.isStatic()) continue;
+            if (!showVirtualMembers && !field.isStatic()) continue;
             if (needle.isEmpty() || field.name().toLowerCase(Locale.ROOT).contains(needle)
                     || field.typeName().toLowerCase(Locale.ROOT).contains(needle)) result.add(field);
         }
@@ -2423,6 +2831,8 @@ public final class TargetTui {
         List<RemoteMethod> result = new ArrayList<RemoteMethod>();
         String needle = memberFilter.toLowerCase(Locale.ROOT);
         for (RemoteMethod method : methods) {
+            if (!showStaticMembers && method.isStatic()) continue;
+            if (!showVirtualMembers && !method.isStatic()) continue;
             if (TuiBrowserModel.inheritedObjectMethodHidden(
                     contextClass == null ? null : contextClass.className(),
                     method.declaringClass(), hideInheritedObjectMethods)) continue;
@@ -2648,6 +3058,11 @@ public final class TargetTui {
         if (tab == Tab.CONTEXT) {
             List<String> result = new ArrayList<String>(contextLines);
             result.add("");
+            result.add("WRITE SOURCE");
+            result.add(session.context().canAssign()
+                    ? session.context().assignmentDescription() + "  (= writes a replacement)"
+                    : "<read-only snapshot; select a field/array element/paused local to make it writable>");
+            result.add("");
             result.add("STACK MANAGEMENT");
             addKeyHelp(result, "Enter", "Move selected item to top");
             addKeyHelp(result, "Space", "Copy selected item to top");
@@ -2701,7 +3116,9 @@ public final class TargetTui {
                             ? "Open this package"
                             : "Open declaring class and select member");
             addKeyHelp(result, "Backspace", "Open parent package/context");
-            addKeyHelp(result, "F", "Find classes, fields, methods or packages");
+            addKeyHelp(result, "f", "Find only in this displayed list");
+            addKeyHelp(result, "F", "Search all loaded classes/members/packages");
+            addKeyHelp(result, ":", "Open an exact class/package/member target");
             addKeyHelp(result, "L", "Class.forName and initialize a target class");
             addKeyHelp(result, "/", "Filter the current list");
             addKeyHelp(result, "J", "Show/hide JDK runtime entries");
@@ -2709,7 +3126,16 @@ public final class TargetTui {
             addKeyHelp(result, "0", "Reset horizontal position");
         } else if (tab == Tab.FIELDS) {
             List<RemoteField> visible = visibleFields();
-            if (!visible.isEmpty()) {
+            result.add("Static fields: " + (showStaticMembers ? "visible" : "hidden")
+                    + "  (@ toggles)");
+            result.add("Instance fields: " + (showVirtualMembers ? "visible" : "hidden")
+                    + "  (# toggles)");
+            result.add("");
+            if (visible.isEmpty()) {
+                result.add(fields.isEmpty() ? "<no fields were returned for this context>"
+                        : "No field matches the active filters. Press @, #, or / to adjust them.");
+                result.add("Press F for global field search or : to enter owner#field directly.");
+            } else {
                 RemoteField field = visible.get(selection());
                 result.add((field.isStatic() ? "STATIC " : "INSTANCE ")
                         + Modifier.toString(field.modifiers()) + " " + field.typeName() + " " + field.name());
@@ -2725,6 +3151,10 @@ public final class TargetTui {
                 result.add("");
                 result.add("SHORTCUTS");
                 addKeyHelp(result, "Enter", "Read field value");
+                addKeyHelp(result, "=", "Set this field from a literal/reference/expression");
+                addKeyHelp(result, "@", "Show/hide static fields");
+                addKeyHelp(result, "#", "Show/hide instance fields");
+                addKeyHelp(result, "f / F", "Find in list / search globally");
                 addKeyHelp(result, "U", "Toggle field-read watchpoint");
                 addKeyHelp(result, "W", "Toggle field-write watchpoint");
                 addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
@@ -2732,10 +3162,18 @@ public final class TargetTui {
             }
         } else if (tab == Tab.METHODS) {
             List<RemoteMethod> visible = visibleMethods();
+            result.add("Static methods: " + (showStaticMembers ? "visible" : "hidden")
+                    + "  (@ toggles)");
+            result.add("Virtual methods: " + (showVirtualMembers ? "visible" : "hidden")
+                    + "  (# toggles)");
             result.add("Object inheritance: " + (hideInheritedObjectMethods
                     ? "hidden when not overridden" : "visible") + " (H toggles)");
             result.add("");
-            if (!visible.isEmpty()) {
+            if (visible.isEmpty()) {
+                result.add(methods.isEmpty() ? "<no methods were returned for this context>"
+                        : "No method matches the active member/Object/text filters. Press @, #, H, or /.");
+                result.add("Press F for global method search or : to enter owner#method directly.");
+            } else {
                 RemoteMethod method = visible.get(selection());
                 result.add((method.isStatic() ? "STATIC " : "INSTANCE ")
                         + Modifier.toString(method.modifiers()) + " " + method.returnTypeName()
@@ -2763,6 +3201,10 @@ public final class TargetTui {
                 addKeyHelp(result, "H", "Hide/show unoverridden Object methods");
                 addKeyHelp(result, "K", "Show/hide <init> and <clinit>");
                 addKeyHelp(result, "Enter / B", "Open method bytecode");
+                addKeyHelp(result, "x / X", "Invoke virtually / exact declaring implementation");
+                addKeyHelp(result, "@", "Show/hide static methods");
+                addKeyHelp(result, "#", "Show/hide virtual methods");
+                addKeyHelp(result, "f / F", "Find in list / search globally");
                 addKeyHelp(result, "F9", "Toggle entry breakpoint at BCI 0");
                 addKeyHelp(result, "S", "Decompile selected method");
                 addKeyHelp(result, "A", "Decompile context class");
@@ -2824,6 +3266,8 @@ public final class TargetTui {
                 result.add("");
                 result.add("SHORTCUTS");
                 addKeyHelp(result, "Enter", "Push this local value onto Context");
+                addKeyHelp(result, "=", debuggerState != null && debuggerState.paused()
+                        ? "Set this paused local" : "Live-sampled locals are read-only");
                 addKeyHelp(result, "G", "Return to selected execution frame BCI");
                 addKeyHelp(result, "Tab", "Frames selects another stack depth");
                 addKeyHelp(result, "T", "Open JVM threads");
@@ -2839,6 +3283,8 @@ public final class TargetTui {
                 result.add("Descriptor: " + breakpoint.descriptor);
                 result.add("BCI:        " + breakpoint.bci);
                 result.add("Line:       " + (breakpoint.line < 0 ? "<unknown>" : breakpoint.line));
+                result.add("Scope:      " + (breakpoint.receiverId == 0L
+                        ? "all instances" : "current object"));
                 result.add("State:      enabled"
                         + (isCurrentBreakpoint(breakpoint) ? " / CURRENT STOP" : ""));
                 result.add("");
@@ -2919,8 +3365,8 @@ public final class TargetTui {
                         && bytecodeMethod.equals(debuggerState.methodName())
                         && bytecodeDescriptor.equals(debuggerState.descriptor())
                         && instruction.offset() == debuggerState.location();
-                boolean breakpoint = breakpoints.containsKey(BreakpointSpec.id(
-                        bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset()));
+                boolean breakpoint = hasBreakpointAt(
+                        bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset());
                 String sourceLine = instruction.sourceLine() < 0 ? "-" : Integer.toString(instruction.sourceLine());
                 gutter = compactGutter
                         ? String.format("%s%s %05d L%-4s", stopped ? ">" : " ", breakpoint ? "*" : " ",
@@ -3119,11 +3565,14 @@ public final class TargetTui {
         if (breakpoints.isEmpty()) result.add("<none>");
         else for (BreakpointSpec breakpoint : breakpoints.values()) {
             result.add("* " + breakpoint.methodName + " @" + breakpoint.bci
-                    + (breakpoint.line < 0 ? "" : " L" + breakpoint.line));
+                    + (breakpoint.line < 0 ? "" : " L" + breakpoint.line)
+                    + (breakpoint.receiverId == 0L ? "" : " [object]"));
         }
         result.add("WATCHPOINTS (" + fieldWatches.size() + ")");
         if (fieldWatches.isEmpty()) result.add("<none; U/W in Fields adds read/write watches>");
-        else for (String watch : fieldWatches.values()) result.add("* " + watch);
+        else for (JvmFieldWatchInfo watch : fieldWatches.values()) {
+            result.add("* " + watch.kind() + " " + watch.className() + "." + watch.fieldName());
+        }
         result.add("");
         result.add("CONTEXT");
         result.add(session.context().isSet() ? session.context().description() : "<unset>");
@@ -3142,7 +3591,8 @@ public final class TargetTui {
         addKeyHelp(result, "Y", "Continue all stopped threads");
         addKeyHelp(result, "*", session.debugger().active()
                 ? "Restore analysis-freeze thread states" : "Freeze eligible threads for analysis");
-        addKeyHelp(result, "F9", "Toggle breakpoint at selected BCI");
+        addKeyHelp(result, "F9", "Toggle normal breakpoint at selected BCI");
+        addKeyHelp(result, "Shift+F9", "Toggle breakpoint for current object only");
         addKeyHelp(result, "F7", "Step one bytecode");
         addKeyHelp(result, "F8", "Continue selected thread");
         addKeyHelp(result, "/", "Search current bytecode/debug view");
@@ -3177,31 +3627,35 @@ public final class TargetTui {
         Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "L Class.forName",
                 "M Locals", "Z Breakpoints");
         if (tab == Tab.BROWSE) Collections.addAll(result,
-                "/ Filter", "F Find", "P Package", "J JDK", "A Arrays", "Backspace Parent");
+                "/ Filter", "f Find List", "F Global Find", ": Exact", "P Package", "J JDK", "a Arrays",
+                "A Class Decompile", "Backspace Parent");
         else if (tab == Tab.FIELDS) Collections.addAll(result,
-                "/ Filter", "Enter Read", "U Break Read", "W Break Write",
-                "Backspace Context", "D Dump");
+                "/ Filter", "f Find List", "F Global Find", "@ Static", "# Instance", "Enter Read", "= Set",
+                "U Break Read", "W Break Write",
+                "A Class Decompile", "Backspace Context", "D Dump");
         else if (tab == Tab.METHODS) Collections.addAll(result,
-                "/ Filter", "H Hide Object", "K <init>/<clinit>", "Enter/B Bytecode",
-                "F9 Entry Break", "S Method Decompile", "A Class Decompile");
+                "/ Filter", "f Find List", "F Global Find", "@ Static", "# Virtual",
+                "H Hide Object", "K <init>/<clinit>", "x/X Invoke/Exact", "Enter/B Bytecode",
+                "F9 Break", "Shift+F9 Object Break", "S Method Decompile", "A Class Decompile");
         else if (tab == Tab.SOURCE) Collections.addAll(result,
-                "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break",
-                "O Export");
+                "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break", "Shift+F9 Object Break",
+                "A Class Decompile", "O Export");
         else if (tab == Tab.BYTECODE) Collections.addAll(result,
-                "/ Search", "n/N Match", "g BCI/Line", "F9 Break", "S Decompile", "I Info");
+                "/ Search", "n/N Match", "g BCI/Line", "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
+                "A Class Decompile", "I Info");
         else if (tab == Tab.DEBUG) Collections.addAll(result,
-                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "F7 Step", "F8 Run", "Y Run All", "* Freeze/Thaw",
-                "/ Search", "S Decompile", "I Info");
+                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "F8 Run", "Y Run All", "* Freeze/Thaw",
+                "/ Search", "S Method Decompile", "A Class Decompile", "I Info");
         else if (tab == Tab.FRAMES) Collections.addAll(result,
                 "Enter Open Frame", "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
         else if (tab == Tab.LOCALS) Collections.addAll(result,
-                "Enter To Context", "G Current BCI", "T Threads", "F4 Live Follow", "F5 Refresh");
+                "Enter To Context", "= Set Paused Local", "G Current BCI", "T Threads", "F4 Live Follow", "F5 Refresh");
         else if (tab == Tab.BREAKPOINTS) Collections.addAll(result,
                 "Enter Open", "F9/Delete Clear", "A Clear All", "G Current BCI");
         else if (tab == Tab.THREADS) Collections.addAll(result,
                 "Enter/F6 Pause", "G Open Stop", "F7 Step", "F8 Run",
                 "T Next", "F5 Refresh", "Y Run All", "* Freeze/Thaw");
-        else Collections.addAll(result, "Backspace Context", "D Dump", "O Export");
+        else Collections.addAll(result, "= Set Source", "A Class Decompile", "Backspace Context", "D Dump", "O Export");
         Collections.addAll(result, "Up/Down Move", "PgUp/PgDn Page", "Home/End Edge",
                 horizontallyScrollable() ? "Left/Right Scroll" : "Left/Right Tab",
                 "Tab View", "Enter Open", "F2 CLI", "Q Back");
@@ -3234,7 +3688,8 @@ public final class TargetTui {
         return (isCurrentBreakpoint(breakpoint) ? "> HIT " : "  ")
                 + breakpoint.className + "." + breakpoint.methodName
                 + " @" + breakpoint.bci
-                + (breakpoint.line < 0 ? "" : " L" + breakpoint.line);
+                + (breakpoint.line < 0 ? "" : " L" + breakpoint.line)
+                + (breakpoint.receiverId == 0L ? "" : " [object]");
     }
 
     private boolean isCurrentBreakpoint(BreakpointSpec breakpoint) {
@@ -3454,11 +3909,28 @@ public final class TargetTui {
         private final String descriptor;
         private final long bci;
         private final int line;
+        private final String registrationId;
+        private final long receiverId;
+        private final String conditionSummary;
         private BreakpointSpec(String className, String methodName, String descriptor, long bci, int line) {
+            this(className, methodName, descriptor, bci, line, "", 0L, "all receivers/callers");
+        }
+        private BreakpointSpec(String className, String methodName, String descriptor,
+                long bci, int line, String registrationId, long receiverId,
+                String conditionSummary) {
             this.className = className; this.methodName = methodName; this.descriptor = descriptor;
             this.bci = bci; this.line = line;
+            this.registrationId = registrationId;
+            this.receiverId = receiverId;
+            this.conditionSummary = conditionSummary;
         }
-        private String id() { return id(className, methodName, descriptor, bci); }
+        private String id() { return registrationId.isEmpty()
+                ? id(className, methodName, descriptor, bci) + '|' + receiverId : registrationId; }
+        private JvmBreakpointInfo info() {
+            if (registrationId.isEmpty()) throw new IllegalStateException("Breakpoint is not registered");
+            return new JvmBreakpointInfo(className, methodName, descriptor, bci,
+                    registrationId, receiverId, conditionSummary);
+        }
         private static String id(String className, String methodName, String descriptor, long bci) {
             return className + '|' + methodName + '|' + descriptor + '|' + bci;
         }
