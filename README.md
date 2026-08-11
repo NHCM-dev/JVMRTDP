@@ -1,5 +1,7 @@
 # JVMRTDP
 
+(Credits to GPT 5.6)
+
 [English](README.md) | [中文](README_ZH.md)
 
 JVMRTDP is a diagnostics, analysis, and debugging tool for HotSpot Java Virtual Machines (JVMs) on Windows x64. It injects an agent into a target JVM and exposes class browsing, object inspection, decompilation, bytecode views, breakpoints, thread control, and Java Virtual Machine Tool Interface (JVMTI) operations through a terminal user interface (TUI), a command line, and scripts.

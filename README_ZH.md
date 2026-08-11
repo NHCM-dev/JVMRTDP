@@ -1,5 +1,7 @@
 # JVMRTDP
 
+(Credits to GPT 5.6)
+
 [English](README.md) | [中文](README_ZH.md)
 
 JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析与调试工具。它将代理注入目标 JVM，并通过终端用户界面（TUI）、命令行和脚本提供类浏览、对象检查、反编译、字节码查看、断点、线程控制和 Java 虚拟机工具接口（JVMTI）操作。
