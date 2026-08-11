@@ -83,13 +83,29 @@ NtCreateThreadExFunction ResolveThreadCreator() {
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
 }
 
+DWORD NtStatusToWindowsError(NTSTATUS status) {
+    using RtlNtStatusToDosErrorFunction = ULONG(WINAPI*)(NTSTATUS);
+    const auto convert = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    if (convert == nullptr) return ERROR_GEN_FAILURE;
+    const ULONG error = convert(status);
+    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : static_cast<DWORD>(error);
+}
+
 HANDLE StartRemoteThread(HANDLE process, void* start, void* argument) {
     const auto createThread = ResolveThreadCreator();
-    if (createThread == nullptr) return nullptr;
+    if (createThread == nullptr || start == nullptr) {
+        SetLastError(createThread == nullptr ? ERROR_PROC_NOT_FOUND : ERROR_INVALID_ADDRESS);
+        return nullptr;
+    }
     HANDLE thread = nullptr;
-    const NTSTATUS status = createThread(&thread, THREAD_ALL_ACCESS, nullptr, process,
+    const NTSTATUS status = createThread(&thread, THREAD_QUERY_INFORMATION | SYNCHRONIZE,
+        nullptr, process,
         start, argument, 0, 0, 0, 0, nullptr);
-    return status >= 0 ? thread : nullptr;
+    if (status >= 0 && thread != nullptr) return thread;
+    if (thread != nullptr) CloseHandle(thread);
+    SetLastError(NtStatusToWindowsError(status));
+    return nullptr;
 }
 
 bool WaitForThread(HANDLE thread, DWORD timeoutMillis, DWORD* exitCode) {

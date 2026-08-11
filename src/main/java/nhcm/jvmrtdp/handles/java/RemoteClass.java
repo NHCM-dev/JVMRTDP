@@ -1,5 +1,11 @@
 package nhcm.jvmrtdp.handles.java;
 
+import nhcm.jvmrtdp.controllerside.analysis.ClassDecompiler;
+import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
+import nhcm.jvmrtdp.controllerside.analysis.ClassFileView;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilationResult;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassFileParser;
 import nhcm.jvmrtdp.handles.RemoteHandle;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.jvm.RemoteJNIEnv;
@@ -38,6 +44,29 @@ public class RemoteClass extends RemoteHandle {
 
     public Path dumpClass(Path outputFile) throws IOException {
         return jvmti.dumpClass(className, outputFile);
+    }
+
+    public DecompilationResult decompile(DecompilerEngine engine) {
+        return new ClassDecompiler().decompile(className, getClassBytes(), engine);
+    }
+
+    public String decompileMethod(String methodName, String descriptor, DecompilerEngine engine) {
+        return new ClassDecompiler().decompileMethod(
+                className, getClassBytes(), methodName, descriptor, engine);
+    }
+
+    public DecompilationResult decompileMethodResult(
+            String methodName, String descriptor, DecompilerEngine engine) {
+        return new ClassDecompiler().decompileMethodResult(
+                className, getClassBytes(), methodName, descriptor, engine);
+    }
+
+    public ClassFileView classFileView() {
+        return new JvmClassFileParser().parse(getClassBytes());
+    }
+
+    public ClassFileMethod bytecode(String methodName, String descriptor) {
+        return classFileView().method(methodName, descriptor);
     }
 
     public RemoteClassInfo info() {

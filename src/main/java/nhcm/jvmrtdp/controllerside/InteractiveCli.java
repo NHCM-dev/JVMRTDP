@@ -4,8 +4,16 @@ import nhcm.jvmrtdp.BuildInfo;
 import nhcm.jvmrtdp.command.CommandLine;
 import nhcm.jvmrtdp.controllerside.command.ShellCommand;
 import nhcm.jvmrtdp.controllerside.command.ShellCommandRegistry;
+import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
+import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilationResult;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.controllerside.tui.TargetSessionCoordinator;
+import nhcm.jvmrtdp.controllerside.tui.TuiResult;
 import nhcm.jvmrtdp.controllerside.script.ScriptEngine;
 import nhcm.jvmrtdp.controllerside.script.ScriptCommandExecutor;
+import nhcm.jvmrtdp.controllerside.debug.DebuggerAnalysisExporter;
+import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 import nhcm.jvmrtdp.handles.java.RemoteClassInfo;
@@ -28,6 +36,11 @@ import nhcm.jvmrtdp.api.jvmti.JvmtiFieldInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiLineNumber;
 import nhcm.jvmrtdp.api.jvmti.JvmtiThreadInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiMonitorUsage;
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
+import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -85,23 +98,28 @@ public class InteractiveCli {
 
     /** Returns true to go back to the controller prompt, false to terminate the controller. */
     public boolean run(ServerHandle server) {
-        try (TargetSession session = new TargetSession(server, output, error)) {
-            output.println("Target prompt ready. Use 'help syntax' for the context-oriented command language.");
-            while (server.isOpen() && !Thread.currentThread().isInterrupted()) {
-                output.printf("target[%d|%s]> ", server.process().pid(), promptContext(session));
-                output.flush();
-                String rawLine;
-                try {
-                    rawLine = input.readLine();
-                } catch (IOException exception) {
-                    error.println("Cannot read command: " + exception.getMessage());
-                    return false;
-                }
-                if (rawLine == null) return false;
-                if (!execute(session, rawLine)) return !session.controllerExitRequested();
+        return new TargetSessionCoordinator(input, output, error).run(server, false);
+    }
+
+    public TuiResult runSession(TargetSession session) {
+        output.println("Target prompt ready. Type 'tui' for the full-screen interface or 'help syntax'.");
+        while (session.server().isOpen() && !Thread.currentThread().isInterrupted()) {
+            output.printf("target[%d|%s]> ", session.server().process().pid(), promptContext(session));
+            output.flush();
+            String rawLine;
+            try {
+                rawLine = input.readLine();
+            } catch (IOException exception) {
+                error.println("Cannot read command: " + exception.getMessage());
+                return TuiResult.EXIT;
             }
-            return true;
+            if (rawLine == null) return TuiResult.EXIT;
+            if (!execute(session, rawLine)) {
+                if (session.consumeTuiRequest()) return TuiResult.TUI;
+                return session.controllerExitRequested() ? TuiResult.EXIT : TuiResult.BACK;
+            }
         }
+        return TuiResult.BACK;
     }
 
     /** Executes one command or an unquoted {@code ->} temporary reference chain. */
@@ -168,6 +186,10 @@ public class InteractiveCli {
         commands.register(new ScriptCommand());
         commands.register(new BatchFileCommand());
         commands.register(new DumpClassCommand());
+        commands.register(new DecompileCommand());
+        commands.register(new BytecodeCommand());
+        commands.register(new DebuggerCommand());
+        commands.register(new TuiCommand());
         commands.register(new DeployCodeCommand());
         commands.register(new JvmtiShellCommand());
         commands.register(new VersionCommand());
@@ -559,15 +581,22 @@ public class InteractiveCli {
 
     private static class ClassCommand extends ShellCommand<TargetSession> {
         private ClassCommand() {
-            super("class", "class <info|fields [all|static|virtual] [glob]|methods [all|static|virtual] [glob]|constructors>",
+            super("class", "class <load <name>|info|fields [all|static|virtual] [glob]|methods [all|static|virtual] [glob]|constructors>",
                     "Lists metadata for the class represented by the current context.");
         }
 
         @Override
         public boolean execute(TargetSession session, List<String> arguments) {
             if (arguments.isEmpty()) arguments = Collections.singletonList("info");
-            RemoteClass type = session.context().remoteClass();
             String operation = lower(arguments.get(0));
+            if ("load".equals(operation) && arguments.size() == 2) {
+                RemoteClass loaded = session.forceLoadClass(arguments.get(1));
+                session.context().select(loaded);
+                session.output().println("Class.forName loaded and initialized " + loaded.className());
+                printContext(session);
+                return true;
+            }
+            RemoteClass type = session.context().remoteClass();
             if ("info".equals(operation) && arguments.size() == 1) {
                 printClassInfo(session, type.info());
                 return true;
@@ -1375,6 +1404,642 @@ public class InteractiveCli {
             }
             return true;
         }
+    }
+
+    private static class DecompileCommand extends ShellCommand<TargetSession> {
+        private DecompileCommand() {
+            super("decompile", "decompile class [class] [--engine cfr|procyon] [--out file] | "
+                            + "decompile method [class] <name> <descriptor> [--engine cfr|procyon] [--out file]",
+                    "Decompiles target class bytes with source-built CFR or Procyon.", "decomp");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) throws IOException {
+            if (arguments.isEmpty()) return InteractiveCli.usage(session, this);
+            String mode = lower(arguments.get(0));
+            ParsedAnalysisOptions options = ParsedAnalysisOptions.parse(arguments.subList(1, arguments.size()));
+            String text;
+            if ("class".equals(mode)) {
+                RemoteClass type = options.positionals.isEmpty()
+                        ? session.context().remoteClass() : session.findClass(options.positionals.get(0));
+                if (options.positionals.size() > 1) return InteractiveCli.usage(session, this);
+                DecompilationResult result = type.decompile(options.engine);
+                text = result.source();
+                for (String diagnostic : result.diagnostics()) session.error().println("decompiler: " + diagnostic);
+            } else if ("method".equals(mode)) {
+                RemoteClass type;
+                String name;
+                String descriptor;
+                if (options.positionals.size() == 2) {
+                    type = session.context().remoteClass();
+                    name = options.positionals.get(0);
+                    descriptor = options.positionals.get(1);
+                } else if (options.positionals.size() == 3) {
+                    type = session.findClass(options.positionals.get(0));
+                    name = options.positionals.get(1);
+                    descriptor = options.positionals.get(2);
+                } else return InteractiveCli.usage(session, this);
+                text = type.decompileMethod(name, descriptor, options.engine);
+            } else return InteractiveCli.usage(session, this);
+            outputAnalysis(session, text, options.output);
+            return true;
+        }
+    }
+
+    private static class BytecodeCommand extends ShellCommand<TargetSession> {
+        private BytecodeCommand() {
+            super("bytecode", "bytecode [class] <method> <descriptor> [--out file]",
+                    "Disassembles a method with BCI, source lines and resolved constant-pool operands.",
+                    "disasm", "bc");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) throws IOException {
+            ParsedAnalysisOptions options = ParsedAnalysisOptions.parse(arguments);
+            RemoteClass type;
+            String name;
+            String descriptor;
+            if (options.positionals.size() == 2) {
+                type = session.context().remoteClass();
+                name = options.positionals.get(0);
+                descriptor = options.positionals.get(1);
+            } else if (options.positionals.size() == 3) {
+                type = session.findClass(options.positionals.get(0));
+                name = options.positionals.get(1);
+                descriptor = options.positionals.get(2);
+            } else return InteractiveCli.usage(session, this);
+            ClassFileMethod method = type.bytecode(name, descriptor);
+            String text = String.format("%s.%s%s  maxStack=%d maxLocals=%d%n%s",
+                    type.className(), method.name(), method.descriptor(),
+                    method.maxStack(), method.maxLocals(), method.disassembly());
+            outputAnalysis(session, text, options.output);
+            return true;
+        }
+    }
+
+    private static class DebuggerCommand extends ShellCommand<TargetSession> {
+        private DebuggerCommand() {
+            super("debugger", "debugger <status|threads|pause <all-thread-index>|freeze [refresh]|thaw|freeze-status|"
+                            + "pause-all|locations|frames [paused-index] [max]|"
+                            + "sample <all-thread-index> [depth] [radius]|"
+                            + "current [paused-index] [depth] [radius]|"
+                            + "stack [max]|stack <paused-index> <max>|locals [thread-index] [depth]|"
+                            + "local-context [thread-index] [depth] [local-index]|enable|disable|"
+                            + "break|clear <class> <method> <descriptor> <bci>|breakpoints [clear-all]|"
+                            + "watch <read|write> <set|clear> <class> <field> <descriptor>|watches [clear-all]|"
+                            + "continue [thread-index|all]|step [thread-index]|"
+                            + "snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]> ...",
+                    "Controls the shared multi-thread debugger, reversible analysis freeze, and structured exports.", "dbg");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) throws IOException {
+            if (!arguments.isEmpty() && "freeze".equalsIgnoreCase(arguments.get(0))
+                    && (arguments.size() == 1 || (arguments.size() == 2
+                    && "refresh".equalsIgnoreCase(arguments.get(1))))) {
+                printFreezeReport(session, session.debugger().freeze());
+                return true;
+            }
+            if (arguments.size() == 1 && "pause-all".equalsIgnoreCase(arguments.get(0))) {
+                printFreezeReport(session, session.debugger().freeze());
+                printCurrentLocations(session);
+                return true;
+            }
+            if (arguments.size() == 1 && ("thaw".equalsIgnoreCase(arguments.get(0))
+                    || "restore".equalsIgnoreCase(arguments.get(0)))) {
+                printFreezeReport(session, session.debugger().restore());
+                return true;
+            }
+            if (arguments.size() == 1 && "freeze-status".equalsIgnoreCase(arguments.get(0))) {
+                printFreezeReport(session, session.debugger().status());
+                return true;
+            }
+            if (!arguments.isEmpty() && "snapshot".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() >= 2 && arguments.size() <= 5) {
+                String destination = arguments.get(1);
+                DebuggerAnalysisExporter.Format format = arguments.size() >= 3
+                        ? DebuggerAnalysisExporter.Format.parse(arguments.get(2))
+                        : DebuggerAnalysisExporter.Format.JSON;
+                int maxFrames = arguments.size() >= 4
+                        ? integer(arguments.get(3), "max frames") : 32;
+                int localsDepth = arguments.size() >= 5
+                        ? integer(arguments.get(4), "locals depth") : 0;
+                if ("-".equals(destination)) {
+                    session.output().print(DebuggerAnalysisExporter.capture(
+                            session, format, maxFrames, localsDepth));
+                } else {
+                    Path output = DebuggerAnalysisExporter.write(session,
+                            Paths.get(destination), format, maxFrames, localsDepth);
+                    session.output().println("debug analysis exported -> " + output);
+                }
+                return true;
+            }
+            if (arguments.size() == 1 && "status".equalsIgnoreCase(arguments.get(0))) {
+                printDebuggerStates(session);
+                session.output().println(session.debugger().status().summary());
+                return true;
+            }
+            if (arguments.size() == 1 && "threads".equalsIgnoreCase(arguments.get(0))) {
+                printAllDebuggerThreads(session);
+                return true;
+            }
+            if (arguments.size() == 1 && "locations".equalsIgnoreCase(arguments.get(0))) {
+                printCurrentLocations(session);
+                return true;
+            }
+            if (arguments.size() == 2 && "pause".equalsIgnoreCase(arguments.get(0))) {
+                int wanted = integer(arguments.get(1), "all-thread index");
+                List<RemoteJvmtiThread> threads = session.jvmti().threads();
+                try {
+                    if (wanted < 0 || wanted >= threads.size()) {
+                        throw new IllegalArgumentException("No JVM thread at index " + wanted);
+                    }
+                    session.jvmti().configureDebugger(true);
+                    threads.get(wanted).pauseInDebugger();
+                    session.output().println("paused " + threads.get(wanted).name());
+                } finally {
+                    for (RemoteJvmtiThread thread : threads) thread.close();
+                }
+                return true;
+            }
+            if (!arguments.isEmpty() && "sample".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() >= 2 && arguments.size() <= 4) {
+                int threadIndex = integer(arguments.get(1), "all-thread index");
+                int depth = arguments.size() >= 3
+                        ? integer(arguments.get(2), "frame depth") : -1;
+                int radius = arguments.size() == 4
+                        ? integer(arguments.get(3), "instruction radius") : 5;
+                sampleRunningThread(session, threadIndex, depth, radius);
+                return true;
+            }
+            if (!arguments.isEmpty() && "stack".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 3) {
+                int threadIndex = arguments.size() == 3 ? integer(arguments.get(1), "thread index") : 0;
+                int maxFrames = arguments.size() >= 2
+                        ? integer(arguments.get(arguments.size() - 1), "max frames") : 16;
+                List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                try {
+                    JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                    for (String frame : session.jvmti().stackTrace(state.thread(), maxFrames)) {
+                        session.output().println(frame);
+                    }
+                } finally {
+                    closeDebuggerStates(states);
+                }
+                return true;
+            }
+            if (!arguments.isEmpty() && "frames".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 3) {
+                int threadIndex = arguments.size() >= 2
+                        ? integer(arguments.get(1), "thread index") : 0;
+                int maxFrames = arguments.size() == 3
+                        ? integer(arguments.get(2), "max frames") : 32;
+                List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                try {
+                    JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                    for (JvmStackFrame frame : session.jvmti().stackFrames(state.thread(), maxFrames)) {
+                        session.output().println(frame.display());
+                    }
+                } finally {
+                    closeDebuggerStates(states);
+                }
+                return true;
+            }
+            if (!arguments.isEmpty() && "current".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 4) {
+                int threadIndex = arguments.size() >= 2
+                        ? integer(arguments.get(1), "thread index") : 0;
+                int depth = arguments.size() >= 3
+                        ? integer(arguments.get(2), "frame depth") : -1;
+                int radius = arguments.size() == 4
+                        ? integer(arguments.get(3), "instruction radius") : 5;
+                printCurrentFrame(session, threadIndex, depth, radius);
+                return true;
+            }
+            if (!arguments.isEmpty() && "locals".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 3) {
+                int threadIndex = arguments.size() >= 2 ? integer(arguments.get(1), "thread index") : 0;
+                int depth = arguments.size() == 3 ? integer(arguments.get(2), "frame depth") : 0;
+                List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                try {
+                    JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                    List<JvmDebuggerLocal> locals = session.jvmti().debuggerLocals(state.thread(), depth);
+                    try {
+                        for (JvmDebuggerLocal local : locals) {
+                            session.output().printf("slot=%d scope=%d+%d %s %s = %s%n", local.slot(),
+                                    local.scopeStart(), local.scopeLength(), local.descriptor(), local.name(),
+                                    local.available() ? local.value() == null ? "null"
+                                            : local.value().displayValue() : "<" + local.error() + ">");
+                        }
+                        if (locals.isEmpty()) session.output().println("<no active local variables>");
+                    } finally {
+                        for (JvmDebuggerLocal local : locals) local.close();
+                    }
+                } finally {
+                    closeDebuggerStates(states);
+                }
+                return true;
+            }
+            if (!arguments.isEmpty() && "local-context".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 4) {
+                int threadIndex = arguments.size() >= 2
+                        ? integer(arguments.get(1), "thread index") : 0;
+                int depth = arguments.size() >= 3 ? integer(arguments.get(2), "frame depth") : 0;
+                int localIndex = arguments.size() == 4
+                        ? integer(arguments.get(3), "local index") : 0;
+                selectDebuggerLocalContext(session, threadIndex, depth, localIndex);
+                return true;
+            }
+            if (arguments.size() == 1 && ("enable".equalsIgnoreCase(arguments.get(0))
+                    || "disable".equalsIgnoreCase(arguments.get(0)))) {
+                boolean enabled = "enable".equalsIgnoreCase(arguments.get(0));
+                if (!enabled && session.debugger().active()) session.debugger().restore();
+                session.jvmti().configureDebugger(enabled);
+                session.output().println("ok");
+                return true;
+            }
+            if (arguments.size() == 5 && ("break".equalsIgnoreCase(arguments.get(0))
+                    || "clear".equalsIgnoreCase(arguments.get(0)))) {
+                boolean enabled = "break".equalsIgnoreCase(arguments.get(0));
+                if (enabled) session.jvmti().configureDebugger(true);
+                session.jvmti().setBreakpoint(arguments.get(1), arguments.get(2), arguments.get(3),
+                        Long.parseLong(arguments.get(4)), enabled);
+                session.output().println("ok");
+                return true;
+            }
+            if (!arguments.isEmpty() && "breakpoints".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 2) {
+                if (arguments.size() == 2 && "clear-all".equalsIgnoreCase(arguments.get(1))) {
+                    session.jvmti().clearManagedBreakpoints();
+                    session.output().println("cleared all managed breakpoints");
+                } else if (arguments.size() == 1) printManagedBreakpoints(session);
+                else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if (arguments.size() == 6 && "watch".equalsIgnoreCase(arguments.get(0))) {
+                boolean modification;
+                if ("read".equalsIgnoreCase(arguments.get(1))) modification = false;
+                else if ("write".equalsIgnoreCase(arguments.get(1))) modification = true;
+                else return InteractiveCli.usage(session, this);
+                boolean enabled;
+                if ("set".equalsIgnoreCase(arguments.get(2))) enabled = true;
+                else if ("clear".equalsIgnoreCase(arguments.get(2))) enabled = false;
+                else return InteractiveCli.usage(session, this);
+                session.jvmti().configureDebugger(true);
+                session.jvmti().setFieldWatch(arguments.get(3), arguments.get(4), arguments.get(5),
+                        modification, enabled);
+                session.output().println("ok");
+                return true;
+            }
+            if (!arguments.isEmpty() && "watches".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 2) {
+                if (arguments.size() == 2 && "clear-all".equalsIgnoreCase(arguments.get(1))) {
+                    session.jvmti().clearManagedFieldWatches();
+                    session.output().println("cleared all managed field watches");
+                } else if (arguments.size() == 1) printManagedWatches(session);
+                else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if (!arguments.isEmpty() && arguments.size() <= 2
+                    && "continue".equalsIgnoreCase(arguments.get(0))) {
+                if (arguments.size() == 2 && "all".equalsIgnoreCase(arguments.get(1))) {
+                    if (session.debugger().active()) {
+                        throw new IllegalStateException(
+                                "Analysis freeze is active; use 'debugger thaw' to preserve original stops");
+                    }
+                    session.jvmti().continueAllExecutions();
+                } else if (arguments.size() == 2) {
+                    resumeDebuggerThread(session, integer(arguments.get(1), "thread index"), false);
+                } else session.jvmti().continueExecution();
+                session.output().println("running");
+                return true;
+            }
+            if (!arguments.isEmpty() && arguments.size() <= 2
+                    && "step".equalsIgnoreCase(arguments.get(0))) {
+                if (arguments.size() == 2) {
+                    resumeDebuggerThread(session, integer(arguments.get(1), "thread index"), true);
+                } else session.jvmti().stepInstruction();
+                session.output().println("stepping");
+                return true;
+            }
+            return InteractiveCli.usage(session, this);
+        }
+
+        private static void printDebuggerStates(TargetSession session) {
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            try {
+                int index = 0;
+                for (JvmDebuggerState state : states) {
+                    if (!state.paused()) {
+                        if (states.size() == 1) session.output().println(state);
+                        continue;
+                    }
+                    session.output().printf("[%d] %s thread=%s#%d%n", index++, state,
+                            state.thread().className(), state.thread().remoteId());
+                }
+            } finally {
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static void printCurrentLocations(TargetSession session) {
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            try {
+                int index = 0;
+                for (JvmDebuggerState state : states) {
+                    if (!state.paused() || state.thread() == null) continue;
+                    List<JvmStackFrame> frames = session.jvmti().stackFrames(state.thread(), 48);
+                    int preferred = preferredFrameDepth(frames);
+                    JvmStackFrame view = frames.isEmpty() ? null : frames.get(preferred);
+                    session.output().printf("[%d] %s actual=%s.%s%s@%d reason=%s%n",
+                            index++, state.thread().displayValue(), state.className(),
+                            state.methodName(), state.descriptor(), state.location(), state.reason());
+                    if (view != null) {
+                        session.output().printf("    view=%s%s%n", view.display(),
+                                view.depth() == 0 ? " (actual top)"
+                                        : " (nearest inspectable Java/application caller)");
+                    }
+                }
+                if (index == 0) {
+                    session.output().println("<no paused Java threads; run 'debugger pause-all' or pause one thread>");
+                }
+            } finally {
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static void printCurrentFrame(TargetSession session, int threadIndex,
+                int requestedDepth, int radius) {
+            if (radius < 0) throw new IllegalArgumentException("instruction radius must not be negative");
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            try {
+                JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                printCurrentFrame(session, state, requestedDepth, radius);
+            } finally {
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static void printCurrentFrame(TargetSession session, JvmDebuggerState state,
+                int requestedDepth, int radius) {
+            if (radius < 0) throw new IllegalArgumentException("instruction radius must not be negative");
+            List<JvmDebuggerLocal> locals = new ArrayList<JvmDebuggerLocal>();
+            try {
+                List<JvmStackFrame> frames = session.jvmti().stackFrames(state.thread(), 64);
+                if (frames.isEmpty()) throw new IllegalStateException("The paused thread has no Java stack frames");
+                int depth = requestedDepth < 0 ? preferredFrameDepth(frames) : requestedDepth;
+                if (depth < 0 || depth >= frames.size()) {
+                    throw new IllegalArgumentException("No stack frame at depth " + depth);
+                }
+                JvmStackFrame frame = frames.get(depth);
+                session.output().println("actual-top=" + frames.get(0).display());
+                session.output().println("selected=" + frame.display());
+                if (frame.depth() > 0) {
+                    session.output().println("note=caller frame is inspectable but is not the currently executing top frame");
+                }
+                if (!frame.hasJavaLocation()) {
+                    session.output().println("bytecode=<native frame; no Java Code attribute or BCI>");
+                    int fallback = preferredFrameDepth(frames);
+                    if (fallback != depth && frames.get(fallback).hasJavaLocation()) {
+                        session.output().println("suggested=" + frames.get(fallback).display());
+                    }
+                    return;
+                }
+                RemoteClass owner = session.findClass(frame.className());
+                ClassFileMethod method = owner.bytecode(frame.methodName(), frame.descriptor());
+                List<BytecodeInstruction> instructions = method.instructions();
+                int center = nearestInstruction(instructions, frame.location());
+                int first = Math.max(0, center - radius);
+                int last = Math.min(instructions.size(), center + radius + 1);
+                session.output().printf("method=%s.%s%s maxStack=%d maxLocals=%d%n",
+                        frame.className(), frame.methodName(), frame.descriptor(),
+                        method.maxStack(), method.maxLocals());
+                for (int index = first; index < last; index++) {
+                    BytecodeInstruction instruction = instructions.get(index);
+                    session.output().printf("%s L%-5s %s%n", index == center ? ">" : " ",
+                            instruction.sourceLine() < 0 ? "-"
+                                    : Integer.toString(instruction.sourceLine()),
+                            instruction.format());
+                }
+                locals.addAll(session.jvmti().debuggerLocals(state.thread(), depth));
+                session.output().println("locals:");
+                if (locals.isEmpty()) session.output().println("  <no readable locals>");
+                for (JvmDebuggerLocal local : locals) {
+                    session.output().printf("  [%d] %s %s = %s%n", local.slot(),
+                            local.name(), local.descriptor(), local.available()
+                                    ? local.value() == null ? "null" : local.value().displayValue()
+                                    : "<" + local.error() + ">");
+                }
+            } finally {
+                for (JvmDebuggerLocal local : locals) local.close();
+            }
+        }
+
+        private static void sampleRunningThread(TargetSession session, int threadIndex,
+                int requestedDepth, int radius) {
+            List<RemoteJvmtiThread> threads = session.jvmti().threads();
+            List<JvmDebuggerState> states = new ArrayList<JvmDebuggerState>();
+            JvmDebuggerState sample = null;
+            boolean pauseCreated = false;
+            try {
+                if (threadIndex < 0 || threadIndex >= threads.size()) {
+                    throw new IllegalArgumentException("No JVM thread at index " + threadIndex);
+                }
+                RemoteJvmtiThread thread = threads.get(threadIndex);
+                if (thread.debuggerPaused()) {
+                    throw new IllegalStateException("Thread is already debugger-paused; use debugger current");
+                }
+                session.jvmti().configureDebugger(true);
+                session.jvmti().pauseExecution(thread.object(), "live_sample");
+                pauseCreated = true;
+                states.addAll(session.jvmti().debuggerStates());
+                for (JvmDebuggerState candidate : states) {
+                    if (!candidate.paused() || !"live_sample".equals(candidate.reason())
+                            || candidate.thread() == null) continue;
+                    String display = candidate.thread().displayValue();
+                    if (display != null && display.contains(thread.name())) {
+                        sample = candidate;
+                        break;
+                    }
+                }
+                if (sample == null) {
+                    throw new IllegalStateException("Live sample state was not returned by the target JVM");
+                }
+                session.output().println("sample-thread=" + thread.name()
+                        + " (resumed immediately after capture)");
+                printCurrentFrame(session, sample, requestedDepth, radius);
+            } finally {
+                if (pauseCreated) {
+                    try {
+                        if (sample != null) session.jvmti().continueExecution(sample.thread());
+                        else if (threadIndex >= 0 && threadIndex < threads.size()) {
+                            session.jvmti().continueExecution(threads.get(threadIndex).object());
+                        }
+                    } catch (RuntimeException ignored) { }
+                }
+                closeDebuggerStates(states);
+                for (RemoteJvmtiThread thread : threads) thread.close();
+            }
+        }
+
+        private static int preferredFrameDepth(List<JvmStackFrame> frames) {
+            if (frames.isEmpty() || frames.get(0).hasJavaLocation()) return 0;
+            for (JvmStackFrame frame : frames) {
+                if (frame.hasJavaLocation() && !frame.isPlatformFrame()) return frame.depth();
+            }
+            for (JvmStackFrame frame : frames) if (frame.hasJavaLocation()) return frame.depth();
+            return 0;
+        }
+
+        private static int nearestInstruction(List<BytecodeInstruction> instructions, long bci) {
+            if (instructions.isEmpty()) return 0;
+            int closest = 0;
+            long distance = Long.MAX_VALUE;
+            for (int index = 0; index < instructions.size(); index++) {
+                long candidate = Math.abs(instructions.get(index).offset() - bci);
+                if (candidate < distance) { distance = candidate; closest = index; }
+            }
+            return closest;
+        }
+
+        private static void printAllDebuggerThreads(TargetSession session) {
+            List<RemoteJvmtiThread> threads = session.jvmti().threads();
+            try {
+                for (int index = 0; index < threads.size(); index++) {
+                    RemoteJvmtiThread thread = threads.get(index);
+                    session.output().printf("[%d] %s  %s%s  priority=%d daemon=%s%n", index,
+                            thread.name(), thread.stateSummary(),
+                            thread.debuggerPaused() ? " DEBUG-PAUSED" : "",
+                            thread.priority(), thread.daemon());
+                }
+            } finally {
+                for (RemoteJvmtiThread thread : threads) thread.close();
+            }
+        }
+
+        private static void printFreezeReport(TargetSession session, DebuggerFreezeReport report) {
+            session.output().println(report.summary());
+            for (DebuggerFreezeReport.Entry entry : report.entries()) {
+                session.output().printf("%-9s %-28s %-20s %s%n",
+                        entry.action().name(), entry.threadName(), entry.originalStateSummary(),
+                        entry.detail());
+            }
+        }
+
+        private static void printManagedBreakpoints(TargetSession session) {
+            List<JvmBreakpointInfo> values = session.jvmti().managedBreakpoints();
+            for (int index = 0; index < values.size(); index++) {
+                JvmBreakpointInfo value = values.get(index);
+                session.output().printf("[%d] %s.%s%s @%d%n", index, value.className(),
+                        value.methodName(), value.descriptor(), value.location());
+            }
+            if (values.isEmpty()) session.output().println("<no managed breakpoints>");
+        }
+
+        private static void printManagedWatches(TargetSession session) {
+            List<JvmFieldWatchInfo> values = session.jvmti().managedFieldWatches();
+            for (int index = 0; index < values.size(); index++) {
+                JvmFieldWatchInfo value = values.get(index);
+                session.output().printf("[%d] %s %s.%s %s%n", index, value.kind(),
+                        value.className(), value.fieldName(), value.descriptor());
+            }
+            if (values.isEmpty()) session.output().println("<no managed field watches>");
+        }
+
+        private static void selectDebuggerLocalContext(TargetSession session,
+                int threadIndex, int depth, int localIndex) {
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            List<JvmDebuggerLocal> locals = new ArrayList<JvmDebuggerLocal>();
+            try {
+                JvmDebuggerState state = pausedDebuggerState(states, threadIndex);
+                locals.addAll(session.jvmti().debuggerLocals(state.thread(), depth));
+                if (localIndex < 0 || localIndex >= locals.size()) {
+                    throw new IllegalArgumentException("No local at index " + localIndex);
+                }
+                JvmDebuggerLocal selected = locals.get(localIndex);
+                if (!selected.available() || selected.value() == null) {
+                    throw new IllegalStateException("Local is unavailable: " + selected.error());
+                }
+                session.context().select(selected.value());
+                locals.remove(localIndex); // Context now owns the selected remote value handle.
+                session.output().println("context <- local " + selected.name()
+                        + " slot=" + selected.slot() + " = " + selected.value().displayValue());
+            } finally {
+                for (JvmDebuggerLocal local : locals) local.close();
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static void resumeDebuggerThread(TargetSession session, int index, boolean step) {
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            try {
+                JvmDebuggerState state = pausedDebuggerState(states, index);
+                if (step) session.jvmti().stepInstruction(state.thread());
+                else session.jvmti().continueExecution(state.thread());
+            } finally {
+                closeDebuggerStates(states);
+            }
+        }
+
+        private static JvmDebuggerState pausedDebuggerState(List<JvmDebuggerState> states, int wanted) {
+            int index = 0;
+            for (JvmDebuggerState state : states) {
+                if (!state.paused() || state.thread() == null) continue;
+                if (index++ == wanted) return state;
+            }
+            throw new IllegalArgumentException("No paused debugger thread at index " + wanted);
+        }
+
+        private static void closeDebuggerStates(List<JvmDebuggerState> states) {
+            for (JvmDebuggerState state : states) state.close();
+        }
+    }
+
+    private static class TuiCommand extends ShellCommand<TargetSession> {
+        private TuiCommand() {
+            super("tui", "tui", "Switches from the command prompt to the full-screen TUI.");
+        }
+
+        @Override
+        public boolean execute(TargetSession session, List<String> arguments) {
+            if (!arguments.isEmpty()) return InteractiveCli.usage(session, this);
+            session.requestTui();
+            return false;
+        }
+    }
+
+    private static final class ParsedAnalysisOptions {
+        private final List<String> positionals = new ArrayList<String>();
+        private DecompilerEngine engine = DecompilerEngine.CFR;
+        private Path output;
+
+        private static ParsedAnalysisOptions parse(List<String> arguments) {
+            ParsedAnalysisOptions result = new ParsedAnalysisOptions();
+            for (int index = 0; index < arguments.size(); index++) {
+                String value = arguments.get(index);
+                if ("--engine".equalsIgnoreCase(value) && index + 1 < arguments.size()) {
+                    result.engine = DecompilerEngine.parse(arguments.get(++index));
+                } else if ("--out".equalsIgnoreCase(value) && index + 1 < arguments.size()) {
+                    result.output = Paths.get(arguments.get(++index));
+                } else if (value.startsWith("--")) {
+                    throw new IllegalArgumentException("Unknown/incomplete analysis option: " + value);
+                } else result.positionals.add(value);
+            }
+            return result;
+        }
+    }
+
+    private static void outputAnalysis(TargetSession session, String text, Path output) throws IOException {
+        if (output == null) {
+            session.output().print(text);
+            if (!text.endsWith("\n")) session.output().println();
+            return;
+        }
+        Path absolute = output.toAbsolutePath().normalize();
+        Path parent = absolute.getParent();
+        if (parent != null) Files.createDirectories(parent);
+        Files.write(absolute, text.getBytes(StandardCharsets.UTF_8));
+        session.output().printf("Wrote %,d character(s) to %s%n", text.length(), absolute);
     }
 
     private static class ForwardCommand extends ShellCommand<TargetSession> {

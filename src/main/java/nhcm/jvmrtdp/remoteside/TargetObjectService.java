@@ -36,6 +36,11 @@ public class TargetObjectService implements AutoCloseable {
         return objects.store(value);
     }
 
+    /** Stores callback/debugger values without running application-defined toString methods. */
+    public RemoteObjectDescriptor storeExternalOpaque(Object value) {
+        return objects.storeOpaque(value);
+    }
+
     /** Resolves an argument handle for another target-side service. */
     public Object resolveExternal(long objectId) {
         return objects.resolve(objectId);
@@ -43,6 +48,75 @@ public class TargetObjectService implements AutoCloseable {
 
     public Class<?> findClass(String className) {
         return NativeAgent.findLoadedClass(className);
+    }
+
+    /** Loads and initializes a class in the target JVM, explicitly invoking Class.forName. */
+    public Class<?> forceLoadClass(String className) {
+        return resolveClassForName(className, true);
+    }
+
+    /**
+     * Loads/links first, then initializes on a non-service thread so a &lt;clinit&gt;
+     * breakpoint may pause without blocking the command channel needed to resume it.
+     */
+    public Class<?> startForceLoadClass(String className) {
+        final Class<?> prepared = resolveClassForName(className, false);
+        final ClassLoader loader = prepared.getClassLoader();
+        Thread initializer = new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    Class.forName(prepared.getName(), true, loader);
+                } catch (ClassNotFoundException impossible) {
+                    throw new IllegalStateException("Prepared class disappeared: " + prepared.getName(), impossible);
+                }
+            }
+        }, "Class.forName-" + prepared.getName());
+        initializer.setContextClassLoader(loader);
+        initializer.setDaemon(true);
+        initializer.start();
+        return prepared;
+    }
+
+    private Class<?> resolveClassForName(String className, boolean initialize) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Class name must not be empty");
+        }
+        String normalized = className.trim().replace('/', '.');
+        List<ClassLoader> loaders = new ArrayList<ClassLoader>();
+        addLoader(loaders, Thread.currentThread().getContextClassLoader());
+        addLoader(loaders, ClassLoader.getSystemClassLoader());
+        addLoader(loaders, TargetObjectService.class.getClassLoader());
+        ClassNotFoundException missing = null;
+        for (ClassLoader loader : loaders) {
+            try {
+                return Class.forName(normalized, initialize, loader);
+            } catch (ClassNotFoundException failure) {
+                missing = failure;
+            }
+        }
+        // Custom application loaders are common in IDEs, plugin systems and obfuscated tools.
+        // Try each already-known loader by identity only after the conventional loaders fail.
+        for (Class<?> loaded : NativeAgent.listLoadedClasses()) {
+            ClassLoader loader = loaded == null ? null : loaded.getClassLoader();
+            if (containsLoader(loaders, loader)) continue;
+            loaders.add(loader);
+            try {
+                return Class.forName(normalized, initialize, loader);
+            } catch (ClassNotFoundException failure) {
+                missing = failure;
+            }
+        }
+        throw new IllegalArgumentException("Class.forName could not load " + normalized
+                + " with any known target ClassLoader", missing);
+    }
+
+    private static void addLoader(List<ClassLoader> loaders, ClassLoader loader) {
+        if (!containsLoader(loaders, loader)) loaders.add(loader);
+    }
+
+    private static boolean containsLoader(List<ClassLoader> loaders, ClassLoader wanted) {
+        for (ClassLoader loader : loaders) if (loader == wanted) return true;
+        return false;
     }
 
     public RemoteObjectDescriptor value(String kind, String encodedValue) {

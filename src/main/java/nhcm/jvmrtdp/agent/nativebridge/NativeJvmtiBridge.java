@@ -17,6 +17,24 @@ public final class NativeJvmtiBridge {
     public static native void setBreakpoint(Class<?> type, String methodName,
             String descriptor, long location, boolean enabled);
 
+    public static native void debuggerConfigure(boolean enabled);
+
+    public static native Object[] debuggerSnapshot();
+
+    public static native Object[][] debuggerSnapshots();
+
+    /** action: 0=continue, 1=single-step one bytecode. */
+    public static native void debuggerResume(int action);
+
+    /** A null thread with action 0 continues every paused debugger thread. */
+    public static native void debuggerResumeThread(Thread thread, int action);
+
+    /** Suspends an arbitrary live JVM thread and exposes it as a debugger stop. */
+    public static native void debuggerPauseThread(Thread thread, String reason);
+
+    /** Active local-variable table entries for a frame in a paused debugger thread. */
+    public static native Object[][] debuggerLocals(Thread thread, int depth);
+
     public static native void setFieldWatch(Class<?> type, String fieldName,
             String descriptor, boolean modification, boolean enabled);
 

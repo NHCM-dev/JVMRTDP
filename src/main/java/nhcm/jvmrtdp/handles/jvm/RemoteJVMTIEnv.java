@@ -20,6 +20,11 @@ import nhcm.jvmrtdp.api.jvmti.JvmtiThreadInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiMonitorUsage;
 import nhcm.jvmrtdp.api.jvmti.JvmtiTimerInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
+import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,12 +34,17 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /** Controller-side facade for JVMTI and target-JVM Java code deployment. */
 public class RemoteJVMTIEnv extends RemoteHandle {
     private static final int UPLOAD_CHUNK_BYTES = 512 * 1024;
+    private final Map<String, BreakpointRegistration> managedBreakpoints =
+            new LinkedHashMap<String, BreakpointRegistration>();
+    private final Map<String, JvmFieldWatchInfo> managedFieldWatches =
+            new LinkedHashMap<String, JvmFieldWatchInfo>();
     public enum DefinitionMode { CHILD, SAME_LOADER }
     public enum JarScope { CHILD, SYSTEM, BOOTSTRAP }
 
@@ -44,6 +54,7 @@ public class RemoteJVMTIEnv extends RemoteHandle {
 
     public byte[] getClassBytes(String className) {
         String encoded = executeForOutput(CommandLine.of("jvmti", "bytes", className));
+        restoreBreakpointsAfterClassBytes(className);
         try {
             return Base64.getUrlDecoder().decode(encoded);
         } catch (IllegalArgumentException exception) {
@@ -232,24 +243,203 @@ public class RemoteJVMTIEnv extends RemoteHandle {
 
     public void retransformClass(String className) {
         executeForOutput(CommandLine.of("jvmti", "retransform", className));
+        restoreBreakpointsAfterClassBytes(className);
     }
 
     public void redefineClass(String className, byte[] classBytes) {
         requireClassBytes(classBytes);
         executeForOutput(CommandLine.of("jvmti", "redefine", className,
                 Base64.getUrlEncoder().withoutPadding().encodeToString(classBytes)));
+        restoreBreakpointsAfterClassBytes(className);
     }
 
     public void setBreakpoint(String className, String methodName, String descriptor,
             long location, boolean enabled) {
+        BreakpointRegistration registration = new BreakpointRegistration(
+                normalizeClassName(className), methodName, descriptor, location);
         executeForOutput(CommandLine.of("jvmti", "breakpoint", enabled ? "set" : "clear",
                 className, methodName, descriptor, Long.toString(location)));
+        synchronized (managedBreakpoints) {
+            if (enabled) managedBreakpoints.put(registration.id(), registration);
+            else managedBreakpoints.remove(registration.id());
+        }
+    }
+
+    public List<JvmBreakpointInfo> managedBreakpoints() {
+        List<JvmBreakpointInfo> result = new ArrayList<JvmBreakpointInfo>();
+        synchronized (managedBreakpoints) {
+            for (BreakpointRegistration value : managedBreakpoints.values()) {
+                result.add(new JvmBreakpointInfo(value.className, value.methodName,
+                        value.descriptor, value.location));
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    public void clearManagedBreakpoints() {
+        List<JvmBreakpointInfo> snapshot = managedBreakpoints();
+        for (JvmBreakpointInfo breakpoint : snapshot) {
+            setBreakpoint(breakpoint.className(), breakpoint.methodName(), breakpoint.descriptor(),
+                    breakpoint.location(), false);
+        }
+    }
+
+    private void restoreBreakpointsAfterClassBytes(String className) {
+        String normalizedClassName = normalizeClassName(className);
+        List<BreakpointRegistration> snapshot = new ArrayList<BreakpointRegistration>();
+        synchronized (managedBreakpoints) {
+            for (BreakpointRegistration registration : managedBreakpoints.values()) {
+                if (registration.className.equals(normalizedClassName)) snapshot.add(registration);
+            }
+        }
+        for (BreakpointRegistration registration : snapshot) {
+            try {
+                executeForOutput(CommandLine.of("jvmti", "breakpoint", "set",
+                        registration.className, registration.methodName,
+                        registration.descriptor, Long.toString(registration.location)));
+            } catch (RuntimeException failure) {
+                // New agents restore natively before returning class bytes. Old agents
+                // require this compatibility reinstall. DUPLICATE means either route
+                // already achieved the desired persistent-breakpoint state.
+                if (!isDuplicateBreakpoint(failure)) throw failure;
+            }
+        }
+    }
+
+    static boolean isDuplicateBreakpoint(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message != null && message.contains("SetBreakpoint")
+                    && message.contains("JVMTI_ERROR_DUPLICATE")) return true;
+        }
+        return false;
+    }
+
+    private static String normalizeClassName(String className) {
+        return className == null ? "" : className.replace('/', '.');
+    }
+
+    private static final class BreakpointRegistration {
+        private final String className;
+        private final String methodName;
+        private final String descriptor;
+        private final long location;
+
+        private BreakpointRegistration(String className, String methodName,
+                String descriptor, long location) {
+            this.className = className;
+            this.methodName = methodName;
+            this.descriptor = descriptor;
+            this.location = location;
+        }
+
+        private String id() {
+            return className + '|' + methodName + '|' + descriptor + '|' + location;
+        }
+    }
+
+    public void configureDebugger(boolean enabled) {
+        executeForOutput(CommandLine.of("jvmti", enabled ? "debug.enable" : "debug.disable"));
+    }
+
+    public JvmDebuggerState debuggerState() {
+        return decodeDebuggerState(executeForOutput(CommandLine.of("jvmti", "debug.status")));
+    }
+
+    public List<JvmDebuggerState> debuggerStates() {
+        String output = executeForOutput(CommandLine.of("jvmti", "debug.status-all"));
+        if (output.isEmpty()) return Collections.emptyList();
+        List<JvmDebuggerState> result = new ArrayList<JvmDebuggerState>();
+        for (String row : output.split("\\r?\\n")) result.add(decodeDebuggerState(row));
+        return Collections.unmodifiableList(result);
+    }
+
+    private JvmDebuggerState decodeDebuggerState(String row) {
+        List<String> fields = TextWireCodec.decode(row, 10);
+        RemoteObject thread = fields.get(0).isEmpty()
+                ? null : object(RemoteObjectDescriptor.decode(fields.get(0)));
+        return new JvmDebuggerState(thread, Boolean.parseBoolean(fields.get(1)),
+                Boolean.parseBoolean(fields.get(2)), fields.get(3), fields.get(4), fields.get(5),
+                fields.get(6), Long.parseLong(fields.get(7)), Integer.parseInt(fields.get(8)),
+                Long.parseLong(fields.get(9)));
+    }
+
+    public void continueExecution() {
+        executeForOutput(CommandLine.of("jvmti", "debug.continue"));
+    }
+
+    public void continueExecution(RemoteObject thread) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        executeForOutput(CommandLine.of("jvmti", "debug.continue-thread", objectId(thread)));
+    }
+
+    public void pauseExecution(RemoteObject thread) {
+        pauseExecution(thread, "manual_pause");
+    }
+
+    public void pauseExecution(RemoteObject thread, String reason) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        if (!"manual_pause".equals(reason) && !"live_sample".equals(reason)) {
+            throw new IllegalArgumentException("Unsupported debugger pause reason: " + reason);
+        }
+        executeForOutput(CommandLine.of("jvmti", "debug.pause-thread", objectId(thread), reason));
+    }
+
+    public void continueAllExecutions() {
+        executeForOutput(CommandLine.of("jvmti", "debug.continue-all"));
+    }
+
+    public void stepInstruction() {
+        executeForOutput(CommandLine.of("jvmti", "debug.step"));
+    }
+
+    public void stepInstruction(RemoteObject thread) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        executeForOutput(CommandLine.of("jvmti", "debug.step-thread", objectId(thread)));
+    }
+
+    public List<JvmDebuggerLocal> debuggerLocals(RemoteObject thread, int depth) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        if (depth < 0) throw new IllegalArgumentException("depth must not be negative");
+        List<JvmDebuggerLocal> result = new ArrayList<JvmDebuggerLocal>();
+        String output = executeForOutput(CommandLine.of("jvmti", "debug.locals", objectId(thread),
+                Integer.toString(depth)));
+        for (String row : lines(output)) {
+            List<String> fields = TextWireCodec.decode(row, 8);
+            RemoteObject value = object(RemoteObjectDescriptor.decode(fields.get(6)));
+            result.add(new JvmDebuggerLocal(fields.get(0), fields.get(1), fields.get(2),
+                    Integer.parseInt(fields.get(3)), Long.parseLong(fields.get(4)),
+                    Long.parseLong(fields.get(5)), value, fields.get(7)));
+        }
+        return Collections.unmodifiableList(result);
     }
 
     public void setFieldWatch(String className, String fieldName, String descriptor,
             boolean modification, boolean enabled) {
+        String normalized = normalizeClassName(className);
+        JvmFieldWatchInfo registration = new JvmFieldWatchInfo(
+                normalized, fieldName, descriptor, modification);
         executeForOutput(CommandLine.of("jvmti", "watch", modification ? "modification" : "access",
-                enabled ? "set" : "clear", className, fieldName, descriptor));
+                enabled ? "set" : "clear", normalized, fieldName, descriptor));
+        synchronized (managedFieldWatches) {
+            if (enabled) managedFieldWatches.put(registration.id(), registration);
+            else managedFieldWatches.remove(registration.id());
+        }
+    }
+
+    public List<JvmFieldWatchInfo> managedFieldWatches() {
+        synchronized (managedFieldWatches) {
+            return Collections.unmodifiableList(
+                    new ArrayList<JvmFieldWatchInfo>(managedFieldWatches.values()));
+        }
+    }
+
+    public void clearManagedFieldWatches() {
+        List<JvmFieldWatchInfo> snapshot = managedFieldWatches();
+        for (JvmFieldWatchInfo watch : snapshot) {
+            setFieldWatch(watch.className(), watch.fieldName(), watch.descriptor(),
+                    watch.modification(), false);
+        }
     }
 
     public RemoteCodeDeployment deployClasses(String name, Map<String, byte[]> classes) {
@@ -374,9 +564,11 @@ public class RemoteJVMTIEnv extends RemoteHandle {
     public List<RemoteJvmtiThread> threads() {
         List<RemoteJvmtiThread> result = new ArrayList<RemoteJvmtiThread>();
         for (String row : lines(executeForOutput(CommandLine.of("jvmti", "threads")))) {
-            List<String> fields = TextWireCodec.decode(row, 2);
+            List<String> fields = TextWireCodec.decode(row, 6);
             RemoteObject thread = object(RemoteObjectDescriptor.decode(fields.get(0)));
-            result.add(new RemoteJvmtiThread(this, thread, Integer.parseInt(fields.get(1))));
+            result.add(new RemoteJvmtiThread(this, thread, Integer.parseInt(fields.get(1)),
+                    fields.get(2), Integer.parseInt(fields.get(3)), Boolean.parseBoolean(fields.get(4)),
+                    Boolean.parseBoolean(fields.get(5))));
         }
         return Collections.unmodifiableList(result);
     }
@@ -420,6 +612,15 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         for (String row : lines(executeForOutput(CommandLine.of(
                 "jvmti", "thread.stack", objectId(thread), Integer.toString(maxFrames))))) {
             result.add(TextWireCodec.decode(row, 1).get(0));
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    public List<JvmStackFrame> stackFrames(RemoteObject thread, int maxFrames) {
+        List<String> rows = stackTrace(thread, maxFrames);
+        List<JvmStackFrame> result = new ArrayList<JvmStackFrame>(rows.size());
+        for (int depth = 0; depth < rows.size(); depth++) {
+            result.add(JvmStackFrame.parse(depth, rows.get(depth)));
         }
         return Collections.unmodifiableList(result);
     }

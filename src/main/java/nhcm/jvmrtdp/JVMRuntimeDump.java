@@ -1,6 +1,11 @@
 package nhcm.jvmrtdp;
 
 import nhcm.jvmrtdp.controllerside.ControllerShell;
+import nhcm.jvmrtdp.controllerside.tui.ControllerTui;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 
 public class JVMRuntimeDump {
     private JVMRuntimeDump() {
@@ -8,8 +13,15 @@ public class JVMRuntimeDump {
 
     public static void main(String[] args) {
         try {
-            ControllerShell shell = new ControllerShell(new JVMRTDP(), System.in, System.out, System.err);
+            JVMRTDP controller = new JVMRTDP();
+            BufferedReader input = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            ControllerShell shell = new ControllerShell(input, controller, System.out, System.err);
             if (args.length == 0) {
+                boolean useCli = Boolean.getBoolean("jvmrtdp.cli") || System.console() == null;
+                if (useCli || new ControllerTui(controller, input, System.out, System.err).run()) shell.run();
+            } else if ("--tui".equalsIgnoreCase(args[0]) && args.length == 1) {
+                if (new ControllerTui(controller, input, System.out, System.err).run()) shell.run();
+            } else if ("--cli".equalsIgnoreCase(args[0]) && args.length == 1) {
                 shell.run();
             } else if (("list".equalsIgnoreCase(args[0]) || "ps".equalsIgnoreCase(args[0]))
                     && args.length == 1) {
@@ -48,6 +60,8 @@ public class JVMRuntimeDump {
     private static void printUsage() {
         System.out.println("Usage:");
         System.out.println("  java -jar JVMRTDP.jar");
+        System.out.println("  java -jar JVMRTDP.jar --tui");
+        System.out.println("  java -jar JVMRTDP.jar --cli");
         System.out.println("  java -jar JVMRTDP.jar list");
         System.out.println("  java -jar JVMRTDP.jar inject <pid>");
         System.out.println("  java -jar JVMRTDP.jar --version");

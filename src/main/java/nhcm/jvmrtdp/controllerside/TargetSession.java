@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.controllerside;
 
+import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 import nhcm.jvmrtdp.handles.jvm.RemoteJNIEnv;
@@ -19,7 +20,9 @@ public class TargetSession implements AutoCloseable {
     private final RemoteWorkspace workspace;
     private final RemoteOperations operations;
     private final RemoteContext context;
+    private final DebuggerControlService debugger;
     private boolean controllerExitRequested;
+    private boolean tuiRequested;
 
     public TargetSession(ServerHandle server, PrintStream output, PrintStream error) {
         this.server = Objects.requireNonNull(server, "server");
@@ -31,6 +34,7 @@ public class TargetSession implements AutoCloseable {
         this.workspace = new RemoteWorkspace(this);
         this.operations = new RemoteOperations(this);
         this.context = new RemoteContext();
+        this.debugger = new DebuggerControlService(jvmti);
     }
 
     public ServerHandle server() {
@@ -47,6 +51,14 @@ public class TargetSession implements AutoCloseable {
 
     public RemoteClass findClass(String className) {
         return jni.findClass(className);
+    }
+
+    public RemoteClass forceLoadClass(String className) {
+        return jni.forceLoadClass(className);
+    }
+
+    public RemoteClass startForceLoadClass(String className) {
+        return jni.startForceLoadClass(className);
     }
 
     public PrintStream output() {
@@ -73,12 +85,22 @@ public class TargetSession implements AutoCloseable {
         return context;
     }
 
+    public DebuggerControlService debugger() { return debugger; }
+
     public void requestControllerExit() {
         controllerExitRequested = true;
     }
 
     public boolean controllerExitRequested() {
         return controllerExitRequested;
+    }
+
+    public void requestTui() { tuiRequested = true; }
+
+    public boolean consumeTuiRequest() {
+        boolean requested = tuiRequested;
+        tuiRequested = false;
+        return requested;
     }
 
     public <T> T withOutput(PrintStream temporaryOutput, OutputAction<T> action) throws Exception {
@@ -94,9 +116,13 @@ public class TargetSession implements AutoCloseable {
     @Override
     public void close() {
         try {
-            context.close();
+            debugger.close();
         } finally {
-            workspace.close();
+            try {
+                context.close();
+            } finally {
+                workspace.close();
+            }
         }
     }
 

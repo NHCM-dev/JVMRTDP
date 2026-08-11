@@ -114,6 +114,43 @@ public class RemoteContext implements AutoCloseable {
         current = selected;
     }
 
+    /** Moves an existing stack item to the top without duplicating it. */
+    public void moveToTop(int stackIndex) {
+        if (stackIndex == 0) { requireCurrent(); return; }
+        Value selected = valueAt(stackIndex);
+        Deque<Value> rebuilt = new ArrayDeque<Value>();
+        int index = 1;
+        for (Value value : history) {
+            if (index++ != stackIndex) rebuilt.addLast(value);
+        }
+        rebuilt.addFirst(requireCurrent());
+        history.clear();
+        history.addAll(rebuilt);
+        current = selected;
+    }
+
+    /** Removes one stack item. Removing the top promotes the next item. */
+    public void remove(int stackIndex) {
+        requireCurrent();
+        if (depth() == 1) {
+            if (stackIndex != 0) valueAt(stackIndex);
+            current = null;
+            return;
+        }
+        if (stackIndex == 0) {
+            current = history.pop();
+            return;
+        }
+        valueAt(stackIndex);
+        Deque<Value> rebuilt = new ArrayDeque<Value>();
+        int index = 1;
+        for (Value value : history) {
+            if (index++ != stackIndex) rebuilt.addLast(value);
+        }
+        history.clear();
+        history.addAll(rebuilt);
+    }
+
     public int depth() {
         return current == null ? 0 : history.size() + 1;
     }

@@ -96,6 +96,52 @@ public class NativeAgent {
         NativeJvmtiBridge.setBreakpoint(type, methodName, descriptor, location, enabled);
     }
 
+    public static void configureDebugger(boolean enabled) {
+        requireAvailable();
+        NativeJvmtiBridge.debuggerConfigure(enabled);
+    }
+
+    public static Object[] debuggerSnapshot() {
+        requireAvailable();
+        return NativeJvmtiBridge.debuggerSnapshot();
+    }
+
+    public static Object[][] debuggerSnapshots() {
+        requireAvailable();
+        return NativeJvmtiBridge.debuggerSnapshots();
+    }
+
+    public static void resumeDebugger(boolean singleStep) {
+        requireAvailable();
+        NativeJvmtiBridge.debuggerResume(singleStep ? 1 : 0);
+    }
+
+    public static void resumeDebugger(Thread thread, boolean singleStep) {
+        requireAvailable();
+        if (thread == null && singleStep) throw new IllegalArgumentException("Cannot single-step all threads");
+        NativeJvmtiBridge.debuggerResumeThread(thread, singleStep ? 1 : 0);
+    }
+
+    public static void pauseDebugger(Thread thread) {
+        pauseDebugger(thread, "manual_pause");
+    }
+
+    public static void pauseDebugger(Thread thread, String reason) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        if (!"manual_pause".equals(reason) && !"live_sample".equals(reason)) {
+            throw new IllegalArgumentException("Unsupported debugger pause reason: " + reason);
+        }
+        NativeJvmtiBridge.debuggerPauseThread(thread, reason);
+    }
+
+    public static Object[][] debuggerLocals(Thread thread, int depth) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        if (depth < 0) throw new IllegalArgumentException("depth must not be negative");
+        return NativeJvmtiBridge.debuggerLocals(thread, depth);
+    }
+
     public static void setFieldWatch(Class<?> type, String fieldName, String descriptor,
             boolean modification, boolean enabled) {
         requireAvailable();

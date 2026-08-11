@@ -12,6 +12,7 @@
 #include <deque>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -91,6 +92,97 @@ std::atomic<bool> gWorkerStopping{false};
 std::thread* gEventWorker = nullptr;
 std::atomic<jlong> gNativeQueued{0};
 std::atomic<jlong> gNativeDropped{0};
+
+std::mutex gDebuggerMutex;
+std::condition_variable gDebuggerChanged;
+bool gDebuggerEnabled = false;
+bool gStartupBreakpointInstalled = false;
+bool gStartupClinitBreakpointInstalled = false;
+std::atomic<bool> gStartupClassPrepareOwned{false};
+jmethodID gStartupMainMethod = nullptr;
+jlocation gStartupMainLocation = 0;
+jmethodID gStartupClinitMethod = nullptr;
+jlocation gStartupClinitLocation = 0;
+jlong gDebuggerSequence = 0;
+std::string gStartupMainClass;
+std::string gStartupClinitClass;
+
+struct DebuggerStop {
+    jobject thread = nullptr;
+    bool paused = true;
+    // Breakpoint/single-step callbacks wait on gDebuggerChanged. A thread paused
+    // from the debugger console is instead suspended with JVMTI SuspendThread.
+    bool externallySuspended = false;
+    jlong sequence = 0;
+    std::string reason;
+    std::string className;
+    std::string methodName;
+    std::string descriptor;
+    jlocation location = 0;
+    jint line = -1;
+};
+
+std::vector<std::shared_ptr<DebuggerStop>> gDebuggerStops;
+
+struct PersistentBreakpoint {
+    jobject klass = nullptr;
+    jmethodID method = nullptr;
+    std::string methodName;
+    std::string descriptor;
+    jlocation location = 0;
+};
+
+std::mutex gBreakpointMutex;
+std::vector<PersistentBreakpoint> gPersistentBreakpoints;
+
+bool SamePersistentBreakpoint(JNIEnv* env, const PersistentBreakpoint& breakpoint,
+        jclass klass, jmethodID method, jlocation location) {
+    return breakpoint.method == method && breakpoint.location == location
+        && breakpoint.klass != nullptr && env->IsSameObject(breakpoint.klass, klass) == JNI_TRUE;
+}
+
+bool HasPersistentBreakpoint(JNIEnv* env, jmethodID method, jlocation location) {
+    std::lock_guard<std::mutex> guard(gBreakpointMutex);
+    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (breakpoint.method == method && breakpoint.location == location) return true;
+    }
+    return false;
+}
+
+void RememberPersistentBreakpoint(JNIEnv* env, jclass klass, jmethodID method,
+        const std::string& methodName, const std::string& descriptor, jlocation location) {
+    std::lock_guard<std::mutex> guard(gBreakpointMutex);
+    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (SamePersistentBreakpoint(env, breakpoint, klass, method, location)) return;
+    }
+    jobject reference = env->NewGlobalRef(klass);
+    if (reference == nullptr) return;
+    gPersistentBreakpoints.push_back(
+        {reference, method, methodName, descriptor, location});
+}
+
+void ForgetPersistentBreakpoint(JNIEnv* env, jclass klass, jmethodID method, jlocation location) {
+    std::lock_guard<std::mutex> guard(gBreakpointMutex);
+    for (auto iterator = gPersistentBreakpoints.begin(); iterator != gPersistentBreakpoints.end();) {
+        if (!SamePersistentBreakpoint(env, *iterator, klass, method, location)) {
+            ++iterator;
+            continue;
+        }
+        env->DeleteGlobalRef(iterator->klass);
+        iterator = gPersistentBreakpoints.erase(iterator);
+    }
+}
+
+jvmtiError ReapplyPersistentBreakpoints(JNIEnv* env, jclass klass) {
+    std::lock_guard<std::mutex> guard(gBreakpointMutex);
+    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (breakpoint.klass == nullptr
+                || env->IsSameObject(breakpoint.klass, klass) != JNI_TRUE) continue;
+        const jvmtiError error = gJvmti->SetBreakpoint(breakpoint.method, breakpoint.location);
+        if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) return error;
+    }
+    return JVMTI_ERROR_NONE;
+}
 
 jobjectArray NewStringArray(JNIEnv* env, const std::vector<std::string>& values);
 bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent, jobject classLoader = nullptr);
@@ -463,6 +555,144 @@ MethodDetails DescribeMethod(JNIEnv* env, jmethodID method) {
     if (signature != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
     if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
     return result;
+}
+
+jint LineAtLocation(jmethodID method, jlocation location) {
+    if (method == nullptr || gJvmti == nullptr) return -1;
+    jint count = 0;
+    jvmtiLineNumberEntry* lines = nullptr;
+    if (gJvmti->GetLineNumberTable(method, &count, &lines) != JVMTI_ERROR_NONE) return -1;
+    jint result = -1;
+    for (jint index = 0; index < count; ++index) {
+        if (lines[index].start_location > location) break;
+        result = lines[index].line_number;
+    }
+    if (lines != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(lines));
+    return result;
+}
+
+bool IsJvmrtdpServiceThread(JNIEnv* env, jthread thread) {
+    if (env == nullptr || thread == nullptr || gJvmti == nullptr) return false;
+    jvmtiThreadInfo info{};
+    if (gJvmti->GetThreadInfo(thread, &info) != JVMTI_ERROR_NONE) return false;
+    std::string name = info.name == nullptr ? "" : info.name;
+    if (info.name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(info.name));
+    if (info.thread_group != nullptr) env->DeleteLocalRef(info.thread_group);
+    if (info.context_class_loader != nullptr) env->DeleteLocalRef(info.context_class_loader);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return name.rfind("jvmrtdp", 0) == 0;
+}
+
+void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation location,
+        const char* reason) {
+    if (env == nullptr || thread == nullptr || method == nullptr) return;
+    // Breakpoints in java.lang.String/collections can also be reached by the agent's
+    // protocol implementation. Never stop the only threads capable of resuming a target.
+    if (IsJvmrtdpServiceThread(env, thread)) return;
+    const MethodDetails details = DescribeMethod(env, method);
+    jobject threadReference = env->NewGlobalRef(thread);
+    if (threadReference == nullptr) return;
+    std::shared_ptr<DebuggerStop> stop = std::make_shared<DebuggerStop>();
+    stop->thread = threadReference;
+    stop->reason = reason == nullptr ? "breakpoint" : reason;
+    stop->className = details.className;
+    stop->methodName = details.name;
+    stop->descriptor = details.descriptor;
+    stop->location = location;
+    stop->line = LineAtLocation(method, location);
+    std::unique_lock<std::mutex> lock(gDebuggerMutex);
+    if (!gDebuggerEnabled || gDebuggerStops.size() >= 128) {
+        lock.unlock();
+        env->DeleteGlobalRef(threadReference);
+        return;
+    }
+    stop->sequence = ++gDebuggerSequence;
+    gDebuggerStops.push_back(stop);
+    gDebuggerChanged.notify_all();
+    gDebuggerChanged.wait(lock, [&stop] { return !stop->paused || !gDebuggerEnabled; });
+    gDebuggerStops.erase(std::remove(gDebuggerStops.begin(), gDebuggerStops.end(), stop), gDebuggerStops.end());
+    lock.unlock();
+    env->DeleteGlobalRef(threadReference);
+}
+
+void ConfigureStartupDebugger(const char* options) {
+    if (options == nullptr) return;
+    std::string input(options);
+    const auto option = [&input](const std::string& key) {
+        std::size_t position = input.find(key);
+        if (position == std::string::npos) return std::string();
+        position += key.size();
+        const std::size_t end = input.find_first_of(",;", position);
+        std::string value = input.substr(position,
+            end == std::string::npos ? std::string::npos : end - position);
+        std::replace(value.begin(), value.end(), '/', '.');
+        return value;
+    };
+    gStartupMainClass = option("break-main=");
+    gStartupClinitClass = option("break-clinit=");
+    if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()) gDebuggerEnabled = true;
+}
+
+void ReleaseStartupClassPrepareIfReady() {
+    if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()) return;
+    if (gStartupClassPrepareOwned.exchange(false)) {
+        gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_PREPARE, nullptr);
+    }
+}
+
+void InstallStartupMainBreakpoint(JNIEnv* env, jclass klass) {
+    if (env == nullptr || klass == nullptr || gStartupMainClass.empty()
+        || gStartupBreakpointInstalled || BinaryClassName(klass) != gStartupMainClass) return;
+    jint count = 0;
+    jmethodID* methods = nullptr;
+    if (gJvmti->GetClassMethods(klass, &count, &methods) != JVMTI_ERROR_NONE) return;
+    for (jint index = 0; index < count; ++index) {
+        const MethodDetails details = DescribeMethod(env, methods[index]);
+        if (details.name != "main" || details.descriptor != "([Ljava/lang/String;)V") continue;
+        jint modifiers = 0;
+        jlocation start = 0;
+        jlocation end = 0;
+        if (gJvmti->GetMethodModifiers(methods[index], &modifiers) == JVMTI_ERROR_NONE
+            && (modifiers & kAccStatic) != 0
+            && gJvmti->GetMethodLocation(methods[index], &start, &end) == JVMTI_ERROR_NONE
+            && gJvmti->SetBreakpoint(methods[index], start) == JVMTI_ERROR_NONE) {
+            gStartupBreakpointInstalled = true;
+            gStartupMainMethod = methods[index];
+            gStartupMainLocation = start;
+        }
+        break;
+    }
+    if (methods != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+    gStartupMainClass.clear();
+    ReleaseStartupClassPrepareIfReady();
+}
+
+void InstallStartupClinitBreakpoint(JNIEnv* env, jclass klass) {
+    if (env == nullptr || klass == nullptr || gStartupClinitClass.empty()
+        || gStartupClinitBreakpointInstalled || BinaryClassName(klass) != gStartupClinitClass) return;
+    jint count = 0;
+    jmethodID* methods = nullptr;
+    if (gJvmti->GetClassMethods(klass, &count, &methods) != JVMTI_ERROR_NONE) return;
+    for (jint index = 0; index < count; ++index) {
+        const MethodDetails details = DescribeMethod(env, methods[index]);
+        if (details.name != "<clinit>" || details.descriptor != "()V") continue;
+        jlocation start = 0;
+        jlocation end = 0;
+        if (gJvmti->GetMethodLocation(methods[index], &start, &end) == JVMTI_ERROR_NONE
+            && gJvmti->SetBreakpoint(methods[index], start) == JVMTI_ERROR_NONE) {
+            gStartupClinitBreakpointInstalled = true;
+            gStartupClinitMethod = methods[index];
+            gStartupClinitLocation = start;
+        }
+        break;
+    }
+    if (methods != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+    // ClassPrepare proves the target is loaded. If it has no <clinit>, there is nothing
+    // the VM can stop before; do not keep a global ClassPrepare notification forever.
+    gStartupClinitClass.clear();
+    ReleaseStartupClassPrepareIfReady();
 }
 
 jstring NewOptionalString(JNIEnv* env, const std::string& value) {
@@ -846,10 +1076,14 @@ void JNICALL ClassLoad(jvmtiEnv*, JNIEnv* env, jthread thread, jclass klass) {
 
 void JNICALL ClassPrepare(jvmtiEnv*, JNIEnv* env, jthread thread, jclass klass) {
     DispatchEvent(env, "class_prepare", thread, klass, nullptr, 0, klass, 0);
+    InstallStartupMainBreakpoint(env, klass);
+    InstallStartupClinitBreakpoint(env, klass);
 }
 
 void JNICALL SingleStep(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
+    gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP, thread);
     DispatchEvent(env, "single_step", thread, nullptr, method, location, nullptr, 0);
+    DebuggerTrap(env, thread, method, location, "single_step");
 }
 
 void JNICALL FramePop(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -860,6 +1094,30 @@ void JNICALL FramePop(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
 
 void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
     DispatchEvent(env, "breakpoint", thread, nullptr, method, location, nullptr, 0);
+    const bool startupMain = gStartupBreakpointInstalled && method == gStartupMainMethod
+        && location == gStartupMainLocation;
+    const bool startupClinit = gStartupClinitBreakpointInstalled && method == gStartupClinitMethod
+        && location == gStartupClinitLocation;
+    if (startupMain) {
+        // break-main is a one-shot bootstrap stop. Leaving it installed can retrap the
+        // launcher and keeps startup-only bookkeeping alive during AWT/Swing initialization.
+        if (!HasPersistentBreakpoint(env, gStartupMainMethod, gStartupMainLocation)) {
+            gJvmti->ClearBreakpoint(gStartupMainMethod, gStartupMainLocation);
+        }
+        gStartupBreakpointInstalled = false;
+        gStartupMainMethod = nullptr;
+        gStartupMainLocation = 0;
+    }
+    if (startupClinit) {
+        if (!HasPersistentBreakpoint(env, gStartupClinitMethod, gStartupClinitLocation)) {
+            gJvmti->ClearBreakpoint(gStartupClinitMethod, gStartupClinitLocation);
+        }
+        gStartupClinitBreakpointInstalled = false;
+        gStartupClinitMethod = nullptr;
+        gStartupClinitLocation = 0;
+    }
+    DebuggerTrap(env, thread, method, location,
+        startupMain ? "main_entry" : startupClinit ? "class_init" : "breakpoint");
 }
 
 void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -867,6 +1125,8 @@ void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID metho
     const FieldDetails details = DescribeField(fieldClass, field);
     DispatchEvent(env, "field_access", thread, fieldClass, method, location, object, 0,
         nullptr, 0, details.name.c_str(), details.descriptor.c_str());
+    DebuggerTrap(env, thread, method, location,
+        ("field_read:" + details.name + details.descriptor).c_str());
 }
 
 void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -877,6 +1137,8 @@ void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID
     const jlong bits = ValueBits(signatureType, newValue, &newObject);
     DispatchEvent(env, "field_modification", thread, fieldClass, method, location, object, bits,
         nullptr, 0, details.name.c_str(), details.descriptor.c_str(), newObject);
+    DebuggerTrap(env, thread, method, location,
+        ("field_write:" + details.name + details.descriptor).c_str());
 }
 
 void JNICALL MethodEntry(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method) {
@@ -1106,6 +1368,7 @@ jbyteArray JNICALL NativeGetClassBytes(JNIEnv* env, jclass, jstring classNameVal
             ++tTemporaryClassFileHookDepth;
             error = gJvmti->RetransformClasses(1, &klass);
             --tTemporaryClassFileHookDepth;
+            if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
         }
         const bool shouldDisable = ownsTemporaryEnable && !gClassFileHookEnabled.load();
         const jvmtiError disableError = shouldDisable ? gJvmti->SetEventNotificationMode(
@@ -1549,6 +1812,7 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
     if (error == JVMTI_ERROR_NONE && event == JVMTI_EVENT_CLASS_FILE_LOAD_HOOK) {
         gClassFileHookEnabled.store(enabled == JNI_TRUE);
     }
+    if (event == JVMTI_EVENT_CLASS_PREPARE) gStartupClassPrepareOwned.store(false);
     ThrowJvmti(env, "SetEventNotificationMode", error);
 }
 
@@ -1565,7 +1829,492 @@ void JNICALL NativeSetBreakpoint(JNIEnv* env, jclass, jclass klass, jstring meth
     const jvmtiError error = enabled == JNI_TRUE
         ? gJvmti->SetBreakpoint(method, static_cast<jlocation>(location))
         : gJvmti->ClearBreakpoint(method, static_cast<jlocation>(location));
+    if (enabled == JNI_TRUE && (error == JVMTI_ERROR_NONE || error == JVMTI_ERROR_DUPLICATE)) {
+        RememberPersistentBreakpoint(env, klass, method, methodName, descriptor,
+            static_cast<jlocation>(location));
+        return;
+    }
+    if (enabled != JNI_TRUE && error == JVMTI_ERROR_NONE) {
+        ForgetPersistentBreakpoint(env, klass, method, static_cast<jlocation>(location));
+        return;
+    }
     ThrowJvmti(env, enabled == JNI_TRUE ? "SetBreakpoint" : "ClearBreakpoint", error);
+}
+
+void JNICALL NativeDebuggerConfigure(JNIEnv* env, jclass, jboolean enabled) {
+    if (enabled == JNI_TRUE) {
+        const jvmtiError error = gJvmti->SetEventNotificationMode(
+            JVMTI_ENABLE, JVMTI_EVENT_BREAKPOINT, nullptr);
+        if (error != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Enable debugger breakpoint events", error);
+            return;
+        }
+    }
+    std::vector<jobject> release;
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        gDebuggerEnabled = enabled == JNI_TRUE;
+        if (!gDebuggerEnabled) {
+            for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+                if (stop->paused && stop->externallySuspended && stop->thread != nullptr) {
+                    gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+                    release.push_back(stop->thread);
+                }
+                stop->paused = false;
+            }
+            gDebuggerStops.erase(std::remove_if(gDebuggerStops.begin(), gDebuggerStops.end(),
+                [](const std::shared_ptr<DebuggerStop>& stop) {
+                    return stop->externallySuspended;
+                }), gDebuggerStops.end());
+        }
+    }
+    for (jobject reference : release) env->DeleteGlobalRef(reference);
+    gDebuggerChanged.notify_all();
+}
+
+void JNICALL NativeDebuggerPauseThread(JNIEnv* env, jclass, jobject requestedThread,
+        jstring reasonValue) {
+    if (requestedThread == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Thread must not be null");
+        return;
+    }
+    if (IsJvmrtdpServiceThread(env, static_cast<jthread>(requestedThread))) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "JVMRTDP service threads cannot be paused because they carry debugger commands");
+        return;
+    }
+    jthread current = nullptr;
+    if (gJvmti->GetCurrentThread(&current) == JVMTI_ERROR_NONE && current != nullptr) {
+        const bool same = env->IsSameObject(current, requestedThread) == JNI_TRUE;
+        env->DeleteLocalRef(current);
+        if (same) {
+            ThrowJava(env, "java/lang/IllegalArgumentException",
+                "The debugger command thread cannot suspend itself");
+            return;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop->paused && stop->thread != nullptr
+                    && env->IsSameObject(requestedThread, stop->thread)) {
+                ThrowJava(env, "java/lang/IllegalStateException",
+                    "Selected debugger thread is already paused");
+                return;
+            }
+        }
+    }
+    const jvmtiError suspendError = gJvmti->SuspendThread(static_cast<jthread>(requestedThread));
+    if (suspendError != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Suspend selected debugger thread", suspendError);
+        return;
+    }
+    jmethodID method = nullptr;
+    jlocation location = 0;
+    const jvmtiError frameError = gJvmti->GetFrameLocation(
+        static_cast<jthread>(requestedThread), 0, &method, &location);
+    if (frameError != JVMTI_ERROR_NONE || method == nullptr) {
+        gJvmti->ResumeThread(static_cast<jthread>(requestedThread));
+        if (frameError != JVMTI_ERROR_NONE) ThrowJvmti(env, "Get selected thread location", frameError);
+        else ThrowJava(env, "java/lang/IllegalStateException",
+            "Selected thread has no Java frame to debug");
+        return;
+    }
+    jobject reference = env->NewGlobalRef(requestedThread);
+    if (reference == nullptr) {
+        gJvmti->ResumeThread(static_cast<jthread>(requestedThread));
+        return;
+    }
+    std::string pauseReason = JStringToUtf8(env, reasonValue);
+    if (pauseReason != "live_sample" && pauseReason != "manual_pause") {
+        pauseReason = "manual_pause";
+    }
+    const MethodDetails details = DescribeMethod(env, method);
+    std::shared_ptr<DebuggerStop> stop = std::make_shared<DebuggerStop>();
+    stop->thread = reference;
+    stop->externallySuspended = true;
+    stop->reason = pauseReason;
+    stop->className = details.className;
+    stop->methodName = details.name;
+    stop->descriptor = details.descriptor;
+    stop->location = location;
+    stop->line = LineAtLocation(method, location);
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        if (!gDebuggerEnabled || gDebuggerStops.size() >= 128) {
+            gJvmti->ResumeThread(static_cast<jthread>(requestedThread));
+            env->DeleteGlobalRef(reference);
+            ThrowJava(env, "java/lang/IllegalStateException",
+                gDebuggerEnabled ? "Too many paused debugger threads" : "Debugger is disabled");
+            return;
+        }
+        stop->sequence = ++gDebuggerSequence;
+        gDebuggerStops.push_back(stop);
+    }
+    gDebuggerChanged.notify_all();
+}
+
+static jobjectArray NewDebuggerSnapshot(JNIEnv* env, const std::shared_ptr<DebuggerStop>& stop) {
+    jclass objectClass = env->FindClass("java/lang/Object");
+    if (objectClass == nullptr) return nullptr;
+    jobjectArray result = env->NewObjectArray(10, objectClass, nullptr);
+    env->DeleteLocalRef(objectClass);
+    if (result == nullptr) return nullptr;
+
+    if (stop != nullptr && stop->thread != nullptr) {
+        jobject thread = env->NewLocalRef(stop->thread);
+        if (thread != nullptr) {
+            env->SetObjectArrayElement(result, 0, thread);
+            env->DeleteLocalRef(thread);
+        }
+    }
+    const std::string fields[] = {
+        gDebuggerEnabled ? "true" : "false",
+        stop != nullptr && stop->paused ? "true" : "false",
+        stop == nullptr ? "" : stop->reason,
+        stop == nullptr ? "" : stop->className,
+        stop == nullptr ? "" : stop->methodName,
+        stop == nullptr ? "" : stop->descriptor,
+        std::to_string(stop == nullptr ? 0 : stop->location),
+        std::to_string(stop == nullptr ? -1 : stop->line),
+        std::to_string(stop == nullptr ? gDebuggerSequence : stop->sequence),
+    };
+    for (jsize index = 0; index < 9; ++index) {
+        jstring value = env->NewStringUTF(fields[index].c_str());
+        if (value != nullptr) {
+            env->SetObjectArrayElement(result, index + 1, value);
+            env->DeleteLocalRef(value);
+        }
+    }
+    return result;
+}
+
+jobjectArray JNICALL NativeDebuggerSnapshot(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> guard(gDebuggerMutex);
+    std::shared_ptr<DebuggerStop> stop;
+    for (const std::shared_ptr<DebuggerStop>& candidate : gDebuggerStops) {
+        if (candidate->paused) { stop = candidate; break; }
+    }
+    return NewDebuggerSnapshot(env, stop);
+}
+
+jobjectArray JNICALL NativeDebuggerSnapshots(JNIEnv* env, jclass) {
+    jclass rowClass = env->FindClass("[Ljava/lang/Object;");
+    if (rowClass == nullptr) return nullptr;
+    std::lock_guard<std::mutex> guard(gDebuggerMutex);
+    jsize count = 0;
+    for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) if (stop->paused) ++count;
+    // Preserve debugger enabled/running state even when no thread is stopped.
+    jobjectArray result = env->NewObjectArray(std::max<jsize>(1, count), rowClass, nullptr);
+    env->DeleteLocalRef(rowClass);
+    if (result == nullptr) return nullptr;
+    jsize index = 0;
+    for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+        if (!stop->paused) continue;
+        jobjectArray row = NewDebuggerSnapshot(env, stop);
+        if (row != nullptr) {
+            env->SetObjectArrayElement(result, index++, row);
+            env->DeleteLocalRef(row);
+        }
+    }
+    if (count == 0) {
+        jobjectArray row = NewDebuggerSnapshot(env, nullptr);
+        if (row != nullptr) {
+            env->SetObjectArrayElement(result, 0, row);
+            env->DeleteLocalRef(row);
+        }
+    }
+    return result;
+}
+
+static void SetDebuggerLocalText(JNIEnv* env, jobjectArray row, jsize index,
+        const std::string& value) {
+    jstring text = env->NewStringUTF(value.c_str());
+    if (text == nullptr) return;
+    env->SetObjectArrayElement(row, index, text);
+    env->DeleteLocalRef(text);
+}
+
+jobjectArray JNICALL NativeDebuggerLocals(JNIEnv* env, jclass, jobject requestedThread, jint depth) {
+    if (requestedThread == nullptr || depth < 0) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "A paused debugger thread and a non-negative frame depth are required");
+        return nullptr;
+    }
+
+    jthread thread = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop->paused && stop->thread != nullptr
+                    && env->IsSameObject(requestedThread, stop->thread)) {
+                thread = static_cast<jthread>(env->NewLocalRef(stop->thread));
+                break;
+            }
+        }
+    }
+    if (thread == nullptr) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "Selected debugger thread is no longer paused");
+        return nullptr;
+    }
+
+    bool suspendedHere = false;
+    jint threadState = 0;
+    jvmtiError error = gJvmti->GetThreadState(thread, &threadState);
+    if (error == JVMTI_ERROR_NONE && (threadState & JVMTI_THREAD_STATE_SUSPENDED) == 0) {
+        error = gJvmti->SuspendThread(thread);
+        if (error == JVMTI_ERROR_NONE) suspendedHere = true;
+    }
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_THREAD_SUSPENDED) {
+        env->DeleteLocalRef(thread);
+        ThrowJvmti(env, "Suspend debugger thread for local access", error);
+        return nullptr;
+    }
+
+    jmethodID method = nullptr;
+    jlocation location = 0;
+    error = gJvmti->GetFrameLocation(thread, depth, &method, &location);
+    if (error != JVMTI_ERROR_NONE) {
+        if (suspendedHere) gJvmti->ResumeThread(thread);
+        env->DeleteLocalRef(thread);
+        ThrowJvmti(env, "GetFrameLocation for debugger locals", error);
+        return nullptr;
+    }
+
+    jint count = 0;
+    jvmtiLocalVariableEntry* table = nullptr;
+    error = gJvmti->GetLocalVariableTable(method, &count, &table);
+    const bool inferSlots = error == JVMTI_ERROR_ABSENT_INFORMATION;
+    if (error != JVMTI_ERROR_NONE && !inferSlots) {
+        if (suspendedHere) gJvmti->ResumeThread(thread);
+        env->DeleteLocalRef(thread);
+        ThrowJvmti(env, "GetLocalVariableTable for debugger locals", error);
+        return nullptr;
+    }
+
+    if (inferSlots) {
+        jint maxLocals = 0;
+        error = gJvmti->GetMaxLocals(method, &maxLocals);
+        if (error != JVMTI_ERROR_NONE) {
+            if (suspendedHere) gJvmti->ResumeThread(thread);
+            env->DeleteLocalRef(thread);
+            ThrowJvmti(env, "GetMaxLocals for inferred debugger locals", error);
+            return nullptr;
+        }
+        jclass rowClass = env->FindClass("[Ljava/lang/Object;");
+        jclass objectClass = env->FindClass("java/lang/Object");
+        jobjectArray result = rowClass == nullptr || objectClass == nullptr ? nullptr
+            : env->NewObjectArray(maxLocals, rowClass, nullptr);
+        if (rowClass != nullptr) env->DeleteLocalRef(rowClass);
+        if (result != nullptr) {
+            for (jint slot = 0; slot < maxLocals; ++slot) {
+                jobjectArray row = env->NewObjectArray(8, objectClass, nullptr);
+                if (row == nullptr) break;
+                SetDebuggerLocalText(env, row, 0, "slot" + std::to_string(slot));
+                SetDebuggerLocalText(env, row, 2, "inferred:maxLocals:no-LVT");
+                SetDebuggerLocalText(env, row, 3, std::to_string(slot));
+                SetDebuggerLocalText(env, row, 4, "0");
+                SetDebuggerLocalText(env, row, 5, "-1");
+
+                char kind = '\0';
+                jvalue value{};
+                jvmtiError valueError = gJvmti->GetLocalObject(thread, depth, slot, &value.l);
+                if (valueError == JVMTI_ERROR_NONE) kind = 'L';
+                if (kind == '\0') {
+                    jint integer = 0;
+                    valueError = gJvmti->GetLocalInt(thread, depth, slot, &integer);
+                    if (valueError == JVMTI_ERROR_NONE) { kind = 'I'; value.i = integer; }
+                }
+                if (kind == '\0') {
+                    valueError = gJvmti->GetLocalLong(thread, depth, slot, &value.j);
+                    if (valueError == JVMTI_ERROR_NONE) kind = 'J';
+                }
+                if (kind == '\0') {
+                    valueError = gJvmti->GetLocalFloat(thread, depth, slot, &value.f);
+                    if (valueError == JVMTI_ERROR_NONE) kind = 'F';
+                }
+                if (kind == '\0') {
+                    valueError = gJvmti->GetLocalDouble(thread, depth, slot, &value.d);
+                    if (valueError == JVMTI_ERROR_NONE) kind = 'D';
+                }
+                const std::string descriptor = kind == '\0' ? "?" :
+                    kind == 'L' ? "Ljava/lang/Object;" : std::string(1, kind);
+                SetDebuggerLocalText(env, row, 1, descriptor);
+                if (kind != '\0') {
+                    jobject boxed = BoxValue(env, kind, value);
+                    if (boxed != nullptr) {
+                        env->SetObjectArrayElement(row, 6, boxed);
+                        env->DeleteLocalRef(boxed);
+                    }
+                } else {
+                    SetDebuggerLocalText(env, row, 7,
+                        "not live or continuation slot at current BCI");
+                }
+                env->SetObjectArrayElement(result, slot, row);
+                env->DeleteLocalRef(row);
+            }
+        }
+        if (objectClass != nullptr) env->DeleteLocalRef(objectClass);
+        const jvmtiError resumeError = suspendedHere
+            ? gJvmti->ResumeThread(thread) : JVMTI_ERROR_NONE;
+        env->DeleteLocalRef(thread);
+        if (resumeError != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Resume debugger thread after inferred local access", resumeError);
+        }
+        return result;
+    }
+
+    std::vector<jint> active;
+    active.reserve(static_cast<std::size_t>(count));
+    for (jint index = 0; index < count; ++index) {
+        const jvmtiLocalVariableEntry& entry = table[index];
+        if (entry.length <= 0) continue;
+        const jlocation end = entry.start_location <= (std::numeric_limits<jlocation>::max)() - entry.length
+            ? entry.start_location + entry.length
+            : (std::numeric_limits<jlocation>::max)();
+        if (location >= entry.start_location && location < end) active.push_back(index);
+    }
+
+    jclass rowClass = env->FindClass("[Ljava/lang/Object;");
+    jclass objectClass = env->FindClass("java/lang/Object");
+    jobjectArray result = rowClass == nullptr || objectClass == nullptr ? nullptr
+        : env->NewObjectArray(static_cast<jsize>(active.size()), rowClass, nullptr);
+    if (rowClass != nullptr) env->DeleteLocalRef(rowClass);
+    if (result != nullptr) {
+        for (jsize resultIndex = 0; resultIndex < static_cast<jsize>(active.size()); ++resultIndex) {
+            const jvmtiLocalVariableEntry& entry = table[active[resultIndex]];
+            jobjectArray row = env->NewObjectArray(8, objectClass, nullptr);
+            if (row == nullptr) break;
+            SetDebuggerLocalText(env, row, 0, entry.name == nullptr ? "" : entry.name);
+            SetDebuggerLocalText(env, row, 1, entry.signature == nullptr ? "" : entry.signature);
+            SetDebuggerLocalText(env, row, 2,
+                entry.generic_signature == nullptr ? "" : entry.generic_signature);
+            SetDebuggerLocalText(env, row, 3, std::to_string(entry.slot));
+            SetDebuggerLocalText(env, row, 4, std::to_string(entry.start_location));
+            SetDebuggerLocalText(env, row, 5, std::to_string(entry.length));
+
+            const char kind = entry.signature == nullptr || entry.signature[0] == '\0'
+                ? '\0' : entry.signature[0];
+            jvalue value{};
+            jvmtiError valueError = JVMTI_ERROR_TYPE_MISMATCH;
+            switch (kind) {
+            case 'Z': case 'B': case 'C': case 'S': case 'I': {
+                jint integer = 0;
+                valueError = gJvmti->GetLocalInt(thread, depth, entry.slot, &integer);
+                if (kind == 'Z') value.z = static_cast<jboolean>(integer);
+                else if (kind == 'B') value.b = static_cast<jbyte>(integer);
+                else if (kind == 'C') value.c = static_cast<jchar>(integer);
+                else if (kind == 'S') value.s = static_cast<jshort>(integer);
+                else value.i = integer;
+                break;
+            }
+            case 'J': valueError = gJvmti->GetLocalLong(thread, depth, entry.slot, &value.j); break;
+            case 'F': valueError = gJvmti->GetLocalFloat(thread, depth, entry.slot, &value.f); break;
+            case 'D': valueError = gJvmti->GetLocalDouble(thread, depth, entry.slot, &value.d); break;
+            case 'L': case '[':
+                valueError = gJvmti->GetLocalObject(thread, depth, entry.slot, &value.l);
+                break;
+            default: break;
+            }
+            if (valueError == JVMTI_ERROR_NONE) {
+                jobject boxed = BoxValue(env, kind, value);
+                if (boxed != nullptr) {
+                    env->SetObjectArrayElement(row, 6, boxed);
+                    env->DeleteLocalRef(boxed);
+                }
+            } else {
+                SetDebuggerLocalText(env, row, 7, JvmtiErrorText(valueError));
+            }
+            env->SetObjectArrayElement(result, resultIndex, row);
+            env->DeleteLocalRef(row);
+        }
+    }
+    if (objectClass != nullptr) env->DeleteLocalRef(objectClass);
+    for (jint index = 0; index < count; ++index) {
+        if (table[index].name != nullptr) {
+            gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table[index].name));
+        }
+        if (table[index].signature != nullptr) {
+            gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table[index].signature));
+        }
+        if (table[index].generic_signature != nullptr) {
+            gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table[index].generic_signature));
+        }
+    }
+    if (table != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(table));
+    const jvmtiError resumeError = suspendedHere ? gJvmti->ResumeThread(thread) : JVMTI_ERROR_NONE;
+    env->DeleteLocalRef(thread);
+    if (resumeError != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Resume debugger thread after local access", resumeError);
+    }
+    return result;
+}
+
+static bool ResumeDebuggerStop(JNIEnv* env, const std::shared_ptr<DebuggerStop>& stop, jint action) {
+    if (stop == nullptr || !stop->paused || stop->thread == nullptr) return false;
+    if (action != 0 && action != 1) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Debugger action must be 0 (continue) or 1 (step)");
+        return false;
+    }
+    jvmtiError error = gJvmti->SetEventNotificationMode(
+        action == 1 ? JVMTI_ENABLE : JVMTI_DISABLE,
+        JVMTI_EVENT_SINGLE_STEP, static_cast<jthread>(stop->thread));
+    if (error != JVMTI_ERROR_NONE && !(action == 0 && error == JVMTI_ERROR_NOT_AVAILABLE)) {
+        ThrowJvmti(env, action == 1 ? "Enable single-step" : "Disable single-step", error);
+        return false;
+    }
+    if (stop->externallySuspended) {
+        error = gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+        if (error != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Resume selected debugger thread", error);
+            return false;
+        }
+    }
+    stop->paused = false;
+    return true;
+}
+
+static void ReleaseResumedExternalStops(JNIEnv* env) {
+    std::vector<jobject> release;
+    for (auto iterator = gDebuggerStops.begin(); iterator != gDebuggerStops.end();) {
+        const std::shared_ptr<DebuggerStop>& stop = *iterator;
+        if (!stop->paused && stop->externallySuspended) {
+            release.push_back(stop->thread);
+            iterator = gDebuggerStops.erase(iterator);
+        } else ++iterator;
+    }
+    for (jobject reference : release) env->DeleteGlobalRef(reference);
+}
+
+void JNICALL NativeDebuggerResume(JNIEnv* env, jclass, jint action) {
+    std::lock_guard<std::mutex> guard(gDebuggerMutex);
+    for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+        if (ResumeDebuggerStop(env, stop, action)) {
+            ReleaseResumedExternalStops(env);
+            gDebuggerChanged.notify_all();
+            return;
+        }
+        if (env->ExceptionCheck()) return;
+    }
+    ThrowJava(env, "java/lang/IllegalStateException", "No debugger thread is paused");
+}
+
+void JNICALL NativeDebuggerResumeThread(JNIEnv* env, jclass, jobject thread, jint action) {
+    std::lock_guard<std::mutex> guard(gDebuggerMutex);
+    bool resumed = false;
+    for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+        if (thread != nullptr && !env->IsSameObject(thread, stop->thread)) continue;
+        if (ResumeDebuggerStop(env, stop, action)) resumed = true;
+        if (env->ExceptionCheck() || (thread != nullptr && resumed)) break;
+    }
+    if (env->ExceptionCheck()) return;
+    if (!resumed) {
+        ThrowJava(env, "java/lang/IllegalStateException", "Selected debugger thread is not paused");
+        return;
+    }
+    ReleaseResumedExternalStops(env);
+    gDebuggerChanged.notify_all();
 }
 
 void JNICALL NativeSetFieldWatch(JNIEnv* env, jclass, jclass klass, jstring fieldNameValue,
@@ -1592,6 +2341,15 @@ void JNICALL NativeSetFieldWatch(JNIEnv* env, jclass, jclass klass, jstring fiel
     } else {
         error = gJvmti->ClearFieldAccessWatch(klass, field);
         operation = "ClearFieldAccessWatch";
+    }
+    if (error == JVMTI_ERROR_NONE && enabled == JNI_TRUE) {
+        const jvmtiEvent event = modification == JNI_TRUE
+            ? JVMTI_EVENT_FIELD_MODIFICATION : JVMTI_EVENT_FIELD_ACCESS;
+        const jvmtiError eventError = gJvmti->SetEventNotificationMode(JVMTI_ENABLE, event, nullptr);
+        if (eventError != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Enable field watch debugger event", eventError);
+            return;
+        }
     }
     ThrowJvmti(env, operation, error);
 }
@@ -1620,7 +2378,9 @@ void JNICALL NativeRetransformClass(JNIEnv* env, jclass, jclass klass) {
         ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
         return;
     }
-    ThrowJvmti(env, "RetransformClasses", gJvmti->RetransformClasses(1, &klass));
+    jvmtiError error = gJvmti->RetransformClasses(1, &klass);
+    if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
+    ThrowJvmti(env, "RetransformClasses", error);
 }
 
 void JNICALL NativeRedefineClass(JNIEnv* env, jclass, jclass klass, jbyteArray classBytes) {
@@ -1635,7 +2395,8 @@ void JNICALL NativeRedefineClass(JNIEnv* env, jclass, jclass klass, jbyteArray c
     definition.klass = klass;
     definition.class_byte_count = length;
     definition.class_bytes = reinterpret_cast<unsigned char*>(bytes);
-    const jvmtiError error = gJvmti->RedefineClasses(1, &definition);
+    jvmtiError error = gJvmti->RedefineClasses(1, &definition);
+    if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
     env->ReleaseByteArrayElements(classBytes, bytes, JNI_ABORT);
     ThrowJvmti(env, "RedefineClasses", error);
 }
@@ -2474,6 +3235,21 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("setBreakpoint"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZ)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
+    {const_cast<char*>("debuggerConfigure"), const_cast<char*>("(Z)V"),
+     reinterpret_cast<void*>(&NativeDebuggerConfigure)},
+    {const_cast<char*>("debuggerSnapshot"), const_cast<char*>("()[Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeDebuggerSnapshot)},
+    {const_cast<char*>("debuggerSnapshots"), const_cast<char*>("()[[Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeDebuggerSnapshots)},
+    {const_cast<char*>("debuggerResume"), const_cast<char*>("(I)V"),
+     reinterpret_cast<void*>(&NativeDebuggerResume)},
+    {const_cast<char*>("debuggerResumeThread"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
+     reinterpret_cast<void*>(&NativeDebuggerResumeThread)},
+    {const_cast<char*>("debuggerPauseThread"),
+     const_cast<char*>("(Ljava/lang/Thread;Ljava/lang/String;)V"),
+     reinterpret_cast<void*>(&NativeDebuggerPauseThread)},
+    {const_cast<char*>("debuggerLocals"), const_cast<char*>("(Ljava/lang/Thread;I)[[Ljava/lang/Object;"),
+     reinterpret_cast<void*>(&NativeDebuggerLocals)},
     {const_cast<char*>("setFieldWatch"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZ)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatch)},
@@ -2753,14 +3529,22 @@ extern "C" JNIEXPORT jint JNICALL JVMRTDP_InitializeJavaBridge(
     return InitializeJavaBridge(vm, env, true, classLoader) ? JNI_OK : JNI_ERR;
 }
 
-extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char*, void*) {
+extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options, void*) {
     if (vm == nullptr || vm->GetEnv(reinterpret_cast<void**>(&gJvmti), JVMTI_VERSION_1_2) != JNI_OK
         || gJvmti == nullptr) return JNI_ERR;
     gJavaVm = vm;
     gLoadedAsJvmtiAgent.store(true);
+    ConfigureStartupDebugger(options);
     if (!RequestAllCapabilities() || !InstallJvmtiCallbacks()) return JNI_ERR;
     if (gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, nullptr)
         != JVMTI_ERROR_NONE) return JNI_ERR;
+    if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()) {
+        if (gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, nullptr)
+                != JVMTI_ERROR_NONE
+            || gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_BREAKPOINT, nullptr)
+                != JVMTI_ERROR_NONE) return JNI_ERR;
+        gStartupClassPrepareOwned.store(true);
+    }
     return JNI_OK;
 }
 
@@ -2779,6 +3563,18 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        gDebuggerEnabled = false;
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop->paused && stop->externallySuspended && stop->thread != nullptr
+                    && gJvmti != nullptr) {
+                gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+            }
+            stop->paused = false;
+        }
+    }
+    gDebuggerChanged.notify_all();
     if (gJvmti != nullptr) {
         jvmtiEventCallbacks callbacks{};
         gJvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
@@ -2797,6 +3593,13 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm != nullptr && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) == JNI_OK
         && env != nullptr) {
+        {
+            std::lock_guard<std::mutex> guard(gBreakpointMutex);
+            for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+                if (breakpoint.klass != nullptr) env->DeleteGlobalRef(breakpoint.klass);
+            }
+            gPersistentBreakpoints.clear();
+        }
         if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
         ReleaseCallbackTypes(env);
     }
@@ -2804,6 +3607,15 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     gDispatchMethod = nullptr;
     gTransformMethod = nullptr;
     gClassFileHookEnabled.store(false);
+    gStartupBreakpointInstalled = false;
+    gStartupClinitBreakpointInstalled = false;
+    gStartupMainMethod = nullptr;
+    gStartupMainLocation = 0;
+    gStartupClinitMethod = nullptr;
+    gStartupClinitLocation = 0;
+    gStartupMainClass.clear();
+    gStartupClinitClass.clear();
+    gStartupClassPrepareOwned.store(false);
     gCallbacksInstalled.store(false);
     gCapabilitiesRequested.store(false);
     gLoadedAsJvmtiAgent.store(false);

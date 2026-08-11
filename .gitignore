@@ -57,3 +57,4 @@ CPPProjects/**/*.VC.opendb
 .DS_Store
 Thumbs.db
 Desktop.ini
+/run.cmd

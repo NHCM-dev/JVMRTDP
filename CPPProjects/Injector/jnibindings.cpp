@@ -272,16 +272,32 @@ bool WriteRemote(HANDLE process, LPVOID destination, const void* source, SIZE_T 
     return WriteProcessMemory(process, destination, source, size, &written) != FALSE && written == size;
 }
 
+DWORD NtStatusToWindowsError(NTSTATUS status) {
+    using RtlNtStatusToDosErrorFunction = ULONG(WINAPI*)(NTSTATUS);
+    const auto convert = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    if (convert == nullptr) return ERROR_GEN_FAILURE;
+    const ULONG error = convert(status);
+    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : static_cast<DWORD>(error);
+}
+
 HANDLE StartRemoteThread(HANDLE process, LPTHREAD_START_ROUTINE start, void* argument) {
     using NtCreateThreadExFunction = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE,
         PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
     const auto createThread = reinterpret_cast<NtCreateThreadExFunction>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
-    if (createThread == nullptr || start == nullptr) return nullptr;
+    if (createThread == nullptr || start == nullptr) {
+        SetLastError(createThread == nullptr ? ERROR_PROC_NOT_FOUND : ERROR_INVALID_ADDRESS);
+        return nullptr;
+    }
     HANDLE thread = nullptr;
-    const NTSTATUS status = createThread(&thread, THREAD_ALL_ACCESS, nullptr, process,
+    const NTSTATUS status = createThread(&thread, THREAD_QUERY_INFORMATION | SYNCHRONIZE,
+        nullptr, process,
         reinterpret_cast<void*>(start), argument, 0, 0, 0, 0, nullptr);
-    return status >= 0 ? thread : nullptr;
+    if (status >= 0 && thread != nullptr) return thread;
+    if (thread != nullptr) CloseHandle(thread);
+    SetLastError(NtStatusToWindowsError(status));
+    return nullptr;
 }
 
 std::uintptr_t PublishedInjectorBase(HANDLE process, DWORD pid) {

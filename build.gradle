@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'nhcm.jvmrtdp'
-version = '1.2.0'
+version = '2.0.0'
 
 java {
     toolchain {
@@ -21,15 +21,93 @@ repositories {
 }
 
 dependencies {
+    implementation 'org.jline:jline:3.30.0'
+    runtimeOnly 'org.jline:jline-terminal-jni:3.30.0'
     testImplementation platform('org.junit:junit-bom:5.12.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+def cfrSourceRoot = file('../cfr')
+def procyonSourceRoot = file('../procyon')
+def decompilerBuildRoot = layout.buildDirectory.dir('decompiler-sources')
+def cfrGeneratedSources = decompilerBuildRoot.map { it.dir('cfr-generated') }
+def cfrClasses = decompilerBuildRoot.map { it.dir('cfr-classes') }
+def procyonCoreClasses = decompilerBuildRoot.map { it.dir('procyon-core-classes') }
+def procyonCompilerClasses = decompilerBuildRoot.map { it.dir('procyon-compiler-classes') }
+
+tasks.register('generateCfrVersionSource') {
+    inputs.file(cfrSourceRoot.toPath().resolve('pom.xml').toFile())
+    outputs.file(cfrGeneratedSources.map {
+        it.file('org/benf/cfr/reader/util/CfrVersionInfo.java')
+    })
+    doLast {
+        def output = cfrGeneratedSources.get()
+                .file('org/benf/cfr/reader/util/CfrVersionInfo.java').asFile
+        output.parentFile.mkdirs()
+        output.text = '''package org.benf.cfr.reader.util;
+
+/** Generated for JVMRTDP's source-built CFR integration. */
+public final class CfrVersionInfo {
+    public static final String VERSION = "0.153-SNAPSHOT";
+    public static final boolean SNAPSHOT = true;
+    public static final String GIT_COMMIT_ABBREVIATED = "local-source";
+    public static final boolean GIT_IS_DIRTY = true;
+    public static final String VERSION_INFO = VERSION + " (local-source)";
+    private CfrVersionInfo() {}
+}
+'''
+    }
+}
+
+tasks.register('compileCfrSources', JavaCompile) {
+    dependsOn 'generateCfrVersionSource'
+    source fileTree(cfrSourceRoot.toPath().resolve('src').toFile()) { include '**/*.java' }
+    source cfrGeneratedSources
+    destinationDirectory = cfrClasses
+    classpath = files()
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(8) }
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+    options.encoding = 'UTF-8'
+}
+
+tasks.register('compileProcyonCoreSources', JavaCompile) {
+    source fileTree(procyonSourceRoot.toPath().resolve('Procyon.Core/src/main/java').toFile()) {
+        include '**/*.java'
+    }
+    destinationDirectory = procyonCoreClasses
+    classpath = files()
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(8) }
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+    options.encoding = 'UTF-8'
+}
+
+tasks.register('compileProcyonCompilerSources', JavaCompile) {
+    dependsOn 'compileProcyonCoreSources'
+    source fileTree(procyonSourceRoot.toPath().resolve('Procyon.CompilerTools/src/main/java').toFile()) {
+        include '**/*.java'
+    }
+    destinationDirectory = procyonCompilerClasses
+    classpath = files(procyonCoreClasses)
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(8) }
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+    options.encoding = 'UTF-8'
+}
+
+sourceSets.main.compileClasspath += files(cfrClasses, procyonCoreClasses, procyonCompilerClasses)
+sourceSets.main.runtimeClasspath += files(cfrClasses, procyonCoreClasses, procyonCompilerClasses)
+dependencies {
+    implementation files(cfrClasses, procyonCoreClasses, procyonCompilerClasses)
 }
 
 def isWindows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
 def msbuildExecutable = providers.gradleProperty('msbuild')
         .orElse('C:/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe')
 def nativeOutput = layout.projectDirectory.dir('natives/x64/Release')
+def agentNativeOutput = layout.buildDirectory.dir('native-output/agent/x64/Release')
 def generatedNativeResources = layout.buildDirectory.dir('generated-resources')
 def generatedVersionSources = layout.buildDirectory.dir('generated/sources/version/java')
 def java8Launcher = javaToolchains.launcherFor {
@@ -54,17 +132,21 @@ tasks.register('buildInjectorNative', Exec) {
 
 tasks.register('buildAgentNative', Exec) {
     group = 'build'
-    description = 'Builds the x64 Release target-side JNI/JVMTI DLL.'
+    description = 'Builds the x64 Release target-side JNI/JVMTI DLL under a staging-only file name.'
     onlyIf { isWindows }
     inputs.files(fileTree('CPPProjects/JVMRTDP') {
         include '**/*.cpp', '**/*.h', '**/*.vcxproj'
     })
-    outputs.file(nativeOutput.file('jvmrtdp-agent.dll'))
-    commandLine msbuildExecutable.get(),
-            file('CPPProjects/JVMRTDP/JVMRTDP.vcxproj'),
-            '/m', '/t:Build', '/p:Configuration=Release', '/p:Platform=x64'
+    outputs.file(agentNativeOutput.map { it.file('jvmrtdp-agent-build.dll') })
     doFirst {
         environment 'JAVA_HOME', java8Launcher.get().metadata.installationPath.asFile.absolutePath
+        def output = agentNativeOutput.get().asFile
+        output.mkdirs()
+        commandLine msbuildExecutable.get(),
+                file('CPPProjects/JVMRTDP/JVMRTDP.vcxproj'),
+                '/m', '/t:Build', '/p:Configuration=Release', '/p:Platform=x64',
+                '/p:TargetName=jvmrtdp-agent-build',
+                "/p:OutDir=${output.absolutePath}\\"
     }
 }
 
@@ -74,13 +156,27 @@ tasks.register('buildNative') {
     dependsOn 'buildInjectorNative', 'buildAgentNative'
 }
 
+tasks.register('publishAgentNative', Copy) {
+    group = 'build'
+    description = 'Copies the staged agent DLL to natives/x64/Release after target JVMs release it.'
+    dependsOn 'buildAgentNative'
+    from(agentNativeOutput)
+    include 'jvmrtdp-agent-build.dll', 'jvmrtdp-agent-build.pdb',
+            'jvmrtdp-agent-build.lib', 'jvmrtdp-agent-build.exp'
+    rename(/jvmrtdp-agent-build\.(.+)/, 'jvmrtdp-agent.$1')
+    into(nativeOutput)
+}
+
 tasks.register('copyNativeLibraries', Sync) {
     group = 'build'
     description = 'Synchronizes the built DLLs into the generated JAR resources.'
     dependsOn 'buildNative'
     onlyIf { isWindows }
-    from(nativeOutput)
-    include 'jvmrtdp-injector.dll', 'jvmrtdp-agent.dll'
+    from(nativeOutput) { include 'jvmrtdp-injector.dll' }
+    from(agentNativeOutput) {
+        include 'jvmrtdp-agent-build.dll'
+        rename 'jvmrtdp-agent-build.dll', 'jvmrtdp-agent.dll'
+    }
     into(generatedNativeResources.map { it.dir('natives/windows-x86_64') })
 }
 
@@ -122,7 +218,8 @@ public final class BuildInfo {
 }
 
 tasks.named('compileJava') {
-    dependsOn tasks.named('generateBuildInfo')
+    dependsOn tasks.named('generateBuildInfo'), tasks.named('compileCfrSources'),
+            tasks.named('compileProcyonCompilerSources')
 }
 
 tasks.named('processResources') {
@@ -145,6 +242,14 @@ tasks.named('test') {
 
 jar {
     archiveBaseName = 'JVMRTDP'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(cfrClasses)
+    from(procyonCoreClasses)
+    from(procyonCompilerClasses)
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
     manifest {
         attributes(
                 'Main-Class': 'nhcm.jvmrtdp.JVMRuntimeDump',

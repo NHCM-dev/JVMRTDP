@@ -13,6 +13,7 @@ public class RemoteMethod extends RemoteHandle {
     private final String name;
     private final String descriptor;
     private final int modifiers;
+    private final boolean jvmSpecial;
 
     public RemoteMethod(
             ServerHandle server,
@@ -22,12 +23,29 @@ public class RemoteMethod extends RemoteHandle {
             String name,
             String descriptor,
             int modifiers) {
+        this(server, remoteId, owner, declaringClass, name, descriptor, modifiers, false);
+    }
+
+    private RemoteMethod(ServerHandle server, long remoteId, RemoteClass owner,
+            String declaringClass, String name, String descriptor, int modifiers,
+            boolean jvmSpecial) {
         super(server, remoteId);
         this.owner = owner;
         this.declaringClass = declaringClass;
         this.name = name;
         this.descriptor = descriptor;
         this.modifiers = modifiers;
+        this.jvmSpecial = jvmSpecial;
+    }
+
+    /** A classfile/JVMTI-only lifecycle method used for bytecode, source and breakpoints. */
+    public static RemoteMethod jvmSpecial(RemoteClass owner, String name,
+            String descriptor, int modifiers) {
+        if (!"<init>".equals(name) && !"<clinit>".equals(name)) {
+            throw new IllegalArgumentException("Not a JVM lifecycle method: " + name);
+        }
+        return new RemoteMethod(owner.server(), allocateRemoteId(), owner, owner.className(),
+                name, descriptor, modifiers, true);
     }
 
     public RemoteClass owner() {
@@ -62,7 +80,21 @@ public class RemoteMethod extends RemoteHandle {
         return Modifier.isStatic(modifiers);
     }
 
+    public boolean isNative() { return Modifier.isNative(modifiers); }
+
+    public boolean isAbstract() { return Modifier.isAbstract(modifiers); }
+
+    public boolean isJvmSpecial() { return jvmSpecial; }
+
+    public String implementationKind() {
+        return isNative() ? "NATIVE" : isAbstract() ? "ABSTRACT" : "BYTECODE";
+    }
+
     public RemoteObject call(RemoteObject receiver, RemoteObject... arguments) {
+        if (jvmSpecial) {
+            throw new UnsupportedOperationException(name
+                    + " is exposed for analysis/breakpoints and cannot be invoked as java.lang.reflect.Method");
+        }
         return owner.jniEnv().call(this, receiver, arguments);
     }
 

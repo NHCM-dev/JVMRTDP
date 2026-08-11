@@ -33,6 +33,25 @@ public class RemoteJNIEnv extends RemoteHandle {
         return new RemoteClass(server(), allocateRemoteId(), className, this, server().javaVM().jvmtiEnv());
     }
 
+    /** Executes Class.forName with initialization in the target JVM and returns its class handle. */
+    public RemoteClass forceLoadClass(String className) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Class name must not be empty");
+        }
+        String loadedName = executeForOutput(CommandLine.of("object", "class.load", className.trim()));
+        return findClass(loadedName);
+    }
+
+    /** Starts initialization on a debugger-visible target thread and returns after linking. */
+    public RemoteClass startForceLoadClass(String className) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Class name must not be empty");
+        }
+        String loadedName = executeForOutput(CommandLine.of(
+                "object", "class.load.start", className.trim()));
+        return findClass(loadedName);
+    }
+
     public RemotePackage findPackage(String packageName) {
         String output = executeForOutput(CommandLine.of("object", "package", packageName));
         List<String> packages = new ArrayList<String>();

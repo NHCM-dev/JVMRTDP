@@ -20,6 +20,24 @@ public class TargetObjectRegistry implements AutoCloseable {
         return store(value, value == null ? Object.class.getName() : value.getClass().getName());
     }
 
+    /** Stores a value without invoking application-defined {@code toString()} code. */
+    public RemoteObjectDescriptor storeOpaque(Object value) {
+        String type = value == null ? Object.class.getName() : value.getClass().getName();
+        long id = ids.getAndIncrement();
+        objects.put(id, new Entry(value == null ? NULL : value, type));
+        String display;
+        if (value == null) display = "null";
+        else if (value instanceof String || value instanceof Number
+                || value instanceof Boolean || value instanceof Character) {
+            display = String.valueOf(value);
+        } else if (value instanceof Enum<?>) {
+            display = ((Enum<?>) value).name();
+        } else {
+            display = type + "@" + Integer.toHexString(System.identityHashCode(value)) + sizeSuffix(value);
+        }
+        return new RemoteObjectDescriptor(id, value == null, type, display);
+    }
+
     public RemoteObjectDescriptor store(Object value, String declaredType) {
         long id = ids.getAndIncrement();
         objects.put(id, new Entry(value == null ? NULL : value, declaredType));

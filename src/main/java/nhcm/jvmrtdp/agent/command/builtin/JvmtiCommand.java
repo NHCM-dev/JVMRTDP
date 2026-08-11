@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
+import java.util.IdentityHashMap;
 
 /** Target-side JVMTI operation surface. */
 public class JvmtiCommand implements RemoteCommand {
@@ -28,7 +29,9 @@ public class JvmtiCommand implements RemoteCommand {
                 + "phase|time|timer-info|current-thread.cpu-time|processors|location-format|"
                 + "class.info|class.interfaces|class.loader-classes|class.source-debug|class.constant-pool|"
                 + "method.info|method.bytecodes|method.lines|field.info|events|events.generate|verbose|retransform|redefine|"
-                + "breakpoint|watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
+                + "breakpoint|debug.enable|debug.disable|debug.status|debug.status-all|debug.continue|"
+                + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.locals|"
+                + "watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
                 + "thread.cpu-time|thread.owned-monitors|thread.contended-monitor|thread.suspend|thread.resume|"
                 + "thread.interrupt|thread.frame-pop|object.size|object.hash|object.monitor-usage|"
                 + "tag.get|tag.set|tag.objects|gc|properties|property.get|property.set> ...";
@@ -170,6 +173,58 @@ public class JvmtiCommand implements RemoteCommand {
                     arguments.get(4), Long.parseLong(arguments.get(5)), enabled);
             return success("ok");
         }
+        if ("debug.enable".equals(operation) && arguments.size() == 1) {
+            NativeAgent.configureDebugger(true);
+            return success("ok");
+        }
+        if ("debug.disable".equals(operation) && arguments.size() == 1) {
+            NativeAgent.configureDebugger(false);
+            return success("ok");
+        }
+        if ("debug.status".equals(operation) && arguments.size() == 1) {
+            return success(encodeDebuggerState(handle, NativeAgent.debuggerSnapshot()));
+        }
+        if ("debug.status-all".equals(operation) && arguments.size() == 1) {
+            List<String> rows = new ArrayList<String>();
+            for (Object[] state : NativeAgent.debuggerSnapshots()) {
+                rows.add(encodeDebuggerState(handle, state));
+            }
+            return success(join(rows));
+        }
+        if (("debug.continue".equals(operation) || "debug.step".equals(operation))
+                && arguments.size() == 1) {
+            NativeAgent.resumeDebugger("debug.step".equals(operation));
+            return success("ok");
+        }
+        if (("debug.continue-thread".equals(operation) || "debug.step-thread".equals(operation))
+                && arguments.size() == 2) {
+            NativeAgent.resumeDebugger(thread(handle, arguments.get(1)),
+                    "debug.step-thread".equals(operation));
+            return success("ok");
+        }
+        if ("debug.pause-thread".equals(operation)
+                && (arguments.size() == 2 || arguments.size() == 3)) {
+            NativeAgent.pauseDebugger(thread(handle, arguments.get(1)),
+                    arguments.size() == 3 ? arguments.get(2) : "manual_pause");
+            return success("ok");
+        }
+        if ("debug.continue-all".equals(operation) && arguments.size() == 1) {
+            NativeAgent.resumeDebugger(null, false);
+            return success("ok");
+        }
+        if ("debug.locals".equals(operation) && arguments.size() == 3) {
+            List<String> rows = new ArrayList<String>();
+            Object[][] locals = NativeAgent.debuggerLocals(thread(handle, arguments.get(1)),
+                    Integer.parseInt(arguments.get(2)));
+            for (Object[] local : locals) {
+                RemoteObjectDescriptor value = handle.targetObjects().storeExternalOpaque(local[6]);
+                rows.add(TextWireCodec.encode(String.valueOf(local[0]), String.valueOf(local[1]),
+                        String.valueOf(local[2]), String.valueOf(local[3]), String.valueOf(local[4]),
+                        String.valueOf(local[5]), value.encode(),
+                        local[7] == null ? "" : String.valueOf(local[7])));
+            }
+            return success(join(rows));
+        }
         if ("watch".equals(operation) && arguments.size() == 6) {
             boolean modification;
             if ("access".equalsIgnoreCase(arguments.get(1))) modification = false;
@@ -182,10 +237,24 @@ public class JvmtiCommand implements RemoteCommand {
         }
         if ("threads".equals(operation) && arguments.size() == 1) {
             List<String> rows = new ArrayList<String>();
+            IdentityHashMap<Thread, Boolean> debuggerPaused = new IdentityHashMap<Thread, Boolean>();
+            for (Object[] state : NativeAgent.debuggerSnapshots()) {
+                if (state.length > 2 && state[0] instanceof Thread
+                        && Boolean.parseBoolean(String.valueOf(state[2]))) {
+                    debuggerPaused.put((Thread) state[0], Boolean.TRUE);
+                }
+            }
             for (Thread thread : NativeAgent.getAllThreads()) {
                 RemoteObjectDescriptor descriptor = handle.targetObjects().storeExternal(thread);
+                String[] info;
+                try { info = NativeAgent.threadInfo(thread); }
+                catch (RuntimeException unavailable) {
+                    info = new String[] { thread.getName(), Integer.toString(thread.getPriority()),
+                            Boolean.toString(thread.isDaemon()), "", "", "0" };
+                }
                 rows.add(TextWireCodec.encode(descriptor.encode(),
-                        Integer.toString(NativeAgent.getThreadState(thread))));
+                        Integer.toString(NativeAgent.getThreadState(thread)), info[0], info[1], info[2],
+                        Boolean.toString(debuggerPaused.containsKey(thread))));
             }
             return success(join(rows));
         }
@@ -271,6 +340,14 @@ public class JvmtiCommand implements RemoteCommand {
             return success(join(rows));
         }
         return invalid();
+    }
+
+    private static String encodeDebuggerState(JRDHandle handle, Object[] state) {
+        String thread = state[0] == null ? "" : handle.targetObjects().storeExternal(state[0]).encode();
+        return TextWireCodec.encode(thread,
+                String.valueOf(state[1]), String.valueOf(state[2]), String.valueOf(state[3]),
+                String.valueOf(state[4]), String.valueOf(state[5]), String.valueOf(state[6]),
+                String.valueOf(state[7]), String.valueOf(state[8]), String.valueOf(state[9]));
     }
 
     private static CommandReply capabilityStatusReply() {

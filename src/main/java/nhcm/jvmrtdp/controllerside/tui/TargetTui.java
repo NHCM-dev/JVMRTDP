@@ -1,0 +1,3476 @@
+package nhcm.jvmrtdp.controllerside.tui;
+
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
+import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
+import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
+import nhcm.jvmrtdp.controllerside.TargetSession;
+import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
+import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
+import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
+import nhcm.jvmrtdp.controllerside.analysis.ClassFileView;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.controllerside.analysis.DecompilationResult;
+import nhcm.jvmrtdp.handles.java.RemoteClass;
+import nhcm.jvmrtdp.handles.java.RemoteClassInfo;
+import nhcm.jvmrtdp.handles.java.RemoteField;
+import nhcm.jvmrtdp.handles.java.RemoteMapEntry;
+import nhcm.jvmrtdp.handles.java.RemoteMethod;
+import nhcm.jvmrtdp.handles.java.RemoteObject;
+import nhcm.jvmrtdp.handles.java.RemoteObjectDebugInfo;
+import nhcm.jvmrtdp.handles.java.RemotePackage;
+import nhcm.jvmrtdp.handles.jvm.RemoteJvmtiThread;
+import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
+import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
+
+import java.io.IOException;
+import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.function.Consumer;
+
+/** Context-oriented package browser and bytecode debugger for one attached JVM. */
+public final class TargetTui {
+    private enum Tab {
+        BROWSE, CONTEXT, FIELDS, METHODS, SOURCE, BYTECODE, DEBUG, FRAMES, LOCALS, BREAKPOINTS, THREADS
+    }
+
+    private final TargetSession session;
+    private final TerminalScreen screen;
+    private final TuiTaskRunner tasks = new TuiTaskRunner("JVMRTDP-TUI-worker");
+    private final int[] selections = new int[Tab.values().length];
+    private final int[] scrolls = new int[Tab.values().length];
+    private final int[] horizontalOffsets = new int[Tab.values().length];
+    private final List<TuiBrowserEntry> browserEntries = new ArrayList<TuiBrowserEntry>();
+    private final List<TuiBrowserEntry> visibleBrowserEntries = new ArrayList<TuiBrowserEntry>();
+    private final List<RemoteField> fields = new ArrayList<RemoteField>();
+    private final List<RemoteMethod> methods = new ArrayList<RemoteMethod>();
+    private final List<String> contextLines = new ArrayList<String>();
+    private final List<String> sourceLines = new ArrayList<String>();
+    private final List<String> debuggerStack = new ArrayList<String>();
+    private final List<JvmStackFrame> debuggerFrames = new ArrayList<JvmStackFrame>();
+    private final List<String> constantPool = new ArrayList<String>();
+    private final List<String> debugSearchResults = new ArrayList<String>();
+    private final List<JvmDebuggerState> debuggerStates = new ArrayList<JvmDebuggerState>();
+    private final List<JvmDebuggerLocal> debuggerLocals = new ArrayList<JvmDebuggerLocal>();
+    private final List<RemoteJvmtiThread> debuggerThreads = new ArrayList<RemoteJvmtiThread>();
+    private final List<String> lastDebuggerStack = new ArrayList<String>();
+    private final List<String> lastDebuggerLocals = new ArrayList<String>();
+    private final Map<String, BreakpointSpec> breakpoints = new LinkedHashMap<String, BreakpointSpec>();
+    private final Map<String, String> fieldWatches = new LinkedHashMap<String, String>();
+    private final Deque<String> errors = new ArrayDeque<String>();
+
+    private Tab tab = Tab.BROWSE;
+    private String packageName = "";
+    private String browserTitle = "package:<root>";
+    private String browserFilter = "";
+    private String memberFilter = "";
+    private String lastSearch = "";
+    private String viewSearch = "";
+    private boolean searchMode;
+    private boolean showRuntime;
+    private boolean showArrays;
+    private boolean showSpecialMethods;
+    private boolean hideInheritedObjectMethods;
+    private TuiBrowserEntry pendingMemberResult;
+    private RemoteClass contextClass;
+    private boolean classContext;
+    private RemoteMethod selectedMethod;
+    private DecompilerEngine engine = DecompilerEngine.CFR;
+    private String sourceTitle = "Select a context, then press A to decompile a class or S to decompile a method.";
+    private String sourceClass = "";
+    private String sourceMethod = "";
+    private String sourceDescriptor = "";
+    private final NavigableMap<Integer, Integer> sourceBciToLine = new TreeMap<Integer, Integer>();
+    private ClassFileMethod bytecode;
+    private String bytecodeClass = "";
+    private String bytecodeMethod = "";
+    private String bytecodeDescriptor = "";
+    private int pendingBytecodeLocation = -1;
+    private JvmDebuggerState debuggerState;
+    private int debuggerFrameDepth;
+    private DebuggerFreezeReport lastFreezeReport;
+    private long activeDebuggerSequence = -1L;
+    private long lastObservedStopSequence = -1L;
+    private String debuggerLocalsError = "";
+    private String lastStopSummary = "";
+    private long lastDebuggerPollAt;
+    private long lastDebuggerFullRefreshAt;
+    private long lastLiveSampleAt;
+    private String followedThreadName = "";
+    private boolean liveFollowEnabled = true;
+    private boolean liveSampleAvailable;
+    private long liveSampleCapturedAt;
+    private String liveSampleActual = "";
+    private String liveSampleView = "";
+    private String liveSampleError = "";
+    private int liveFollowFrameDepth = -1;
+    private Boolean inspectorVisibleOverride;
+    private boolean inspectorFocused;
+    private int inspectorScroll;
+    private int inspectorHorizontal;
+    private int statusPage;
+    private String pagedStatus = "";
+    private String status = "Opening root package...";
+
+    public TargetTui(TargetSession session, TerminalScreen screen) {
+        this.session = session;
+        this.screen = screen;
+        for (JvmBreakpointInfo breakpoint : session.jvmti().managedBreakpoints()) {
+            BreakpointSpec spec = new BreakpointSpec(breakpoint.className(), breakpoint.methodName(),
+                    breakpoint.descriptor(), breakpoint.location(), -1);
+            breakpoints.put(spec.id(), spec);
+        }
+        for (JvmFieldWatchInfo watch : session.jvmti().managedFieldWatches()) {
+            String id = watch.kind() + "|" + watch.className() + "|" + watch.fieldName()
+                    + "|" + watch.descriptor();
+            fieldWatches.put(id, watch.kind() + " " + watch.className() + "." + watch.fieldName());
+        }
+    }
+
+    public TuiResult run() throws IOException {
+        requestPackage("");
+        try {
+            while (session.server().isOpen() && !Thread.currentThread().isInterrupted()) {
+                tasks.poll();
+                maybeAutoRefreshDebugger();
+                render();
+                int key = screen.readKey(90L);
+                if (key == TuiKey.NONE) continue;
+                if (key == TuiKey.EOF) {
+                    releasePausedDebugger();
+                    return TuiResult.BACK;
+                }
+                try {
+                    TuiResult result = handleKey(key);
+                    if (result != null) return result;
+                } catch (RuntimeException failure) {
+                    recordError(failure);
+                }
+            }
+            return TuiResult.BACK;
+        } finally {
+            tasks.close();
+            closeDebuggerStates();
+        }
+    }
+
+    private TuiResult handleKey(int key) throws IOException {
+        if (key == TuiKey.F2 || key == 'c' || key == 'C') {
+            if (tasks.busy()) { status = "Operation is still running; switch to CLI when it finishes."; return null; }
+            return TuiResult.CLI;
+        }
+        if (key == 'q' || key == 'Q' || key == TuiKey.F10) {
+            if (tasks.busy()) { status = "Operation is still running; wait before detaching."; return null; }
+            releasePausedDebugger();
+            return TuiResult.BACK;
+        }
+        if (handleInspectorNavigation(key)) return null;
+        if (key == TuiKey.LEFT && horizontallyScrollable()) moveHorizontal(-8);
+        else if (key == TuiKey.RIGHT && horizontallyScrollable()) moveHorizontal(8);
+        else if (key == TuiKey.LEFT) changeTab(-1);
+        else if (key == TuiKey.RIGHT || key == TuiKey.TAB) changeTab(1);
+        else if (key == TuiKey.SHIFT_TAB) changeTab(-1);
+        else if (key == TuiKey.UP) move(-1);
+        else if (key == TuiKey.DOWN) move(1);
+        else if (key == TuiKey.PAGE_UP) move(-Math.max(1, screen.height() - 7));
+        else if (key == TuiKey.PAGE_DOWN) move(Math.max(1, screen.height() - 7));
+        else if (key == TuiKey.HOME) moveToBoundary(false);
+        else if (key == TuiKey.END) moveToBoundary(true);
+        else if (key == TuiKey.ENTER) activate();
+        else if (key == TuiKey.DELETE && tab == Tab.CONTEXT) removeSelectedContext();
+        else if (key == TuiKey.DELETE && tab == Tab.BREAKPOINTS) clearSelectedBreakpoint();
+        else if (key == TuiKey.BACKSPACE || key == TuiKey.DELETE) navigateBack();
+        else if (key == ' ' && tab == Tab.CONTEXT) duplicateSelectedContext();
+        else if (key == '/') editFilter();
+        else if (key == 'n') findNextInView(1);
+        else if (key == 'N') findNextInView(-1);
+        else if (key == 'g') goToLocation();
+        else if (key == '!') statusPage++;
+        else if (key == '[') moveHorizontal(-8);
+        else if (key == ']') moveHorizontal(8);
+        else if (key == 'f' || key == 'F') find();
+        else if (key == 'p' || key == 'P') goPackage();
+        else if (key == 'l' || key == 'L') forceLoadClass();
+        else if (key == 'j' || key == 'J') toggleRuntime();
+        else if (key == 'k' || key == 'K') toggleSpecialMethods();
+        else if (key == 'h' || key == 'H') toggleInheritedObjectMethods();
+        else if (key == 'r' || key == 'R' || key == TuiKey.F5) refresh();
+        else if ((key == 's' || key == 'S') && tab == Tab.CONTEXT) swapContextTop();
+        else if (key == 's' || key == 'S') requestSource(false);
+        else if (key == 'a' || key == 'A') {
+            if (tab == Tab.BREAKPOINTS) clearAllBreakpoints();
+            else if (tab == Tab.BROWSE) toggleArrays();
+            else requestSource(true);
+        }
+        else if (key == 'b' || key == 'B') requestSelectedBytecode(Tab.BYTECODE);
+        else if (key == 'v' || key == 'V') tab = Tab.CONTEXT;
+        else if (key == 'd' || key == 'D') dumpContextClass();
+        else if (key == 'u' || key == 'U') toggleSelectedFieldWatch(false);
+        else if (key == 'w' || key == 'W') toggleSelectedFieldWatch(true);
+        else if (key == 'o' || key == 'O') exportCurrentView();
+        else if (key == 'i' || key == 'I') toggleInspector();
+        else if (key == 't' || key == 'T') openOrCycleThreads();
+        else if (key == 'm' || key == 'M') openLocals();
+        else if (key == 'z' || key == 'Z') openBreakpoints();
+        else if (key == 'y' || key == 'Y') continueAllExecutions();
+        else if (key == '*') toggleAnalysisFreeze();
+        else if (key == 'G') jumpToCurrentExecution();
+        else if (key == 'e' || key == 'E') toggleEngine();
+        else if (key == '0') resetHorizontal();
+        else if (key == 'x' || key == 'X') clearContext();
+        else if (key == TuiKey.F9) toggleBreakpoint();
+        else if (key == TuiKey.F4) toggleLiveFollow();
+        else if (key == TuiKey.F6) pauseSelectedThread();
+        else if (key == TuiKey.F7) step();
+        else if (key == TuiKey.F8) continueExecution();
+        return null;
+    }
+
+    private void requestPackage(final String requested) {
+        final String normalized = requested == null || ".".equals(requested.trim())
+                ? "" : requested.trim().replace('/', '.');
+        final boolean includeArrays = showArrays && normalized.isEmpty();
+        submit("Loading package " + (normalized.isEmpty() ? "<root>" : normalized) + "...",
+                new Callable<RemotePackage>() {
+                    @Override public RemotePackage call() {
+                        RemotePackage value = session.jni().findPackage(normalized);
+                        if (!includeArrays) return value;
+                        List<String> classNames = new ArrayList<String>(value.classes());
+                        for (RemoteClassInfo info : session.jni().searchClasses(
+                                new RemoteClassQuery().kind("array").limit(10000))) {
+                            classNames.add(info.name());
+                        }
+                        return new RemotePackage(value.name(), value.packages(), classNames);
+                    }
+                }, new Consumer<RemotePackage>() {
+                    @Override public void accept(RemotePackage value) {
+                        packageName = normalized;
+                        searchMode = false;
+                        browserTitle = "package:" + (normalized.isEmpty() ? "<root>" : normalized);
+                        replaceBrowserEntries(TuiBrowserModel.packageEntries(
+                                value, showRuntime, showArrays));
+                        status = visibleBrowserEntries.size() + " item(s) in " + browserTitle
+                                + (showRuntime ? " (runtime visible)" : " (java/jdk/sun hidden)")
+                                + (showArrays ? " (array classes visible)" : " (arrays hidden)");
+                    }
+                });
+    }
+
+    private void find() throws IOException {
+        if (tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG) {
+            editViewSearch();
+            return;
+        }
+        String query = editText("Find: text | class: | field: | method: | package: (owner#member supported)",
+                lastSearch);
+        if (query == null || query.trim().isEmpty()) return;
+        lastSearch = query.trim();
+        requestSearch(lastSearch);
+    }
+
+    private void requestSearch(final String query) {
+        submit("Searching " + query + "...", new Callable<SearchResult>() {
+            @Override public SearchResult call() {
+                String lower = query.toLowerCase(Locale.ROOT);
+                boolean packagesOnly = lower.startsWith("package:");
+                boolean classesOnly = lower.startsWith("class:");
+                boolean fieldsOnly = lower.startsWith("field:");
+                boolean methodsOnly = lower.startsWith("method:");
+                int prefixLength = packagesOnly ? 8 : classesOnly ? 6
+                        : fieldsOnly ? 6 : methodsOnly ? 7 : 0;
+                String expression = query.substring(prefixLength).trim();
+                MemberPattern member = MemberPattern.parse(expression);
+                String glob = glob(expression);
+                boolean plain = !packagesOnly && !classesOnly && !fieldsOnly && !methodsOnly;
+                List<String> packages = packagesOnly || plain
+                        ? session.jni().searchPackages(glob, 10000) : Collections.<String>emptyList();
+                List<RemoteClassInfo> classes = classesOnly || plain
+                        ? session.jni().searchClasses(new RemoteClassQuery().name(glob).limit(10000))
+                        : Collections.<RemoteClassInfo>emptyList();
+                List<RemoteField> foundFields = fieldsOnly || plain
+                        ? session.jni().searchFields(new RemoteMemberQuery()
+                                .owner(member.ownerGlob).name(member.nameGlob).limit(10000))
+                        : Collections.<RemoteField>emptyList();
+                List<RemoteMethod> foundMethods = methodsOnly || plain
+                        ? session.jni().searchMethods(new RemoteMemberQuery()
+                                .owner(member.ownerGlob).name(member.nameGlob).limit(10000))
+                        : Collections.<RemoteMethod>emptyList();
+                return new SearchResult(packages, classes, foundFields, foundMethods);
+            }
+        }, new Consumer<SearchResult>() {
+            @Override public void accept(SearchResult result) {
+                searchMode = true;
+                browserTitle = "find:" + query;
+                replaceBrowserEntries(TuiBrowserModel.searchEntries(
+                        result.packages, result.classes, result.fields, result.methods,
+                        showRuntime, showArrays));
+                tab = Tab.BROWSE;
+                status = visibleBrowserEntries.size() + " typed search result(s); Enter opens its context; "
+                        + "/ filters results";
+            }
+        });
+    }
+
+    private void replaceBrowserEntries(List<TuiBrowserEntry> values) {
+        browserEntries.clear();
+        browserEntries.addAll(values);
+        applyBrowserFilter();
+    }
+
+    private void applyBrowserFilter() {
+        visibleBrowserEntries.clear();
+        visibleBrowserEntries.addAll(TuiBrowserModel.filter(browserEntries, browserFilter));
+        selections[Tab.BROWSE.ordinal()] = clamp(
+                selections[Tab.BROWSE.ordinal()], 0, Math.max(0, visibleBrowserEntries.size() - 1));
+        scrolls[Tab.BROWSE.ordinal()] = 0;
+    }
+
+    private void selectBrowserEntry() {
+        if (visibleBrowserEntries.isEmpty()) return;
+        TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+        if (entry.kind() == TuiBrowserEntry.Kind.PARENT
+                || entry.kind() == TuiBrowserEntry.Kind.PACKAGE) {
+            requestPackage(entry.name());
+            return;
+        }
+        String owner = entry.ownerName();
+        pendingMemberResult = entry.kind() == TuiBrowserEntry.Kind.FIELD
+                || entry.kind() == TuiBrowserEntry.Kind.METHOD ? entry : null;
+        session.context().select(session.findClass(owner));
+        tab = Tab.CONTEXT;
+        status = "Context <- class " + owner + "; loading members...";
+        requestContextRefresh();
+    }
+
+    private void requestContextRefresh() {
+        if (!session.context().isSet()) {
+            clearContextView();
+            return;
+        }
+        final boolean includeSpecialMethods = showSpecialMethods;
+        submit("Loading context " + session.context().description() + "...",
+                new Callable<ContextSnapshot>() {
+                    @Override public ContextSnapshot call() {
+                        RemoteClass type = session.context().remoteClass();
+                        boolean staticContext = session.context().isClass();
+                        List<RemoteField> loadedFields = new ArrayList<RemoteField>();
+                        List<RemoteMethod> loadedMethods = new ArrayList<RemoteMethod>();
+                        if (staticContext) {
+                            // A class context is also a metadata/debug context. Instance members
+                            // do not need a receiver to inspect bytecode or install JVMTI watches.
+                            addUniqueFields(loadedFields, type.getStaticFields());
+                            addUniqueFields(loadedFields, type.getVirtualFields());
+                            addUniqueMethods(loadedMethods, type.getStaticMethods());
+                            addUniqueMethods(loadedMethods, type.getVirtualMethods());
+                        } else {
+                            addUniqueFields(loadedFields, type.getVirtualFields());
+                            addUniqueMethods(loadedMethods, type.getVirtualMethods());
+                        }
+                        String specialError = "";
+                        if (includeSpecialMethods) {
+                            try { loadedMethods.addAll(loadJvmSpecialMethods(type)); }
+                            catch (RuntimeException failure) { specialError = rootMessage(failure); }
+                        }
+                        return new ContextSnapshot(type, staticContext, loadedFields, loadedMethods,
+                                describeContext(staticContext), specialError);
+                    }
+                }, new Consumer<ContextSnapshot>() {
+                    @Override public void accept(ContextSnapshot value) {
+                        contextClass = value.type;
+                        classContext = value.classContext;
+                        fields.clear();
+                        fields.addAll(value.fields);
+                        methods.clear();
+                        methods.addAll(value.methods);
+                        sortMembers();
+                        contextLines.clear();
+                        contextLines.addAll(value.valueLines);
+                        preserveSelectedMethod();
+                        clampMemberSelections();
+                        if (pendingMemberResult != null
+                                && pendingMemberResult.ownerName().equals(contextClass.className())) {
+                            selectPendingMemberResult();
+                        }
+                        status = (classContext ? "CLASS/member metadata" : "OBJECT/instance") + " context: "
+                                + contextClass.className() + " | stack depth=" + session.context().depth()
+                                + (showSpecialMethods ? " | <init>/<clinit> visible" : "")
+                                + (value.specialError.isEmpty() ? ""
+                                        : " | special methods unavailable: " + value.specialError);
+                    }
+                });
+    }
+
+    private static void addUniqueFields(List<RemoteField> target, List<RemoteField> source) {
+        for (RemoteField candidate : source) {
+            if (!containsField(target, candidate)) target.add(candidate);
+        }
+    }
+
+    private static void addUniqueMethods(List<RemoteMethod> target, List<RemoteMethod> source) {
+        for (RemoteMethod candidate : source) {
+            if (!containsMethod(target, candidate)) target.add(candidate);
+        }
+    }
+
+    private void selectPendingMemberResult() {
+        TuiBrowserEntry entry = pendingMemberResult;
+        pendingMemberResult = null;
+        memberFilter = "";
+        if (entry.kind() == TuiBrowserEntry.Kind.FIELD) {
+            RemoteField wanted = entry.field();
+            if (!containsField(fields, wanted)) fields.add(wanted);
+            sortMembers();
+            selections[Tab.FIELDS.ordinal()] = indexOfField(fields, wanted);
+            tab = Tab.FIELDS;
+        } else if (entry.kind() == TuiBrowserEntry.Kind.METHOD) {
+            RemoteMethod wanted = entry.method();
+            if (!containsMethod(methods, wanted)) methods.add(wanted);
+            sortMembers();
+            selections[Tab.METHODS.ordinal()] = indexOfMethod(methods, wanted);
+            selectedMethod = methods.get(selections[Tab.METHODS.ordinal()]);
+            tab = Tab.METHODS;
+        }
+    }
+
+    private static boolean containsField(List<RemoteField> values, RemoteField wanted) {
+        return indexOfField(values, wanted) >= 0;
+    }
+
+    private static int indexOfField(List<RemoteField> values, RemoteField wanted) {
+        for (int index = 0; index < values.size(); index++) {
+            RemoteField value = values.get(index);
+            if (value.declaringClass().equals(wanted.declaringClass())
+                    && value.name().equals(wanted.name())
+                    && value.descriptor().equals(wanted.descriptor())) return index;
+        }
+        return -1;
+    }
+
+    private static boolean containsMethod(List<RemoteMethod> values, RemoteMethod wanted) {
+        return indexOfMethod(values, wanted) >= 0;
+    }
+
+    private static int indexOfMethod(List<RemoteMethod> values, RemoteMethod wanted) {
+        for (int index = 0; index < values.size(); index++) {
+            if (sameMethod(values.get(index), wanted)) return index;
+        }
+        return -1;
+    }
+
+    private static List<RemoteMethod> loadJvmSpecialMethods(RemoteClass type) {
+        List<RemoteMethod> result = new ArrayList<RemoteMethod>();
+        for (nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod method
+                : type.classFileView().methods()) {
+            if ("<init>".equals(method.name()) || "<clinit>".equals(method.name())) {
+                result.add(RemoteMethod.jvmSpecial(type, method.name(), method.descriptor(),
+                        method.accessFlags()));
+            }
+        }
+        return result;
+    }
+
+    private List<String> describeContext(boolean staticContext) {
+        List<String> result = new ArrayList<String>();
+        result.add("Context stack top: " + session.context().description());
+        result.add("mode          " + (staticContext ? "CLASS (static + virtual member metadata)"
+                : "OBJECT (instance fields/methods)"));
+        result.add("view type     " + session.context().remoteClass().className());
+        result.add("stack depth   " + session.context().depth());
+        if (staticContext) {
+            result.add("");
+            result.add("Static and virtual members are searchable without an object reference.");
+            result.add("Enter reads static fields; instance fields need an OBJECT context.");
+            result.add("U/W can watch instance field access/write directly from this CLASS context.");
+            return result;
+        }
+        RemoteObject object = session.context().remoteObject();
+        RemoteObjectDebugInfo debug = object.debugInfo();
+        result.add("runtime type  " + debug.className());
+        result.add("shape         " + debug.shape());
+        result.add("size          " + (debug.size().isEmpty() ? "n/a" : debug.size()));
+        result.add("identity      0x" + debug.identityHash());
+        result.add("display       " + debug.displayValue());
+        addValuePreview(result, object, debug);
+        return result;
+    }
+
+    private static void addValuePreview(List<String> lines, RemoteObject object, RemoteObjectDebugInfo debug) {
+        lines.add("");
+        if ("array".equals(debug.shape())) {
+            int size = object.arrayLength();
+            lines.add("Array preview:");
+            for (int index = 0; index < Math.min(size, 16); index++) {
+                try (RemoteObject value = object.arrayGet(index)) {
+                    lines.add(String.format("  [%d] %s", index, value));
+                }
+            }
+            if (size > 16) lines.add("  ... " + (size - 16) + " more element(s)");
+        } else if ("map".equals(debug.shape())) {
+            lines.add("Map preview:");
+            List<RemoteMapEntry> entries = object.mapEntries(16);
+            try {
+                for (RemoteMapEntry entry : entries) lines.add("  " + entry.key() + " => " + entry.value());
+            } finally {
+                for (RemoteMapEntry entry : entries) entry.close();
+            }
+        } else if ("iterable".equals(debug.shape())) {
+            lines.add("Iterable preview:");
+            List<RemoteObject> elements = object.iterableElements(16);
+            try {
+                for (int index = 0; index < elements.size(); index++) {
+                    lines.add(String.format("  [%d] %s", index, elements.get(index)));
+                }
+            } finally {
+                for (RemoteObject element : elements) element.close();
+            }
+        }
+    }
+
+    private void sortMembers() {
+        Collections.sort(fields, Comparator.comparing(RemoteField::name)
+                .thenComparing(RemoteField::declaringClass).thenComparing(RemoteField::descriptor));
+        Collections.sort(methods, Comparator.comparing(RemoteMethod::name)
+                .thenComparing(RemoteMethod::declaringClass).thenComparing(RemoteMethod::descriptor));
+    }
+
+    private void preserveSelectedMethod() {
+        if (selectedMethod == null) return;
+        for (RemoteMethod candidate : methods) {
+            if (sameMethod(candidate, selectedMethod)) {
+                selectedMethod = candidate;
+                return;
+            }
+        }
+        selectedMethod = null;
+    }
+
+    private void activate() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tab == Tab.BROWSE) selectBrowserEntry();
+        else if (tab == Tab.CONTEXT) selectContextStackItem();
+        else if (tab == Tab.FIELDS) readSelectedField();
+        else if (tab == Tab.METHODS) requestSelectedBytecode(Tab.BYTECODE);
+        else if (tab == Tab.SOURCE) jumpSourceLineToBytecode();
+        else if (tab == Tab.FRAMES) openSelectedDebuggerFrame();
+        else if (tab == Tab.LOCALS) selectLocalAsContext();
+        else if (tab == Tab.BREAKPOINTS) openSelectedBreakpoint();
+        else if (tab == Tab.THREADS) selectOrPauseThread();
+        else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) toggleBreakpoint();
+    }
+
+    private void jumpSourceLineToBytecode() {
+        if (sourceMethod.isEmpty() || sourceBciToLine.isEmpty()) {
+            status = "This Decompile view has no method-level BCI mapping; decompile one method with CFR.";
+            return;
+        }
+        int selectedLine = selections[Tab.SOURCE.ordinal()] + 1;
+        Map.Entry<Integer, Integer> best = nearestSourceMapping(selectedLine);
+        if (best == null) { status = "No bytecode mapping exists near this decompiled line."; return; }
+        final int bci = best.getKey();
+        requestBytecode(sourceClass, sourceMethod, sourceDescriptor, Tab.BYTECODE);
+        // The bytecode task applies this cursor after loading via the pending location.
+        pendingBytecodeLocation = bci;
+        status = "Loading bytecode for decompiled line " + selectedLine + " -> BCI " + bci;
+    }
+
+    private Map.Entry<Integer, Integer> nearestSourceMapping(int selectedLine) {
+        Map.Entry<Integer, Integer> best = null;
+        int distance = Integer.MAX_VALUE;
+        for (Map.Entry<Integer, Integer> mapping : sourceBciToLine.entrySet()) {
+            int candidate = Math.abs(mapping.getValue() - selectedLine);
+            if (candidate < distance) { best = mapping; distance = candidate; }
+        }
+        return best;
+    }
+
+    private void selectContextStackItem() {
+        if (!session.context().isSet()) return;
+        int index = clamp(selection(), 0, Math.max(0, session.context().depth() - 1));
+        if (index == 0) return;
+        session.context().moveToTop(index);
+        selections[Tab.CONTEXT.ordinal()] = 0;
+        requestContextRefresh();
+    }
+
+    private void duplicateSelectedContext() {
+        if (!session.context().isSet()) return;
+        int index = clamp(selections[Tab.CONTEXT.ordinal()], 0, session.context().depth() - 1);
+        session.context().pick(index);
+        selections[Tab.CONTEXT.ordinal()] = 0;
+        status = "Copied context stack item #" + index + " to the top";
+        requestContextRefresh();
+    }
+
+    private void removeSelectedContext() {
+        if (!session.context().isSet()) return;
+        int index = clamp(selections[Tab.CONTEXT.ordinal()], 0, session.context().depth() - 1);
+        session.context().remove(index);
+        selections[Tab.CONTEXT.ordinal()] = clamp(index, 0,
+                Math.max(0, session.context().depth() - 1));
+        if (session.context().isSet()) requestContextRefresh();
+        else {
+            clearContextView();
+            status = "Context stack is empty";
+        }
+    }
+
+    private void swapContextTop() {
+        if (!session.context().isSet() || session.context().depth() < 2) {
+            status = "Context stack has no second item to swap";
+            return;
+        }
+        session.context().swap();
+        selections[Tab.CONTEXT.ordinal()] = 0;
+        requestContextRefresh();
+    }
+
+    private void openLocals() {
+        tab = Tab.LOCALS;
+        selections[Tab.LOCALS.ordinal()] = clamp(selections[Tab.LOCALS.ordinal()], 0,
+                Math.max(0, debuggerLocals.size() - 1));
+        status = debuggerState != null && debuggerState.paused()
+                ? "Frame #" + debuggerFrameDepth
+                        + " locals; Enter pushes an available value onto Context"
+                : liveSampleAvailable
+                        ? "Live sample frame #" + debuggerFrameDepth
+                                + " locals; Enter pushes an available value onto Context"
+                        : "Locals require a paused thread or a live-follow sample";
+        if (!liveSampleAvailable && !tasks.busy()) requestDebuggerRefresh();
+    }
+
+    private void openSelectedDebuggerFrame() {
+        boolean paused = debuggerState != null && debuggerState.paused();
+        if ((!paused && !liveSampleAvailable) || debuggerFrames.isEmpty()) {
+            status = "Pause a Java thread or enable live follow, then select a stack frame.";
+            return;
+        }
+        debuggerFrameDepth = clamp(selections[Tab.FRAMES.ordinal()], 0,
+                debuggerFrames.size() - 1);
+        final JvmStackFrame selected = debuggerFrames.get(debuggerFrameDepth);
+        if (!selected.hasJavaLocation()) {
+            status = "Frame #" + selected.depth()
+                    + " is native and has no Java bytecode/BCI; select a Java caller below it.";
+            return;
+        }
+        if (!paused) {
+            liveFollowFrameDepth = selected.depth();
+            pendingBytecodeLocation = (int) selected.location();
+            requestBytecode(selected.className(), selected.methodName(),
+                    selected.descriptor(), Tab.DEBUG);
+            status = "Following frame #" + selected.depth()
+                    + "; its bytecode and locals refresh on the next live sample";
+            return;
+        }
+        submit("Opening frame #" + selected.depth() + " at BCI " + selected.location() + "...",
+                new Callable<DebuggerSnapshot>() {
+                    @Override public DebuggerSnapshot call() { return debuggerSnapshot(); }
+                }, new Consumer<DebuggerSnapshot>() {
+                    @Override public void accept(DebuggerSnapshot value) {
+                        applyDebuggerSnapshot(value, false);
+                        JvmStackFrame current = viewedDebuggerFrame();
+                        if (current == null || !current.hasJavaLocation()) {
+                            status = "The selected frame disappeared while refreshing the thread.";
+                            return;
+                        }
+                        pendingBytecodeLocation = (int) current.location();
+                        requestBytecode(current.className(), current.methodName(),
+                                current.descriptor(), Tab.DEBUG);
+                    }
+                });
+    }
+
+    private JvmStackFrame viewedDebuggerFrame() {
+        if (debuggerFrames.isEmpty()) return null;
+        return debuggerFrames.get(clamp(debuggerFrameDepth, 0, debuggerFrames.size() - 1));
+    }
+
+    private void selectLocalAsContext() {
+        boolean readable = debuggerState != null && debuggerState.paused() || liveSampleAvailable;
+        if (!readable || debuggerLocals.isEmpty()) {
+            status = "No paused/live-sampled frame local is available";
+            return;
+        }
+        int index = clamp(selections[Tab.LOCALS.ordinal()], 0, debuggerLocals.size() - 1);
+        JvmDebuggerLocal local = debuggerLocals.get(index);
+        if (!local.available() || local.value() == null) {
+            status = "Local " + local.name() + " is unavailable: " + local.error();
+            return;
+        }
+        // Transfer this remote handle out of the refresh-owned locals list. Otherwise the
+        // next debugger snapshot would close the object now retained by RemoteContext.
+        debuggerLocals.remove(index);
+        session.context().select(local.value());
+        tab = Tab.CONTEXT;
+        selections[Tab.CONTEXT.ordinal()] = 0;
+        status = "Context <- local [" + local.slot() + "] " + local.name();
+        requestContextRefresh();
+    }
+
+    private void openBreakpoints() {
+        tab = Tab.BREAKPOINTS;
+        selections[Tab.BREAKPOINTS.ordinal()] = clamp(selections[Tab.BREAKPOINTS.ordinal()], 0,
+                Math.max(0, breakpoints.size() - 1));
+        status = breakpoints.isEmpty() ? "No managed breakpoints; use F9 in Methods/Bytecode/Decompile"
+                : "Enter opens a breakpoint; F9/Delete clears it; A clears all";
+    }
+
+    private List<BreakpointSpec> breakpointList() {
+        return new ArrayList<BreakpointSpec>(breakpoints.values());
+    }
+
+    private void openSelectedBreakpoint() {
+        List<BreakpointSpec> values = breakpointList();
+        if (values.isEmpty()) return;
+        BreakpointSpec selected = values.get(clamp(selections[Tab.BREAKPOINTS.ordinal()], 0,
+                values.size() - 1));
+        pendingBytecodeLocation = (int) selected.bci;
+        requestBytecode(selected.className, selected.methodName, selected.descriptor, Tab.BYTECODE);
+    }
+
+    private void clearSelectedBreakpoint() {
+        List<BreakpointSpec> values = breakpointList();
+        if (values.isEmpty()) { status = "No breakpoint is selected"; return; }
+        final BreakpointSpec selected = values.get(clamp(selections[Tab.BREAKPOINTS.ordinal()], 0,
+                values.size() - 1));
+        submit("Clearing breakpoint " + selected.methodName + " @" + selected.bci + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        session.jvmti().setBreakpoint(selected.className, selected.methodName,
+                                selected.descriptor, selected.bci, false);
+                        return Boolean.TRUE;
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean ignored) {
+                        breakpoints.remove(selected.id());
+                        selections[Tab.BREAKPOINTS.ordinal()] = clamp(
+                                selections[Tab.BREAKPOINTS.ordinal()], 0,
+                                Math.max(0, breakpoints.size() - 1));
+                        status = "Breakpoint cleared: " + selected.className + "."
+                                + selected.methodName + " @BCI " + selected.bci;
+                    }
+                });
+    }
+
+    private void clearAllBreakpoints() {
+        if (breakpoints.isEmpty()) { status = "No managed breakpoints to clear"; return; }
+        final List<BreakpointSpec> values = breakpointList();
+        submit("Clearing " + values.size() + " breakpoints...", new Callable<BreakpointClearResult>() {
+            @Override public BreakpointClearResult call() {
+                List<String> cleared = new ArrayList<String>();
+                List<String> failures = new ArrayList<String>();
+                for (BreakpointSpec selected : values) {
+                    try {
+                        session.jvmti().setBreakpoint(selected.className, selected.methodName,
+                                selected.descriptor, selected.bci, false);
+                        cleared.add(selected.id());
+                    } catch (RuntimeException failure) {
+                        failures.add(selected.methodName + " @" + selected.bci + ": "
+                                + rootMessage(failure));
+                    }
+                }
+                return new BreakpointClearResult(cleared, failures);
+            }
+        }, new Consumer<BreakpointClearResult>() {
+            @Override public void accept(BreakpointClearResult result) {
+                for (String id : result.cleared) breakpoints.remove(id);
+                selections[Tab.BREAKPOINTS.ordinal()] = clamp(
+                        selections[Tab.BREAKPOINTS.ordinal()], 0,
+                        Math.max(0, breakpoints.size() - 1));
+                status = result.failures.isEmpty()
+                        ? "Cleared " + result.cleared.size() + " managed breakpoint(s)"
+                        : "Cleared " + result.cleared.size() + "; "
+                                + result.failures.size() + " failed: " + result.failures.get(0);
+            }
+        });
+    }
+
+    private void readSelectedField() {
+        final List<RemoteField> visible = visibleFields();
+        if (visible.isEmpty()) return;
+        final RemoteField field = visible.get(selection());
+        if (!field.isStatic() && session.context().isClass()) {
+            status = "This is an instance field. Select an object context before reading it; "
+                    + "its metadata is still available here.";
+            return;
+        }
+        final RemoteObject receiver = field.isStatic() ? null : session.context().remoteObject();
+        submit("Reading " + field.declaringClass() + "." + field.name() + "...",
+                new Callable<RemoteObject>() {
+                    @Override public RemoteObject call() { return field.read(receiver); }
+                }, new Consumer<RemoteObject>() {
+                    @Override public void accept(RemoteObject value) {
+                        session.context().select(value);
+                        tab = Tab.CONTEXT;
+                        status = "Context <- " + field.declaringClass() + "." + field.name();
+                        requestContextRefresh();
+                    }
+                });
+    }
+
+    private void requestSource(boolean wholeClass) {
+        final DecompilerEngine selectedEngine = engine;
+        final RemoteClass type;
+        final String methodName;
+        final String descriptor;
+        if (wholeClass) {
+            if (!requireContext()) return;
+            type = contextClass;
+            methodName = "";
+            descriptor = "";
+        } else if (((tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty())
+                || (tab == Tab.SOURCE && !sourceMethod.isEmpty())) {
+            boolean sourceSelection = tab == Tab.SOURCE;
+            type = session.findClass(sourceSelection ? sourceClass : bytecodeClass);
+            methodName = sourceSelection ? sourceMethod : bytecodeMethod;
+            descriptor = sourceSelection ? sourceDescriptor : bytecodeDescriptor;
+        } else {
+            if (!requireContext()) return;
+            RemoteMethod method = selectedMethodForAction();
+            if (method == null) {
+                status = "Select a method in Methods, Bytecode, or Debug before decompiling.";
+                tab = Tab.METHODS;
+                return;
+            }
+            type = session.findClass(method.declaringClass());
+            methodName = method.name();
+            descriptor = method.descriptor();
+        }
+        final String title = methodName.isEmpty() ? type.className()
+                : type.className() + "." + methodName + descriptor;
+        if (!submit("Decompiling " + title + " with " + selectedEngine + "...",
+                new Callable<DecompilationResult>() {
+                    @Override public DecompilationResult call() {
+                        return methodName.isEmpty() ? type.decompile(selectedEngine)
+                                : type.decompileMethodResult(methodName, descriptor, selectedEngine);
+                    }
+                }, new Consumer<DecompilationResult>() {
+                    @Override public void accept(DecompilationResult result) {
+                        sourceLines.clear();
+                        addLines(sourceLines, result.source());
+                        sourceClass = type.className();
+                        sourceMethod = methodName;
+                        sourceDescriptor = descriptor;
+                        sourceBciToLine.clear();
+                        if (!methodName.isEmpty()) {
+                            sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
+                        }
+                        alignSourceWithDebugger();
+                        status = "Decompiled " + title + " with " + selectedEngine
+                                + (methodName.isEmpty() || !sourceBciToLine.isEmpty() ? ""
+                                : "; decompiled-line breakpoints need CFR line mappings");
+                    }
+                })) return;
+        sourceLines.clear();
+        sourceLines.add("Decompiling " + title + " with " + selectedEngine + "...");
+        sourceTitle = title;
+        tab = Tab.SOURCE;
+        selections[Tab.SOURCE.ordinal()] = 0;
+        scrolls[Tab.SOURCE.ordinal()] = 0;
+        horizontalOffsets[Tab.SOURCE.ordinal()] = 0;
+    }
+
+    private void alignSourceWithDebugger() {
+        if (debuggerState == null || !debuggerState.paused()
+                || !sourceClass.equals(debuggerState.className())
+                || !sourceMethod.equals(debuggerState.methodName())
+                || !sourceDescriptor.equals(debuggerState.descriptor())) return;
+        Map.Entry<Integer, Integer> mapping = sourceBciToLine.floorEntry((int) debuggerState.location());
+        if (mapping == null) mapping = sourceBciToLine.ceilingEntry((int) debuggerState.location());
+        if (mapping != null) {
+            selections[Tab.SOURCE.ordinal()] = clamp(mapping.getValue() - 1,
+                    0, Math.max(0, sourceLines.size() - 1));
+        }
+    }
+
+    private void requestSelectedBytecode(Tab destination) {
+        if (!requireContext()) return;
+        RemoteMethod method = selectedMethodForAction();
+        if (method == null) {
+            status = "Select a method first; bytecode belongs to a method, not to an object value.";
+            tab = Tab.METHODS;
+            return;
+        }
+        selectedMethod = method;
+        requestBytecode(method.declaringClass(), method.name(), method.descriptor(), destination);
+    }
+
+    private void requestBytecode(final String className, final String methodName,
+            final String descriptor, final Tab destination) {
+        if (!submit("Loading bytecode " + className + "." + methodName + "...",
+                new Callable<ClassFileView>() {
+                    @Override public ClassFileView call() {
+                        // Reflection lists inherited members. Class bytes must come from the method's
+                        // declaring class, not from the current context/runtime class.
+                        return session.findClass(className).classFileView();
+                    }
+                }, new Consumer<ClassFileView>() {
+                    @Override public void accept(ClassFileView view) {
+                        bytecode = view.method(methodName, descriptor);
+                        constantPool.addAll(view.constants());
+                        alignDebuggerLocation(destination);
+                        if (pendingBytecodeLocation >= 0) {
+                            alignBytecodeLocation(destination, pendingBytecodeLocation);
+                            pendingBytecodeLocation = -1;
+                        }
+                        status = bytecode.instructions().isEmpty()
+                                ? "No Code attribute (native or abstract method): " + className + "." + methodName
+                                : "Loaded " + bytecode.instructions().size() + " bytecode instruction(s) from " + className;
+                        if (destination == Tab.DEBUG && debuggerState != null && debuggerState.paused()
+                                && className.equals(debuggerState.className())
+                                && methodName.equals(debuggerState.methodName())
+                                && descriptor.equals(debuggerState.descriptor())) {
+                            status = "STOP HIT: " + debuggerState.reason() + " | "
+                                    + className + "." + methodName + " @BCI "
+                                    + debuggerState.location() + " | F7 step, F8 continue";
+                        }
+                    }
+                })) return;
+        bytecode = null;
+        bytecodeClass = className;
+        bytecodeMethod = methodName;
+        bytecodeDescriptor = descriptor;
+        constantPool.clear();
+        debugSearchResults.clear();
+        tab = destination;
+        selections[destination.ordinal()] = 0;
+        scrolls[destination.ordinal()] = 0;
+        horizontalOffsets[destination.ordinal()] = 0;
+    }
+
+    private void alignDebuggerLocation(Tab destination) {
+        if (debuggerState == null || !debuggerState.paused() || bytecode == null
+                || !bytecodeClass.equals(debuggerState.className())
+                || !bytecodeMethod.equals(debuggerState.methodName())
+                || !bytecodeDescriptor.equals(debuggerState.descriptor())) return;
+        List<BytecodeInstruction> instructions = bytecode.instructions();
+        for (int index = 0; index < instructions.size(); index++) {
+            if (instructions.get(index).offset() == debuggerState.location()) {
+                selections[destination.ordinal()] = index;
+                scrolls[destination.ordinal()] = Math.max(0, index - Math.max(1, screen.height() / 3));
+                return;
+            }
+        }
+    }
+
+    private void alignBytecodeLocation(Tab destination, long location) {
+        if (bytecode == null) return;
+        List<BytecodeInstruction> instructions = bytecode.instructions();
+        int closest = 0;
+        long distance = Long.MAX_VALUE;
+        for (int index = 0; index < instructions.size(); index++) {
+            long candidate = Math.abs(instructions.get(index).offset() - location);
+            if (candidate < distance) { distance = candidate; closest = index; }
+        }
+        selections[destination.ordinal()] = closest;
+        scrolls[destination.ordinal()] = Math.max(0, closest - Math.max(1, screen.height() / 3));
+    }
+
+    private RemoteMethod selectedMethodForAction() {
+        if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+        }
+        return selectedMethod;
+    }
+
+    private void requestDebuggerRefresh() {
+        final boolean followLocation = tab == Tab.DEBUG;
+        submit("Refreshing debugger state...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() { return debuggerSnapshot(); }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) {
+                lastDebuggerFullRefreshAt = System.currentTimeMillis();
+                applyDebuggerSnapshot(value, followLocation);
+            }
+        });
+    }
+
+    private void maybeAutoRefreshDebugger() {
+        if (tasks.busy()) return;
+        long now = System.currentTimeMillis();
+        if (tab == Tab.DEBUG && liveFollowEnabled && !session.debugger().active()
+                && debuggerState != null && debuggerState.enabled() && !debuggerState.paused()
+                && !followedThreadName.isEmpty() && now - lastLiveSampleAt >= 350L) {
+            lastLiveSampleAt = now;
+            tasks.submit("", new Callable<LiveExecutionSample>() {
+                @Override public LiveExecutionSample call() { return captureLiveExecutionSample(); }
+            }, new Consumer<LiveExecutionSample>() {
+                @Override public void accept(LiveExecutionSample sample) {
+                    applyLiveExecutionSample(sample);
+                }
+            }, new Consumer<Throwable>() {
+                @Override public void accept(Throwable failure) {
+                    liveSampleError = rootMessage(failure);
+                }
+            });
+            return;
+        }
+        if (now - lastDebuggerPollAt < 200L) return;
+        lastDebuggerPollAt = now;
+        boolean debuggerPage = tab == Tab.DEBUG || tab == Tab.FRAMES
+                || tab == Tab.LOCALS || tab == Tab.THREADS;
+        boolean needsFullRefresh = debuggerState == null
+                || (tab == Tab.THREADS && now - lastDebuggerFullRefreshAt >= 1200L);
+        if (debuggerPage && needsFullRefresh) {
+            final long observed = lastObservedStopSequence;
+            lastDebuggerFullRefreshAt = now;
+            tasks.submit("", new Callable<DebuggerSnapshot>() {
+                @Override public DebuggerSnapshot call() { return debuggerSnapshot(observed); }
+            }, new Consumer<DebuggerSnapshot>() {
+                @Override public void accept(DebuggerSnapshot value) {
+                    boolean newStop = newestPausedSequence(value.states) > lastObservedStopSequence;
+                    applyDebuggerSnapshot(value, newStop && tab == Tab.DEBUG);
+                    if (newStop && tab == Tab.THREADS) {
+                        status = "STOP HIT: marked with >> in Threads; Enter or G opens current bytecode";
+                    }
+                }
+            }, new Consumer<Throwable>() {
+                @Override public void accept(Throwable failure) { }
+            });
+            return;
+        }
+        // A fast sequence-only probe detects a new stop without repeatedly re-reading
+        // stack/locals or disturbing the current tab/cursor. The full stop transaction
+        // is requested only when the sequence changes.
+        tasks.submit("", new Callable<List<JvmDebuggerState>>() {
+            @Override public List<JvmDebuggerState> call() {
+                return new ArrayList<JvmDebuggerState>(session.jvmti().debuggerStates());
+            }
+        }, new Consumer<List<JvmDebuggerState>>() {
+            @Override public void accept(List<JvmDebuggerState> states) {
+                long newest = newestPausedSequence(states);
+                boolean selectedStopDisappeared = debuggerState != null && debuggerState.paused()
+                        && !containsPausedSequence(states, activeDebuggerSequence);
+                for (JvmDebuggerState state : states) state.close();
+                if (newest > lastObservedStopSequence) requestDetectedStop(lastObservedStopSequence);
+                else if (selectedStopDisappeared && debuggerPage) requestDebuggerRefresh();
+            }
+        }, new Consumer<Throwable>() {
+            @Override public void accept(Throwable failure) { }
+        });
+    }
+
+    private LiveExecutionSample captureLiveExecutionSample() {
+        final long previouslyObserved = lastObservedStopSequence;
+        List<RemoteJvmtiThread> threads = new ArrayList<RemoteJvmtiThread>(session.jvmti().threads());
+        RemoteJvmtiThread selected = null;
+        boolean pauseRequested = false;
+        try {
+            for (RemoteJvmtiThread thread : threads) {
+                if (followedThreadName.equals(thread.name())) { selected = thread; break; }
+            }
+            if (selected == null) {
+                return LiveExecutionSample.error(followedThreadName,
+                        "followed thread is no longer alive");
+            }
+            if (selected.debuggerPaused()) {
+                return LiveExecutionSample.realStop(previouslyObserved);
+            }
+            session.jvmti().configureDebugger(true);
+            session.jvmti().pauseExecution(selected.object(), "live_sample");
+            pauseRequested = true;
+            DebuggerSnapshot snapshot = debuggerSnapshot(previouslyObserved);
+            JvmDebuggerState sampleState = null;
+            boolean realStopDetected = false;
+            for (JvmDebuggerState state : snapshot.states) {
+                if (!state.paused() || state.thread() == null) continue;
+                if (state.sequence() > previouslyObserved && !"live_sample".equals(state.reason())) {
+                    realStopDetected = true;
+                }
+                if ("live_sample".equals(state.reason())
+                        && followedThreadName.equals(threadNameForState(state, threads))) {
+                    sampleState = state;
+                }
+            }
+            if (sampleState == null) {
+                snapshot.close();
+                pauseRequested = false; // An already-existing real stop was not created by us.
+                return LiveExecutionSample.realStop(previouslyObserved);
+            }
+            session.jvmti().continueExecution(sampleState.thread());
+            pauseRequested = false;
+            if (realStopDetected) {
+                snapshot.close();
+                return LiveExecutionSample.realStop(previouslyObserved);
+            }
+            return LiveExecutionSample.captured(followedThreadName, snapshot);
+        } finally {
+            if (pauseRequested && selected != null) {
+                try { session.jvmti().continueExecution(selected.object()); }
+                catch (RuntimeException ignored) { }
+            }
+            for (RemoteJvmtiThread thread : threads) thread.close();
+        }
+    }
+
+    private void applyLiveExecutionSample(LiveExecutionSample sample) {
+        if (sample == null) return;
+        if (sample.realStopDetected) {
+            requestDetectedStop(sample.previouslyObserved);
+            return;
+        }
+        if (sample.snapshot == null) {
+            liveSampleError = sample.error;
+            return;
+        }
+        DebuggerSnapshot value = sample.snapshot;
+        JvmDebuggerState captured = value.selectedState();
+        if (captured == null || !captured.paused() || !"live_sample".equals(captured.reason())) {
+            value.close();
+            return;
+        }
+        lastObservedStopSequence = Math.max(lastObservedStopSequence, captured.sequence());
+        for (JvmDebuggerLocal local : debuggerLocals) local.close();
+        debuggerLocals.clear();
+        debuggerStack.clear();
+        debuggerStack.addAll(value.stack);
+        debuggerFrames.clear();
+        debuggerFrames.addAll(value.frames);
+        debuggerFrameDepth = value.frameDepth;
+        debuggerLocals.addAll(value.locals);
+        value.locals.clear(); // Ownership moves to the live-sample view/context stack.
+        debuggerLocalsError = value.localsError;
+        selections[Tab.FRAMES.ordinal()] = clamp(debuggerFrameDepth, 0,
+                Math.max(0, debuggerFrames.size() - 1));
+        selections[Tab.LOCALS.ordinal()] = clamp(selections[Tab.LOCALS.ordinal()], 0,
+                Math.max(0, debuggerLocals.size() - 1));
+
+        JvmStackFrame viewed = viewedDebuggerFrame();
+        liveSampleActual = captured.className() + "." + captured.methodName()
+                + captured.descriptor() + " @" + captured.location();
+        liveSampleView = viewed == null ? "<no Java frame>" : viewed.className() + "."
+                + viewed.methodName() + viewed.descriptor() + " @" + viewed.location()
+                + " frame#" + viewed.depth();
+        liveSampleCapturedAt = System.currentTimeMillis();
+        liveSampleAvailable = true;
+        liveSampleError = "";
+
+        boolean methodMatches = viewed != null && bytecode != null
+                && bytecodeClass.equals(viewed.className())
+                && bytecodeMethod.equals(viewed.methodName())
+                && bytecodeDescriptor.equals(viewed.descriptor());
+        if (value.stopBytecodeView != null && viewed != null) {
+            bytecode = value.stopBytecodeView.method(value.stopBytecodeMethod,
+                    value.stopBytecodeDescriptor);
+            bytecodeClass = value.stopBytecodeClass;
+            bytecodeMethod = value.stopBytecodeMethod;
+            bytecodeDescriptor = value.stopBytecodeDescriptor;
+            constantPool.clear();
+            constantPool.addAll(value.stopBytecodeView.constants());
+            alignBytecodeLocation(Tab.DEBUG, value.stopBytecodeLocation);
+        } else if (methodMatches && viewed.hasJavaLocation()) {
+            alignBytecodeLocation(Tab.DEBUG, viewed.location());
+        } else if (viewed != null && viewed.hasJavaLocation()) {
+            pendingBytecodeLocation = (int) viewed.location();
+            requestBytecode(viewed.className(), viewed.methodName(), viewed.descriptor(), Tab.DEBUG);
+        }
+        status = "LIVE FOLLOW " + sample.threadName + " | " + liveSampleView;
+        value.close();
+    }
+
+    private void toggleLiveFollow() {
+        liveFollowEnabled = !liveFollowEnabled;
+        lastLiveSampleAt = 0L;
+        status = liveFollowEnabled
+                ? "Live follow enabled; RUNNING threads are sampled without leaving them paused"
+                : "Live follow disabled; Debug keeps the last captured view";
+    }
+
+    private static boolean containsPausedSequence(List<JvmDebuggerState> states, long sequence) {
+        for (JvmDebuggerState state : states) {
+            if (state.paused() && state.sequence() == sequence) return true;
+        }
+        return false;
+    }
+
+    private void requestDetectedStop(final long previouslyObserved) {
+        status = "Debugger stop detected; loading thread, locals and current bytecode...";
+        submit("Opening debugger stop...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() { return debuggerSnapshot(previouslyObserved); }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) {
+                lastDebuggerFullRefreshAt = System.currentTimeMillis();
+                if (tab != Tab.THREADS) tab = Tab.DEBUG;
+                applyDebuggerSnapshot(value, tab == Tab.DEBUG);
+                if (tab == Tab.THREADS) {
+                    status = "STOP HIT: thread marked with >>; Enter or G jumps to Debug";
+                }
+            }
+        });
+    }
+
+    private static long newestPausedSequence(List<JvmDebuggerState> states) {
+        long newest = -1L;
+        for (JvmDebuggerState state : states) {
+            if (state.paused()) newest = Math.max(newest, state.sequence());
+        }
+        return newest;
+    }
+
+    private DebuggerSnapshot debuggerSnapshot() {
+        return debuggerSnapshot(-1L);
+    }
+
+    private DebuggerSnapshot debuggerSnapshot(long newerThanSequence) {
+        final long knownSequence = Math.max(newerThanSequence, activeDebuggerSequence);
+        List<JvmDebuggerState> states = new ArrayList<JvmDebuggerState>(session.jvmti().debuggerStates());
+        List<RemoteJvmtiThread> threads = new ArrayList<RemoteJvmtiThread>(session.jvmti().threads());
+        Collections.sort(threads, new Comparator<RemoteJvmtiThread>() {
+            @Override public int compare(RemoteJvmtiThread left, RemoteJvmtiThread right) {
+                int name = left.name().compareToIgnoreCase(right.name());
+                return name != 0 ? name : left.name().compareTo(right.name());
+            }
+        });
+        int selected = 0;
+        long newestCandidate = newerThanSequence;
+        if (newerThanSequence >= 0) {
+            for (int index = 0; index < states.size(); index++) {
+                JvmDebuggerState candidate = states.get(index);
+                if (candidate.paused() && candidate.sequence() > newestCandidate) {
+                    newestCandidate = candidate.sequence();
+                    selected = index;
+                }
+            }
+        }
+        if (newestCandidate == newerThanSequence) {
+            for (int index = 0; index < states.size(); index++) {
+                JvmDebuggerState candidate = states.get(index);
+                if (!followedThreadName.isEmpty() && candidate.paused() && candidate.thread() != null
+                        && candidate.thread().displayValue().contains(followedThreadName)) {
+                    selected = index;
+                    break;
+                }
+                if (candidate.sequence() == activeDebuggerSequence) selected = index;
+            }
+        }
+        JvmDebuggerState state = states.isEmpty() ? null : states.get(selected);
+        List<String> stack = new ArrayList<String>();
+        List<JvmStackFrame> frames = new ArrayList<JvmStackFrame>();
+        List<JvmDebuggerLocal> locals = new ArrayList<JvmDebuggerLocal>();
+        String localsError = "";
+        int frameDepth = 0;
+        ClassFileView stopBytecodeView = null;
+        String stopBytecodeClass = "";
+        String stopBytecodeMethod = "";
+        String stopBytecodeDescriptor = "";
+        long stopBytecodeLocation = -1L;
+        String stopBytecodeError = "";
+        if (state != null && state.paused() && state.thread() != null) {
+            try {
+                frames.addAll(session.jvmti().stackFrames(state.thread(), 48));
+                for (JvmStackFrame frame : frames) stack.add(frame.raw());
+                if ("live_sample".equals(state.reason()) && liveFollowFrameDepth >= 0) {
+                    frameDepth = clamp(liveFollowFrameDepth, 0, Math.max(0, frames.size() - 1));
+                } else {
+                    frameDepth = state.sequence() == activeDebuggerSequence
+                            ? clamp(debuggerFrameDepth, 0, Math.max(0, frames.size() - 1))
+                            : preferredFrameDepth(frames);
+                }
+            }
+            catch (RuntimeException failure) { stack.add("<stack unavailable: " + rootMessage(failure) + ">"); }
+            try { locals.addAll(session.jvmti().debuggerLocals(state.thread(), frameDepth)); }
+            catch (RuntimeException failure) { localsError = friendlyLocalsError(failure); }
+            if (state.sequence() > knownSequence && !frames.isEmpty()) {
+                JvmStackFrame frame = frames.get(clamp(frameDepth, 0, frames.size() - 1));
+                boolean alreadyLoaded = bytecode != null
+                        && bytecodeClass.equals(frame.className())
+                        && bytecodeMethod.equals(frame.methodName())
+                        && bytecodeDescriptor.equals(frame.descriptor());
+                if (frame.hasJavaLocation() && !alreadyLoaded) {
+                    stopBytecodeClass = frame.className();
+                    stopBytecodeMethod = frame.methodName();
+                    stopBytecodeDescriptor = frame.descriptor();
+                    stopBytecodeLocation = frame.location();
+                    try {
+                        stopBytecodeView = session.findClass(stopBytecodeClass).classFileView();
+                        // Validate the exact method while this stop transaction is still current.
+                        stopBytecodeView.method(stopBytecodeMethod, stopBytecodeDescriptor);
+                    } catch (RuntimeException failure) {
+                        stopBytecodeView = null;
+                        stopBytecodeError = rootMessage(failure);
+                    }
+                }
+            }
+        }
+        return new DebuggerSnapshot(states, selected, threads, stack, frames,
+                frameDepth, locals, localsError, stopBytecodeView, stopBytecodeClass,
+                stopBytecodeMethod, stopBytecodeDescriptor, stopBytecodeLocation,
+                stopBytecodeError);
+    }
+
+    private static int preferredFrameDepth(List<JvmStackFrame> frames) {
+        if (frames.isEmpty() || frames.get(0).hasJavaLocation()) return 0;
+        for (JvmStackFrame frame : frames) {
+            if (frame.hasJavaLocation() && !frame.isPlatformFrame()) return frame.depth();
+        }
+        for (JvmStackFrame frame : frames) if (frame.hasJavaLocation()) return frame.depth();
+        return 0;
+    }
+
+    private void applyDebuggerSnapshot(DebuggerSnapshot value, boolean loadLocation) {
+        if (value.newestSequence() >= 0 && value.newestSequence() < lastObservedStopSequence) {
+            value.close();
+            return;
+        }
+        JvmDebuggerState incoming = value.selectedState();
+        long previousSequence = activeDebuggerSequence;
+        String previousClass = debuggerState == null ? "" : debuggerState.className();
+        String previousMethod = debuggerState == null ? "" : debuggerState.methodName();
+        String previousDescriptor = debuggerState == null ? "" : debuggerState.descriptor();
+        long previousLocation = debuggerState == null ? -1L : debuggerState.location();
+        boolean newStop = incoming != null && incoming.paused()
+                && incoming.sequence() != previousSequence;
+        boolean executionMoved = incoming != null && incoming.paused()
+                && (!incoming.className().equals(previousClass)
+                || !incoming.methodName().equals(previousMethod)
+                || !incoming.descriptor().equals(previousDescriptor)
+                || incoming.location() != previousLocation);
+        String selectedThreadName = selectedDebuggerThread() == null
+                ? followedThreadName : selectedDebuggerThread().name();
+        if (newStop) {
+            String stoppedThreadName = threadNameForState(incoming, value.threads);
+            if (!stoppedThreadName.isEmpty()) followedThreadName = stoppedThreadName;
+            liveFollowFrameDepth = -1;
+        }
+        if (newStop) rememberLastStop(incoming, value.stack, value.locals,
+                value.localsError);
+        liveSampleAvailable = false;
+        closeDebuggerStates();
+        debuggerStates.addAll(value.states);
+        debuggerThreads.addAll(value.threads);
+        if (!selectedThreadName.isEmpty()) {
+            for (int index = 0; index < debuggerThreads.size(); index++) {
+                if (selectedThreadName.equals(debuggerThreads.get(index).name())) {
+                    selections[Tab.THREADS.ordinal()] = index;
+                    break;
+                }
+            }
+        }
+        debuggerState = value.selectedState();
+        activeDebuggerSequence = debuggerState == null ? -1L : debuggerState.sequence();
+        lastObservedStopSequence = Math.max(lastObservedStopSequence,
+                newestPausedSequence(debuggerStates));
+        debuggerStack.clear();
+        debuggerStack.addAll(value.stack);
+        debuggerFrames.clear();
+        debuggerFrames.addAll(value.frames);
+        debuggerFrameDepth = value.frameDepth;
+        debuggerLocals.addAll(value.locals);
+        debuggerLocalsError = value.localsError;
+        selections[Tab.FRAMES.ordinal()] = clamp(debuggerFrameDepth, 0,
+                Math.max(0, debuggerFrames.size() - 1));
+        selections[Tab.LOCALS.ordinal()] = clamp(selections[Tab.LOCALS.ordinal()], 0,
+                Math.max(0, debuggerLocals.size() - 1));
+        if (debuggerState != null && debuggerState.paused()) {
+            status = (newStop ? "STOP HIT: " : "") + debuggerState.toString()
+                    + " | " + pausedDebuggerCount() + " paused thread(s)";
+            JvmStackFrame viewed = viewedDebuggerFrame();
+            boolean viewedMethodMatches = viewed != null && bytecode != null
+                    && bytecodeClass.equals(viewed.className())
+                    && bytecodeMethod.equals(viewed.methodName())
+                    && bytecodeDescriptor.equals(viewed.descriptor());
+            boolean stopBytecodeApplied = false;
+            if (newStop && value.stopBytecodeView != null
+                    && viewed != null
+                    && value.stopBytecodeClass.equals(viewed.className())
+                    && value.stopBytecodeMethod.equals(viewed.methodName())
+                    && value.stopBytecodeDescriptor.equals(viewed.descriptor())) {
+                bytecode = value.stopBytecodeView.method(value.stopBytecodeMethod,
+                        value.stopBytecodeDescriptor);
+                bytecodeClass = value.stopBytecodeClass;
+                bytecodeMethod = value.stopBytecodeMethod;
+                bytecodeDescriptor = value.stopBytecodeDescriptor;
+                constantPool.clear();
+                constantPool.addAll(value.stopBytecodeView.constants());
+                pendingBytecodeLocation = -1;
+                if (tab == Tab.DEBUG) {
+                    alignBytecodeLocation(Tab.DEBUG, value.stopBytecodeLocation);
+                }
+                stopBytecodeApplied = true;
+            }
+            if ((loadLocation || newStop) && tab == Tab.DEBUG
+                    && viewed != null && viewed.hasJavaLocation() && !stopBytecodeApplied) {
+                if (viewedMethodMatches) {
+                    // A new BCI in the same method only moves the execution marker. Never
+                    // discard/reload 900+ instructions or reset a user's cursor on a poll.
+                    if (newStop || executionMoved) alignBytecodeLocation(Tab.DEBUG, viewed.location());
+                } else {
+                    pendingBytecodeLocation = (int) viewed.location();
+                    requestBytecode(viewed.className(), viewed.methodName(),
+                            viewed.descriptor(), Tab.DEBUG);
+                }
+            }
+            if (newStop && !value.stopBytecodeError.isEmpty()) {
+                status += " | bytecode load pending: " + value.stopBytecodeError;
+            }
+            if (newStop && debuggerState.location() < 0 && viewed != null
+                    && viewed.depth() > 0 && viewed.hasJavaLocation()) {
+                status += " | native top frame; viewing Java caller frame #" + viewed.depth();
+            }
+        } else status = debuggerState != null && debuggerState.enabled()
+                ? "Target is running; " + debuggerThreads.size()
+                        + " JVM thread(s), F6 pauses the selected thread"
+                : "Debugger is disabled. Set a breakpoint with F9 to enable it.";
+    }
+
+    private static String threadNameForState(JvmDebuggerState state,
+            List<RemoteJvmtiThread> threads) {
+        if (state == null || state.thread() == null) return "";
+        String display = state.thread().displayValue();
+        if (display == null) return "";
+        for (RemoteJvmtiThread thread : threads) {
+            if (display.contains("[" + thread.name() + ",")
+                    || display.contains("," + thread.name() + ",")) return thread.name();
+        }
+        return "";
+    }
+
+    private void rememberLastStop(JvmDebuggerState state, List<String> stack,
+            List<JvmDebuggerLocal> locals, String localsError) {
+        lastStopSummary = state.reason() + " at " + state.className() + "." + state.methodName()
+                + " BCI " + state.location() + (state.sourceLine() < 0 ? "" : " line " + state.sourceLine());
+        lastDebuggerStack.clear();
+        lastDebuggerStack.addAll(stack);
+        lastDebuggerLocals.clear();
+        if (localsError != null && !localsError.isEmpty()) {
+            lastDebuggerLocals.add("<unavailable: " + localsError + ">");
+        } else if (locals.isEmpty()) {
+            lastDebuggerLocals.add("<no active variables or LocalVariableTable>");
+        } else {
+            for (JvmDebuggerLocal local : locals) {
+                lastDebuggerLocals.add((local.inferred() ? "~" : "") + "[" + local.slot()
+                        + "] " + local.name() + " "
+                        + local.descriptor());
+                lastDebuggerLocals.add("    " + (local.available()
+                        ? local.value() == null ? "null" : local.value().displayValue()
+                        : "<" + local.error() + ">"));
+            }
+        }
+    }
+
+    private static String friendlyLocalsError(Throwable failure) {
+        String message = rootMessage(failure);
+        String lower = message.toLowerCase(Locale.ROOT);
+        if (lower.contains("absent_information") || lower.contains("absent information")) {
+            return "This method has no LocalVariableTable; compile with debug information (-g)";
+        }
+        if (lower.contains("no longer paused") || lower.contains("thread_not_suspended")
+                || lower.contains("thread not suspended")) {
+            return "The thread resumed while locals were being read; they will refresh at the next stop";
+        }
+        if (lower.contains("must possess capability") || lower.contains("not available")) {
+            return "can_access_local_variables is unavailable in this JVM; start with -agentpath";
+        }
+        int exception = message.lastIndexOf(": ");
+        return exception >= 0 ? message.substring(exception + 2) : message;
+    }
+
+    private void step() {
+        if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
+        if (debuggerState == null || !debuggerState.paused()) {
+            status = "F7 steps a paused thread. Select it in Threads and press F6 first.";
+            tab = Tab.THREADS;
+            if (!tasks.busy()) requestDebuggerRefresh();
+            return;
+        }
+        final long sequence = debuggerState.sequence();
+        final RemoteObject thread = debuggerState.thread();
+        submit("Single-stepping one JVM bytecode...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() throws Exception {
+                session.jvmti().stepInstruction(thread);
+                DebuggerSnapshot latest = null;
+                for (int attempt = 0; attempt < 100; attempt++) {
+                    Thread.sleep(20L);
+                    if (latest != null) latest.close();
+                    latest = debuggerSnapshot(sequence);
+                    JvmDebuggerState selected = latest.selectedState();
+                    if (selected != null && selected.paused() && selected.sequence() > sequence) return latest;
+                }
+                return latest;
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) { applyDebuggerSnapshot(value, true); }
+        });
+    }
+
+    private void continueExecution() {
+        if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
+        if (debuggerState == null || !debuggerState.paused()) {
+            status = "Selected thread is running. F6 pauses it; F9 sets a BCI breakpoint.";
+            return;
+        }
+        String stoppedThreadName = threadNameForState(debuggerState, debuggerThreads);
+        if (!stoppedThreadName.isEmpty()) followedThreadName = stoppedThreadName;
+        lastLiveSampleAt = 0L;
+        final RemoteObject thread = debuggerState.thread();
+        submit("Continuing target thread...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() {
+                session.jvmti().continueExecution(thread);
+                return debuggerSnapshot();
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) { applyDebuggerSnapshot(value, false); }
+        });
+    }
+
+    private void continueAllExecutions() {
+        if (session.debugger().active()) {
+            status = "Analysis freeze is active; press * to restore only freeze-owned threads.";
+            return;
+        }
+        if (pausedDebuggerCount() == 0) {
+            status = "Target is already running; there are no stopped threads to continue.";
+            return;
+        }
+        String stoppedThreadName = threadNameForState(debuggerState, debuggerThreads);
+        if (!stoppedThreadName.isEmpty()) followedThreadName = stoppedThreadName;
+        lastLiveSampleAt = 0L;
+        submit("Continuing all paused target threads...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() {
+                session.jvmti().continueAllExecutions();
+                return debuggerSnapshot();
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) { applyDebuggerSnapshot(value, false); }
+        });
+    }
+
+    private void toggleAnalysisFreeze() {
+        final boolean restore = session.debugger().active();
+        submit(restore ? "Restoring pre-freeze thread states..."
+                        : "Freezing eligible JVM threads for analysis...",
+                new Callable<DebuggerFreezeReport>() {
+                    @Override public DebuggerFreezeReport call() {
+                        return restore ? session.debugger().restore() : session.debugger().freeze();
+                    }
+                }, new Consumer<DebuggerFreezeReport>() {
+                    @Override public void accept(DebuggerFreezeReport report) {
+                        lastFreezeReport = report;
+                        status = report.summary() + (report.count(DebuggerFreezeReport.Action.FAILED) == 0
+                                ? "" : "; press I for details and retry * if needed");
+                        requestDebuggerRefresh();
+                    }
+                });
+    }
+
+    private void switchDebuggerThread() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        List<JvmDebuggerState> paused = new ArrayList<JvmDebuggerState>();
+        for (JvmDebuggerState state : debuggerStates) if (state.paused()) paused.add(state);
+        if (paused.isEmpty()) {
+            status = "Target is running; T cycles threads only when breakpoint events are simultaneously paused.";
+            return;
+        }
+        if (paused.size() == 1) {
+            debuggerState = paused.get(0);
+            activeDebuggerSequence = debuggerState.sequence();
+            status = "Selected the only paused thread: "
+                    + (debuggerState.thread() == null ? "<unknown>" : debuggerState.thread().displayValue());
+            jumpToCurrentExecution();
+            return;
+        }
+        int current = paused.indexOf(debuggerState);
+        debuggerState = paused.get((current + 1) % paused.size());
+        activeDebuggerSequence = debuggerState.sequence();
+        tab = Tab.DEBUG;
+        requestDebuggerRefresh();
+    }
+
+    private void openOrCycleThreads() {
+        if (tab != Tab.THREADS) {
+            tab = Tab.THREADS;
+            if (!tasks.busy()) requestDebuggerRefresh();
+            status = "All JVM threads; Enter/F6 pauses, F8 continues, F7 steps a paused thread.";
+            return;
+        }
+        move(1);
+        RemoteJvmtiThread selected = selectedDebuggerThread();
+        status = selected == null ? "No JVM threads available" : "Selected " + selected.name();
+    }
+
+    private RemoteJvmtiThread selectedDebuggerThread() {
+        if (debuggerThreads.isEmpty()) return null;
+        return debuggerThreads.get(clamp(selections[Tab.THREADS.ordinal()], 0,
+                debuggerThreads.size() - 1));
+    }
+
+    private JvmDebuggerState selectPausedStateForThread(RemoteJvmtiThread selected) {
+        JvmDebuggerState state = pausedStateForThread(selected);
+        if (state != null) {
+            debuggerState = state;
+            activeDebuggerSequence = state.sequence();
+            followedThreadName = selected.name();
+            return state;
+        }
+        return null;
+    }
+
+    private JvmDebuggerState pausedStateForThread(RemoteJvmtiThread selected) {
+        if (selected == null) return null;
+        for (JvmDebuggerState state : debuggerStates) {
+            if (!state.paused() || state.thread() == null) continue;
+            String display = state.thread().displayValue();
+            if (display != null && (display.contains("[" + selected.name() + ",")
+                    || display.contains(selected.name()))) return state;
+        }
+        return null;
+    }
+
+    private String debuggerThreadLabel(RemoteJvmtiThread thread) {
+        JvmDebuggerState stop = pausedStateForThread(thread);
+        if (stop == null) return (thread.debuggerPaused() ? ">> [STOP] " : "   ")
+                + thread.name() + "  [" + thread.stateSummary() + "]";
+        return ">> [STOP:" + stop.reason() + "] " + thread.name() + "  "
+                + stop.className() + "." + stop.methodName() + " @" + stop.location();
+    }
+
+    private void selectOrPauseThread() {
+        RemoteJvmtiThread selected = selectedDebuggerThread();
+        if (selected == null) { status = "No JVM thread is selected."; return; }
+        followedThreadName = selected.name();
+        if (selected.debuggerPaused() && selectPausedStateForThread(selected) != null) {
+            tab = Tab.DEBUG;
+            jumpToCurrentExecution();
+        } else pauseSelectedThread();
+    }
+
+    private void pauseSelectedThread() {
+        final RemoteJvmtiThread selected = selectedDebuggerThread();
+        if (selected == null) {
+            status = "Open Threads with T and select a live JVM thread first.";
+            tab = Tab.THREADS;
+            if (!tasks.busy()) requestDebuggerRefresh();
+            return;
+        }
+        if (selected.debuggerPaused()) {
+            selectPausedStateForThread(selected);
+            tab = Tab.DEBUG;
+            jumpToCurrentExecution();
+            return;
+        }
+        final String name = selected.name();
+        followedThreadName = name;
+        submit("Pausing thread " + name + "...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() {
+                session.jvmti().configureDebugger(true);
+                selected.pauseInDebugger();
+                return debuggerSnapshot();
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) {
+                tab = Tab.DEBUG;
+                applyDebuggerSnapshot(value, true);
+                status = "Paused and following thread " + name;
+            }
+        });
+    }
+
+    private int pausedDebuggerCount() {
+        int count = 0;
+        for (JvmDebuggerState state : debuggerStates) if (state.paused()) count++;
+        return count;
+    }
+
+    private void jumpToCurrentExecution() {
+        if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
+        if (debuggerState == null || !debuggerState.paused()) {
+            status = "No selected debugger thread is paused.";
+            requestDebuggerRefresh();
+            return;
+        }
+        tab = Tab.DEBUG;
+        JvmStackFrame viewed = viewedDebuggerFrame();
+        if (viewed == null) {
+            requestDebuggerRefresh();
+            status = "Loading current thread stack frames...";
+        } else if (!viewed.hasJavaLocation()) {
+            tab = Tab.FRAMES;
+            status = "The top frame is native (BCI -1). Select a Java caller frame and press Enter.";
+        } else if (bytecode != null && bytecodeClass.equals(viewed.className())
+                && bytecodeMethod.equals(viewed.methodName())
+                && bytecodeDescriptor.equals(viewed.descriptor())) {
+            alignBytecodeLocation(Tab.DEBUG, viewed.location());
+            status = "Current execution view: frame #" + viewed.depth()
+                    + " BCI " + viewed.location();
+        } else {
+            pendingBytecodeLocation = (int) viewed.location();
+            requestBytecode(viewed.className(), viewed.methodName(),
+                    viewed.descriptor(), Tab.DEBUG);
+        }
+    }
+
+    private void closeDebuggerStates() {
+        for (JvmDebuggerState state : debuggerStates) state.close();
+        for (JvmDebuggerLocal local : debuggerLocals) local.close();
+        for (RemoteJvmtiThread thread : debuggerThreads) thread.close();
+        debuggerStates.clear();
+        debuggerFrames.clear();
+        debuggerLocals.clear();
+        debuggerThreads.clear();
+        debuggerLocalsError = "";
+        debuggerState = null;
+        liveSampleAvailable = false;
+    }
+
+    private void toggleBreakpoint() {
+        if (tab == Tab.BREAKPOINTS) {
+            clearSelectedBreakpoint();
+            return;
+        }
+        if (tab == Tab.SOURCE) {
+            toggleSourceBreakpoint();
+            return;
+        }
+        if (tab == Tab.METHODS) {
+            toggleMethodEntryBreakpoint();
+            return;
+        }
+        if (bytecode == null || bytecode.instructions().isEmpty()) {
+            status = "Load a method bytecode view first; F9 applies to the highlighted BCI.";
+            return;
+        }
+        final BytecodeInstruction instruction = bytecode.instructions().get(bytecodeCursor());
+        final BreakpointSpec spec = new BreakpointSpec(
+                bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset(), instruction.sourceLine());
+        final boolean set = !breakpoints.containsKey(spec.id());
+        submit((set ? "Setting" : "Clearing") + " breakpoint at BCI " + spec.bci + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        if (set) session.jvmti().configureDebugger(true);
+                        session.jvmti().setBreakpoint(spec.className, spec.methodName,
+                                spec.descriptor, spec.bci, set);
+                        return set;
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
+                        else breakpoints.remove(spec.id());
+                        boolean invoke = instruction.mnemonic().startsWith("invoke");
+                        status = (enabled.booleanValue() ? "Breakpoint set" : "Breakpoint cleared")
+                                + (invoke ? " before invoke" : "")
+                                + " at " + spec.className + "." + spec.methodName + " BCI " + spec.bci;
+                    }
+                });
+    }
+
+    private void toggleMethodEntryBreakpoint() {
+        RemoteMethod method = selectedMethodForAction();
+        if (method == null) {
+            status = "Select a method first.";
+            return;
+        }
+        if (method.isNative() || method.isAbstract()) {
+            status = method.implementationKind() + " methods have no Java bytecode entry to break on.";
+            return;
+        }
+        final BreakpointSpec spec = new BreakpointSpec(method.declaringClass(), method.name(),
+                method.descriptor(), 0L, -1);
+        final boolean set = !breakpoints.containsKey(spec.id());
+        submit((set ? "Setting" : "Clearing") + " method-entry breakpoint on "
+                        + method.declaringClass() + "." + method.name() + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        if (set) session.jvmti().configureDebugger(true);
+                        session.jvmti().setBreakpoint(spec.className, spec.methodName,
+                                spec.descriptor, spec.bci, set);
+                        return Boolean.valueOf(set);
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
+                        else breakpoints.remove(spec.id());
+                        status = (enabled.booleanValue() ? "Method-entry breakpoint set: "
+                                : "Method-entry breakpoint cleared: ")
+                                + spec.className + "." + spec.methodName + spec.descriptor
+                                + " @BCI 0; no object reference required";
+                    }
+                });
+    }
+
+    private void toggleSelectedFieldWatch(final boolean modification) {
+        if (tab != Tab.FIELDS) {
+            status = "U/W set field-read/field-write watchpoints from the Fields view.";
+            return;
+        }
+        List<RemoteField> visible = visibleFields();
+        if (visible.isEmpty()) return;
+        final RemoteField field = visible.get(selection());
+        final String kind = modification ? "write" : "read";
+        final String id = kind + "|" + field.declaringClass() + "|" + field.name()
+                + "|" + field.descriptor();
+        final boolean set = !fieldWatches.containsKey(id);
+        submit((set ? "Setting " : "Clearing ") + kind + " watchpoint on " + field.name() + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        if (set) session.jvmti().configureDebugger(true);
+                        session.jvmti().setFieldWatch(field.declaringClass(), field.name(),
+                                field.descriptor(), modification, set);
+                        return Boolean.valueOf(set);
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        if (enabled.booleanValue()) fieldWatches.put(id,
+                                kind + " " + field.declaringClass() + "." + field.name());
+                        else fieldWatches.remove(id);
+                        status = kind + " watchpoint "
+                                + (enabled.booleanValue() ? "set" : "cleared") + " on "
+                                + field.declaringClass() + "." + field.name();
+                    }
+                });
+    }
+
+    private void toggleSourceBreakpoint() {
+        if (sourceMethod.isEmpty()) {
+            status = "F9 in Decompile requires a single-method result; press S from Methods or Debug.";
+            return;
+        }
+        if (sourceBciToLine.isEmpty()) {
+            status = "This decompiler produced no line/BCI map. Switch to CFR with E and decompile again.";
+            return;
+        }
+        final int selectedLine = selections[Tab.SOURCE.ordinal()] + 1;
+        Map.Entry<Integer, Integer> best = null;
+        int distance = Integer.MAX_VALUE;
+        for (Map.Entry<Integer, Integer> mapping : sourceBciToLine.entrySet()) {
+            int candidate = Math.abs(mapping.getValue() - selectedLine);
+            if (candidate < distance) { best = mapping; distance = candidate; }
+        }
+        if (best == null) { status = "No mapped bytecode exists near this decompiled line."; return; }
+        final BreakpointSpec spec = new BreakpointSpec(sourceClass, sourceMethod, sourceDescriptor,
+                best.getKey(), best.getValue());
+        final boolean set = !breakpoints.containsKey(spec.id());
+        final int mappedLine = best.getValue();
+        submit((set ? "Setting" : "Clearing") + " decompiled-line breakpoint at line " + selectedLine + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        session.jvmti().setBreakpoint(spec.className, spec.methodName, spec.descriptor,
+                                spec.bci, set);
+                        if (set) session.jvmti().configureDebugger(true);
+                        return Boolean.valueOf(set);
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        if (enabled.booleanValue()) breakpoints.put(spec.id(), spec);
+                        else breakpoints.remove(spec.id());
+                        status = (enabled.booleanValue() ? "Breakpoint set" : "Breakpoint cleared")
+                                + " at decompiled line " + mappedLine + " / BCI " + spec.bci
+                                + (mappedLine == selectedLine ? "" : " (nearest mapped line)");
+                    }
+                });
+    }
+
+    private void dumpContextClass() {
+        if (!requireContext()) return;
+        final RemoteClass type = contextClass;
+        final Path output = Paths.get("dumps", type.className().replace('.', '/') + ".class")
+                .toAbsolutePath().normalize();
+        submit("Dumping " + type.className() + "...", new Callable<Long>() {
+            @Override public Long call() throws IOException {
+                type.dumpClass(output);
+                return Files.size(output);
+            }
+        }, new Consumer<Long>() {
+            @Override public void accept(Long size) {
+                status = "Dumped " + size + " bytes to " + output;
+            }
+        });
+    }
+
+    private void exportCurrentView() throws IOException {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        final ExportPayload payload = exportPayload();
+        if (payload == null) {
+            status = "Nothing is loaded in the current view.";
+            return;
+        }
+        Path suggested = Paths.get("exports", Long.toString(session.server().process().pid()),
+                safeFileName(payload.baseName) + payload.extension).toAbsolutePath().normalize();
+        String requested = editText("Export " + tab.name().toLowerCase(Locale.ROOT) + " view (Ctrl+U clears)",
+                suggested.toString());
+        if (requested == null) return;
+        if (requested.trim().isEmpty()) requested = suggested.toString();
+        final Path output = Paths.get(requested.trim()).toAbsolutePath().normalize();
+        submit("Exporting " + tab.name().toLowerCase(Locale.ROOT) + "...", new Callable<Long>() {
+            @Override public Long call() throws IOException {
+                Path parent = output.getParent();
+                if (parent != null) Files.createDirectories(parent);
+                byte[] bytes = payload.content.getBytes(StandardCharsets.UTF_8);
+                Files.write(output, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                return (long) bytes.length;
+            }
+        }, new Consumer<Long>() {
+            @Override public void accept(Long bytes) {
+                status = "Exported " + bytes + " byte(s) to " + output;
+            }
+        });
+    }
+
+    private ExportPayload exportPayload() {
+        List<String> lines = new ArrayList<String>();
+        String baseName = tab.name().toLowerCase(Locale.ROOT);
+        String extension = ".txt";
+        if (tab == Tab.BROWSE) {
+            lines.add("JVMRTDP browser export");
+            lines.add(browserTitle);
+            lines.add("filter=" + (browserFilter.isEmpty() ? "<none>" : browserFilter));
+            lines.add("");
+            for (TuiBrowserEntry entry : visibleBrowserEntries) lines.add(entry.displayName());
+            baseName = browserTitle;
+        } else if (tab == Tab.CONTEXT) {
+            if (!session.context().isSet()) return null;
+            lines.add("CONTEXT STACK");
+            List<String> stack = session.context().stack(1024);
+            for (int index = 0; index < stack.size(); index++) lines.add("#" + index + " " + stack.get(index));
+            lines.add("");
+            lines.add("CONTEXT VALUE");
+            lines.addAll(contextLines);
+            baseName = session.context().description();
+        } else if (tab == Tab.FIELDS) {
+            if (contextClass == null) return null;
+            lines.add("Fields of " + contextClass.className());
+            lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
+            lines.add("");
+            for (RemoteField field : visibleFields()) {
+                lines.add(String.format("%s %s %s  descriptor=%s  declaredBy=%s",
+                        field.isStatic() ? "static" : "instance", field.typeName(), field.name(),
+                        field.descriptor(), field.declaringClass()));
+            }
+            baseName = contextClass.className() + "-fields";
+        } else if (tab == Tab.METHODS) {
+            if (contextClass == null) return null;
+            lines.add("Methods of " + contextClass.className());
+            lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
+            lines.add("");
+            for (RemoteMethod method : visibleMethods()) {
+                lines.add(String.format("%s %s %s%s  declaredBy=%s",
+                        method.isStatic() ? "static" : "instance", method.returnTypeName(), method.name(),
+                        method.parameterTypeNames(), method.declaringClass()));
+                lines.add("  descriptor=" + method.descriptor());
+            }
+            baseName = contextClass.className() + "-methods";
+        } else if (tab == Tab.SOURCE) {
+            if (sourceLines.isEmpty()) return null;
+            lines.addAll(sourceLines);
+            baseName = sourceTitle;
+            extension = ".java";
+        } else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) {
+            if (bytecode == null) return null;
+            lines.add(bytecodeClass + "." + bytecodeMethod + bytecodeDescriptor);
+            lines.add("maxStack=" + bytecode.maxStack() + " maxLocals=" + bytecode.maxLocals());
+            lines.add("");
+            int index = 0;
+            for (BytecodeInstruction instruction : bytecode.instructions()) {
+                lines.add(String.format("#%04d BCI=%05d line=%-5s %-16s %s", index++, instruction.offset(),
+                        instruction.sourceLine() < 0 ? "-" : Integer.toString(instruction.sourceLine()),
+                        instruction.mnemonic(), instruction.operands()));
+            }
+            if (tab == Tab.DEBUG) {
+                lines.add("");
+                lines.addAll(debuggerSidePanel());
+            }
+            baseName = bytecodeClass + "." + bytecodeMethod + (tab == Tab.DEBUG ? "-debug" : "-bytecode");
+            extension = tab == Tab.DEBUG ? ".debug.txt" : ".bytecode.txt";
+        } else if (tab == Tab.THREADS) {
+            lines.add("JVM THREADS (" + debuggerThreads.size() + ")");
+            for (RemoteJvmtiThread thread : debuggerThreads) {
+                JvmDebuggerState stop = pausedStateForThread(thread);
+                lines.add(thread.name() + "  " + thread.stateSummary()
+                        + (stop == null ? "" : "  STOP=" + stop.reason() + " "
+                                + stop.className() + "." + stop.methodName() + "@" + stop.location())
+                        + "  priority=" + thread.priority() + " daemon=" + thread.daemon());
+            }
+            baseName = "jvm-threads";
+        }
+        return new ExportPayload(baseName, extension, joinLines(lines));
+    }
+
+    private boolean horizontallyScrollable() {
+        return tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG;
+    }
+
+    private void moveHorizontal(int delta) {
+        int index = tab.ordinal();
+        horizontalOffsets[index] = clamp(horizontalOffsets[index] + delta, 0, maximumHorizontalOffset());
+        status = horizontalOffsets[index] == 0 ? "Horizontal viewport reset"
+                : "Horizontal offset " + horizontalOffsets[index] + " ([ / ] scroll, 0 resets)";
+    }
+
+    private void resetHorizontal() {
+        horizontalOffsets[tab.ordinal()] = 0;
+        status = "Horizontal viewport reset";
+    }
+
+    private void toggleInspector() {
+        if (tab != Tab.BYTECODE && tab != Tab.DEBUG) {
+            status = "The inspector is available in Bytecode and Debug views.";
+            return;
+        }
+        inspectorVisibleOverride = Boolean.TRUE;
+        inspectorFocused = !inspectorFocused;
+        status = inspectorFocused
+                ? "Debugger info focused: arrows/PgUp/PgDn scroll, I or Esc returns to bytecode"
+                : "Debugger info returned to the side panel";
+    }
+
+    private boolean inspectorVisible(int width) {
+        boolean requested = inspectorVisibleOverride == null ? width >= 90
+                : inspectorVisibleOverride.booleanValue();
+        return requested && width >= 90;
+    }
+
+    private boolean handleInspectorNavigation(int key) {
+        if (!inspectorFocused || (tab != Tab.BYTECODE && tab != Tab.DEBUG)) return false;
+        List<String> lines = debuggerSidePanel();
+        int page = Math.max(1, screen.height() - 7);
+        if (key == 'i' || key == 'I' || key == TuiKey.ESCAPE) {
+            toggleInspector();
+            return true;
+        }
+        if (key == TuiKey.UP) inspectorScroll--;
+        else if (key == TuiKey.DOWN) inspectorScroll++;
+        else if (key == TuiKey.PAGE_UP) inspectorScroll -= page;
+        else if (key == TuiKey.PAGE_DOWN) inspectorScroll += page;
+        else if (key == TuiKey.HOME) inspectorScroll = 0;
+        else if (key == TuiKey.END) inspectorScroll = Math.max(0, lines.size() - 1);
+        else if (key == TuiKey.LEFT || key == '[') inspectorHorizontal -= 8;
+        else if (key == TuiKey.RIGHT || key == ']') inspectorHorizontal += 8;
+        else if (key == '0') inspectorHorizontal = 0;
+        else return false;
+        inspectorScroll = clamp(inspectorScroll, 0, Math.max(0, lines.size() - 1));
+        inspectorHorizontal = clamp(inspectorHorizontal, 0,
+                Math.max(0, TuiViewport.maximumWidth(lines) - 1));
+        return true;
+    }
+
+    private int maximumHorizontalOffset() {
+        if (inspectorFocused) {
+            return Math.max(0, TuiViewport.maximumWidth(debuggerSidePanel()) - 1);
+        }
+        if (tab == Tab.SOURCE) return Math.max(0, TuiViewport.maximumWidth(sourceLines) - 1);
+        if (tab == Tab.BYTECODE || tab == Tab.DEBUG) {
+            if (bytecode == null) return 0;
+            int maximum = 0;
+            for (BytecodeInstruction instruction : bytecode.instructions()) {
+                maximum = Math.max(maximum, instructionText(instruction).length());
+            }
+            return Math.max(0, maximum - 1);
+        }
+        return Math.max(0, Math.max(TuiViewport.maximumWidth(leftLines()),
+                TuiViewport.maximumWidth(rightLines())) - 1);
+    }
+
+    private void navigateBack() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tab == Tab.FRAMES || tab == Tab.LOCALS || tab == Tab.BREAKPOINTS) {
+            tab = Tab.DEBUG;
+            alignDebuggerLocation(Tab.DEBUG);
+            status = "Returned to Debug";
+            return;
+        }
+        if (tab == Tab.BROWSE) {
+            if (searchMode) requestPackage(packageName);
+            else if (!packageName.isEmpty()) requestPackage(TuiBrowserModel.parentPackage(packageName));
+            return;
+        }
+        if (session.context().isSet() && session.context().depth() > 1) {
+            session.context().back();
+            tab = Tab.CONTEXT;
+            requestContextRefresh();
+        } else status = "Context stack has no previous item.";
+    }
+
+    private void clearContext() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        session.context().clear();
+        selectedMethod = null;
+        clearContextView();
+        tab = Tab.BROWSE;
+        status = "Context and context stack cleared.";
+    }
+
+    private void clearContextView() {
+        contextClass = null;
+        fields.clear();
+        methods.clear();
+        contextLines.clear();
+        contextLines.add("No context selected.");
+        contextLines.add("Choose a class from Browse. Class context exposes static + virtual metadata;");
+        contextLines.add("reading a field pushes an object context with instance members.");
+    }
+
+    private void refresh() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        if (tab == Tab.BROWSE) {
+            if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
+            else requestPackage(packageName);
+        } else if (tab == Tab.DEBUG || tab == Tab.FRAMES
+                || tab == Tab.LOCALS || tab == Tab.THREADS) requestDebuggerRefresh();
+        else if (session.context().isSet()) requestContextRefresh();
+    }
+
+    private void toggleRuntime() {
+        showRuntime = !showRuntime;
+        status = showRuntime ? "Runtime/JDK classes are visible"
+                : "Runtime/JDK classes and generated lambdas are hidden";
+        if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
+        else requestPackage(packageName);
+    }
+
+    private void toggleArrays() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        showArrays = !showArrays;
+        status = showArrays
+                ? "Array classes enabled; opening package root (arrays have no Java package or <clinit>)"
+                : "Array classes hidden";
+        if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
+        else requestPackage(showArrays ? "" : packageName);
+    }
+
+    private void toggleSpecialMethods() {
+        if (tasks.busy()) { status = busyMessage(); return; }
+        showSpecialMethods = !showSpecialMethods;
+        status = showSpecialMethods
+                ? "JVM lifecycle methods enabled: loading <init> and <clinit> from class bytes"
+                : "JVM lifecycle methods hidden";
+        if (session.context().isSet() && !tasks.busy()) requestContextRefresh();
+        else if (!session.context().isSet()) tab = Tab.BROWSE;
+    }
+
+    private void toggleInheritedObjectMethods() {
+        if (tab != Tab.METHODS) {
+            status = "H toggles inherited java.lang.Object methods from the Methods view.";
+            return;
+        }
+        hideInheritedObjectMethods = !hideInheritedObjectMethods;
+        clampMemberSelections();
+        List<RemoteMethod> visible = visibleMethods();
+        selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+        status = hideInheritedObjectMethods
+                ? "Hidden unoverridden java.lang.Object methods; real overrides remain visible"
+                : "Inherited java.lang.Object methods are visible";
+    }
+
+    private void toggleEngine() {
+        engine = engine == DecompilerEngine.CFR ? DecompilerEngine.PROCYON : DecompilerEngine.CFR;
+        status = "Decompiler changed to " + engine + "; press S or A to decompile.";
+    }
+
+    private void editFilter() throws IOException {
+        if (tab == Tab.BROWSE) {
+            String value = editText("Local browser filter", browserFilter);
+            if (value != null) {
+                browserFilter = value;
+                applyBrowserFilter();
+                status = visibleBrowserEntries.size() + " locally filtered item(s)";
+            }
+        } else if (tab == Tab.FIELDS || tab == Tab.METHODS) {
+            String value = editText("Member filter", memberFilter);
+            if (value != null) {
+                memberFilter = value;
+                clampMemberSelections();
+                status = "Member filter: " + (memberFilter.isEmpty() ? "<none>" : memberFilter);
+            }
+        } else if (tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG) {
+            editViewSearch();
+        } else status = "Use / in Browse, Fields, Methods, Decompile, Bytecode, or Debug.";
+    }
+
+    private void editViewSearch() throws IOException {
+        String prompt = tab == Tab.SOURCE ? "Find decompiled text"
+                : "Find text, opcode:, operand:, bci:, line:, or string:";
+        String value = editText(prompt, viewSearch);
+        if (value == null || value.trim().isEmpty()) return;
+        viewSearch = value.trim();
+        findNextInView(1);
+    }
+
+    private void findNextInView(int direction) {
+        if (viewSearch.isEmpty() || (tab != Tab.SOURCE && tab != Tab.BYTECODE && tab != Tab.DEBUG)) {
+            status = "Press / to enter a Decompile/Bytecode search first.";
+            return;
+        }
+        if (tab == Tab.SOURCE) {
+            int match = nextTextMatch(sourceLines, selections[tab.ordinal()], viewSearch, direction);
+            if (match >= 0) {
+                selections[tab.ordinal()] = match;
+                status = "Decompile match at line " + (match + 1) + " (N previous, n next)";
+            } else status = "No decompiled-text match for: " + viewSearch;
+            return;
+        }
+        if (bytecode == null || bytecode.instructions().isEmpty()) {
+            status = "Load bytecode before searching.";
+            return;
+        }
+        String lower = viewSearch.toLowerCase(Locale.ROOT);
+        String mode = "text";
+        String expression = viewSearch;
+        int separator = viewSearch.indexOf(':');
+        if (separator > 0) {
+            mode = viewSearch.substring(0, separator).trim().toLowerCase(Locale.ROOT);
+            expression = viewSearch.substring(separator + 1).trim();
+        }
+        debugSearchResults.clear();
+        if ("string".equals(mode) || "constant".equals(mode)) {
+            String needle = expression.toLowerCase(Locale.ROOT);
+            for (String constant : constantPool) {
+                if (constant.toLowerCase(Locale.ROOT).contains(needle)) {
+                    debugSearchResults.add(constant);
+                    if (debugSearchResults.size() >= 32) break;
+                }
+            }
+        }
+        List<BytecodeInstruction> instructions = bytecode.instructions();
+        int start = selections[tab.ordinal()];
+        for (int step = 1; step <= instructions.size(); step++) {
+            int index = Math.floorMod(start + direction * step, instructions.size());
+            BytecodeInstruction instruction = instructions.get(index);
+            if (matchesInstruction(instruction, mode, expression)) {
+                selections[tab.ordinal()] = index;
+                status = "Bytecode match #" + index + " BCI " + instruction.offset()
+                        + " (N previous, n next)";
+                return;
+            }
+        }
+        status = debugSearchResults.isEmpty() ? "No bytecode/constant match for: " + viewSearch
+                : debugSearchResults.size() + " constant-pool match(es); see Debug inspector";
+    }
+
+    private static boolean matchesInstruction(
+            BytecodeInstruction instruction, String mode, String expression) {
+        String needle = expression.toLowerCase(Locale.ROOT);
+        if ("bci".equals(mode)) return Long.toString(instruction.offset()).equals(expression);
+        if ("line".equals(mode)) return Integer.toString(instruction.sourceLine()).equals(expression);
+        if ("opcode".equals(mode)) return instruction.mnemonic().toLowerCase(Locale.ROOT).contains(needle);
+        if ("operand".equals(mode) || "string".equals(mode) || "constant".equals(mode)) {
+            return instruction.operands().toLowerCase(Locale.ROOT).contains(needle);
+        }
+        return instructionText(instruction).toLowerCase(Locale.ROOT).contains(
+                (mode + ("text".equals(mode) ? "" : ":") + expression).toLowerCase(Locale.ROOT));
+    }
+
+    private static int nextTextMatch(List<String> lines, int start, String query, int direction) {
+        if (lines.isEmpty()) return -1;
+        String needle = query.toLowerCase(Locale.ROOT);
+        for (int step = 1; step <= lines.size(); step++) {
+            int index = Math.floorMod(start + direction * step, lines.size());
+            if (lines.get(index).toLowerCase(Locale.ROOT).contains(needle)) return index;
+        }
+        return -1;
+    }
+
+    private void goToLocation() throws IOException {
+        if (tab != Tab.SOURCE && tab != Tab.BYTECODE && tab != Tab.DEBUG) {
+            status = "g jumps to a decompiled row, BCI, bytecode line, or instruction row.";
+            return;
+        }
+        String value = editText(tab == Tab.SOURCE ? "Go to decompiled line"
+                : "Go to row number, bci:<n>, or line:<n>", "");
+        if (value == null || value.trim().isEmpty()) return;
+        String query = value.trim().toLowerCase(Locale.ROOT);
+        if (tab == Tab.SOURCE) {
+            try {
+                selections[tab.ordinal()] = clamp(Integer.parseInt(query) - 1,
+                        0, Math.max(0, sourceLines.size() - 1));
+                status = "Decompiled line " + (selections[tab.ordinal()] + 1);
+            } catch (NumberFormatException failure) { status = "Invalid decompiled line: " + value; }
+            return;
+        }
+        String mode = "row";
+        int split = query.indexOf(':');
+        if (split > 0) { mode = query.substring(0, split); query = query.substring(split + 1); }
+        try {
+            int wanted = Integer.parseInt(query);
+            if ("row".equals(mode)) selections[tab.ordinal()] = clamp(wanted,
+                    0, Math.max(0, itemCount(tab) - 1));
+            else {
+                viewSearch = mode + ":" + wanted;
+                findNextInView(1);
+            }
+        } catch (NumberFormatException failure) { status = "Invalid location: " + value; }
+    }
+
+    private void goPackage() throws IOException {
+        String value = editText("Go to exact package", packageName);
+        if (value != null) requestPackage(value);
+    }
+
+    private void forceLoadClass() throws IOException {
+        final String value = editText("Class.forName in target JVM", "");
+        if (value == null) return;
+        final String className = value.trim();
+        if (className.isEmpty()) {
+            status = "Class.forName cancelled: class name is empty.";
+            return;
+        }
+        submit("Loading " + className + " for Class.forName initialization...", new Callable<RemoteClass>() {
+            @Override public RemoteClass call() { return session.startForceLoadClass(className); }
+        }, new Consumer<RemoteClass>() {
+            @Override public void accept(RemoteClass type) {
+                session.context().select(type);
+                tab = Tab.CONTEXT;
+                status = "Class.forName initialization started for " + type.className()
+                        + "; <clinit> breakpoints can stop its loader thread";
+                requestContextRefresh();
+            }
+        });
+    }
+
+    private String editText(String prompt, String initial) throws IOException {
+        if (tasks.busy()) { status = busyMessage(); return null; }
+        final String previousStatus = status;
+        StringBuilder value = new StringBuilder(initial == null ? "" : initial);
+        while (true) {
+            status = prompt + ": " + value + "  (Enter apply, Esc/Ctrl+G cancel)";
+            render();
+            int key = screen.readKey();
+            if (key == TuiKey.EOF) {
+                status = previousStatus;
+                return null;
+            }
+            if (key == TuiKey.ENTER) return value.toString();
+            if (key == TuiKey.ESCAPE || key == TuiKey.CTRL_C || key == TuiKey.CTRL_G
+                    || key == TuiKey.F10) {
+                status = previousStatus;
+                return null;
+            }
+            if (key == TuiKey.CTRL_U) {
+                value.setLength(0);
+                continue;
+            }
+            if (key == TuiKey.BACKSPACE || key == TuiKey.DELETE) {
+                if (value.length() > 0) value.deleteCharAt(value.length() - 1);
+            } else if (key >= 32 && key < 127) value.append((char) key);
+        }
+    }
+
+    private void move(int delta) {
+        int count = itemCount(tab);
+        selections[tab.ordinal()] = clamp(selections[tab.ordinal()] + delta,
+                0, Math.max(0, count - 1));
+        if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+        }
+    }
+
+    private void moveToBoundary(boolean end) {
+        selections[tab.ordinal()] = end ? Math.max(0, itemCount(tab) - 1) : 0;
+        if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+        }
+    }
+
+    private void changeTab(int delta) {
+        inspectorFocused = false;
+        Tab[] tabs = Tab.values();
+        tab = tabs[(tab.ordinal() + delta + tabs.length) % tabs.length];
+        if (tab == Tab.DEBUG) alignDebuggerLocation(Tab.DEBUG);
+        if ((tab == Tab.DEBUG || tab == Tab.FRAMES || tab == Tab.LOCALS || tab == Tab.THREADS)
+                && !tasks.busy()) requestDebuggerRefresh();
+    }
+
+    private int itemCount(Tab value) {
+        if (value == Tab.BROWSE) return visibleBrowserEntries.size();
+        if (value == Tab.CONTEXT) return session.context().isSet() ? session.context().depth() : 0;
+        if (value == Tab.FIELDS) return visibleFields().size();
+        if (value == Tab.METHODS) return visibleMethods().size();
+        if (value == Tab.FRAMES) return debuggerFrames.size();
+        if (value == Tab.LOCALS) return debuggerLocals.size();
+        if (value == Tab.BREAKPOINTS) return breakpoints.size();
+        if (value == Tab.THREADS) return debuggerThreads.size();
+        if (value == Tab.BYTECODE || value == Tab.DEBUG) {
+            return bytecode == null ? 0 : bytecode.instructions().size();
+        }
+        return sourceLines.size();
+    }
+
+    private int selection() { return selections[tab.ordinal()]; }
+
+    private int bytecodeCursor() {
+        return clamp(selections[tab.ordinal()], 0,
+                Math.max(0, bytecode == null ? 0 : bytecode.instructions().size() - 1));
+    }
+
+    private List<RemoteField> visibleFields() {
+        List<RemoteField> result = new ArrayList<RemoteField>();
+        String needle = memberFilter.toLowerCase(Locale.ROOT);
+        for (RemoteField field : fields) {
+            if (needle.isEmpty() || field.name().toLowerCase(Locale.ROOT).contains(needle)
+                    || field.typeName().toLowerCase(Locale.ROOT).contains(needle)) result.add(field);
+        }
+        return result;
+    }
+
+    private List<RemoteMethod> visibleMethods() {
+        List<RemoteMethod> result = new ArrayList<RemoteMethod>();
+        String needle = memberFilter.toLowerCase(Locale.ROOT);
+        for (RemoteMethod method : methods) {
+            if (TuiBrowserModel.inheritedObjectMethodHidden(
+                    contextClass == null ? null : contextClass.className(),
+                    method.declaringClass(), hideInheritedObjectMethods)) continue;
+            if (needle.isEmpty() || method.name().toLowerCase(Locale.ROOT).contains(needle)
+                    || method.returnTypeName().toLowerCase(Locale.ROOT).contains(needle)
+                    || method.descriptor().toLowerCase(Locale.ROOT).contains(needle)) result.add(method);
+        }
+        return result;
+    }
+
+    private void clampMemberSelections() {
+        selections[Tab.FIELDS.ordinal()] = clamp(selections[Tab.FIELDS.ordinal()],
+                0, Math.max(0, visibleFields().size() - 1));
+        selections[Tab.METHODS.ordinal()] = clamp(selections[Tab.METHODS.ordinal()],
+                0, Math.max(0, visibleMethods().size() - 1));
+    }
+
+    private boolean requireContext() {
+        if (contextClass != null && session.context().isSet()) return true;
+        status = "Select a class or object context from Browse first.";
+        tab = Tab.BROWSE;
+        return false;
+    }
+
+    private <T> boolean submit(String label, Callable<T> operation, Consumer<T> success) {
+        boolean accepted = tasks.submitOrQueue(label, operation, success, new Consumer<Throwable>() {
+            @Override public void accept(Throwable failure) { recordError(failure); }
+        });
+        status = accepted ? label : "Busy: " + busyMessage();
+        return accepted;
+    }
+
+    private String busyMessage() {
+        String activity = tasks.activity();
+        return activity.isEmpty() ? "Refreshing debugger state; retry in a moment." : activity;
+    }
+
+    private void recordError(Throwable failure) {
+        pendingMemberResult = null;
+        String message = rootMessage(failure);
+        if (errors.size() >= 8) errors.removeFirst();
+        errors.addLast(message);
+        status = "ERROR: " + message;
+    }
+
+    private void render() {
+        // Never paint the physical last terminal column. Windows Terminal enables
+        // delayed autowrap when that cell is written, which appears as a flashing
+        // reverse-video block at the right edge during frequent debugger refreshes.
+        int width = Math.max(1, screen.width() - 1);
+        int height = Math.max(1, screen.height());
+        List<String> output = new ArrayList<String>();
+        output.add(TerminalScreen.REVERSE + TerminalScreen.pad(title(width), width) + TerminalScreen.RESET);
+        boolean tabsVisible = height >= 5;
+        boolean statusVisible = height >= 3;
+        boolean helpVisible = height >= 6;
+        int maximumHelpRows = height >= 12 ? 3 : height >= 8 ? 2 : 1;
+        List<String> shortcuts = helpVisible
+                ? TuiFooter.rows(helpTokens(), width, maximumHelpRows)
+                : Collections.<String>emptyList();
+        if (tabsVisible) output.add(tabsLine(width));
+        int reservedFooterRows = (statusVisible ? 1 : 0) + shortcuts.size();
+        int bodyRows = Math.max(0, height - output.size() - reservedFooterRows);
+        if (bodyRows > 0) {
+            if (tab == Tab.SOURCE) renderSource(output, width, bodyRows);
+            else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) renderWorkbench(output, width, bodyRows);
+            else renderBrowserPane(output, width, bodyRows);
+        }
+        if (statusVisible) {
+            String taskActivity = tasks.activity();
+            String activity = taskActivity.isEmpty() ? status : taskActivity;
+            if (horizontalOffsets[tab.ordinal()] > 0) {
+                activity += " | x=" + horizontalOffsets[tab.ordinal()] + "  [ / ] scroll  0 reset";
+            }
+            if (!activity.equals(pagedStatus)) {
+                pagedStatus = activity;
+                statusPage = 0;
+            }
+            output.add(TerminalScreen.REVERSE + TerminalScreen.pad(
+                    TuiFooter.page(Collections.singletonList(activity), width, statusPage), width)
+                    + TerminalScreen.RESET);
+        }
+        for (String shortcut : shortcuts) output.add(TerminalScreen.pad(shortcut, width));
+        screen.draw(output);
+    }
+
+    private String title(int width) {
+        String context = session.context().isSet() ? session.context().description() : "<no context>";
+        if (width < 90) {
+            return " JVMRTDP " + session.server().process().pid() + " | "
+                    + tab.name().toLowerCase(Locale.ROOT) + " | " + context;
+        }
+        String location = tab == Tab.SOURCE ? "decompile:" + sourceTitle
+                : (tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty()
+                        ? "method:" + bytecodeClass + "." + bytecodeMethod : browserTitle;
+        return " JVMRTDP " + session.server().process().pid() + " | CTX " + context
+                + " | " + location + " | " + engine + " ";
+    }
+
+    private String tabsLine(int width) {
+        StringBuilder result = new StringBuilder();
+        for (Tab value : Tab.values()) {
+            String name = width < 116 ? shortTabName(value) : displayTabName(value);
+            String label = " " + name + " ";
+            result.append(value == tab ? TerminalScreen.REVERSE + label + TerminalScreen.RESET : label);
+        }
+        return result.toString();
+    }
+
+    private static String displayTabName(Tab value) {
+        return value == Tab.SOURCE ? "decompile" : value.name().toLowerCase(Locale.ROOT);
+    }
+
+    private void renderBrowserPane(List<String> output, int width, int bodyRows) {
+        List<String> left = leftLines();
+        List<String> right = rightLines();
+        if (width < 90) {
+            List<String> compact = left;
+            int selected = selection();
+            int scroll = scrolls[tab.ordinal()];
+            boolean selectable = selectableTab();
+            if (selectable) {
+                if (selected < scroll) scroll = selected;
+                if (selected >= scroll + bodyRows) scroll = selected - bodyRows + 1;
+                scrolls[tab.ordinal()] = Math.max(0, scroll);
+            }
+            for (int row = 0; row < bodyRows; row++) {
+                int index = scroll + row;
+                String text = index < compact.size() ? compact.get(index) : "";
+                String cell = TerminalScreen.pad(TuiViewport.horizontal(text,
+                        horizontalOffsets[tab.ordinal()], width), width);
+                if (selectable && index == selected && index < left.size()) {
+                    cell = TerminalScreen.REVERSE + cell + TerminalScreen.RESET;
+                }
+                output.add(cell);
+            }
+            return;
+        }
+        int leftWidth = clamp(width * 38 / 100, 28, 54);
+        int rightWidth = Math.max(1, width - leftWidth - 3);
+        int selected = selection();
+        int scroll = scrolls[tab.ordinal()];
+        if (selectableTab()) {
+            if (selected < scroll) scroll = selected;
+            if (selected >= scroll + bodyRows) scroll = selected - bodyRows + 1;
+            scrolls[tab.ordinal()] = scroll;
+        } else scroll = scrolls[tab.ordinal()];
+        for (int row = 0; row < bodyRows; row++) {
+            int leftIndex = selectableTab() ? scroll + row : row;
+            String leftText = leftIndex < left.size() ? left.get(leftIndex) : "";
+            String leftCell = TerminalScreen.pad(TuiViewport.horizontal(leftText,
+                    horizontalOffsets[tab.ordinal()], leftWidth), leftWidth);
+            if (selectableTab() && leftIndex == selected) {
+                leftCell = TerminalScreen.REVERSE + leftCell + TerminalScreen.RESET;
+            }
+            int rightIndex = tab == Tab.SOURCE ? scrolls[tab.ordinal()] + row : row;
+            String rightText = rightIndex < right.size() ? right.get(rightIndex) : "";
+            output.add(leftCell + " | " + TerminalScreen.pad(TuiViewport.horizontal(rightText,
+                    horizontalOffsets[tab.ordinal()], rightWidth), rightWidth));
+        }
+    }
+
+    private void renderSource(List<String> output, int width, int bodyRows) {
+        int cursor = clamp(selections[Tab.SOURCE.ordinal()], 0, Math.max(0, sourceLines.size() - 1));
+        int vertical = clamp(scrolls[Tab.SOURCE.ordinal()], 0, Math.max(0, sourceLines.size() - 1));
+        if (cursor < vertical) vertical = cursor;
+        if (cursor >= vertical + bodyRows) vertical = cursor - bodyRows + 1;
+        scrolls[Tab.SOURCE.ordinal()] = vertical;
+        int digits = Math.max(3, Integer.toString(Math.max(1, sourceLines.size())).length());
+        int gutterWidth = Math.min(width, digits + 2);
+        int contentWidth = Math.max(0, width - gutterWidth - (width > gutterWidth ? 1 : 0));
+        int horizontal = horizontalOffsets[Tab.SOURCE.ordinal()];
+        for (int row = 0; row < bodyRows; row++) {
+            int index = vertical + row;
+            String gutter = index < sourceLines.size() ? String.format("%" + digits + "d ", index + 1) : "";
+            String source = index < sourceLines.size()
+                    ? TuiViewport.horizontal(sourceLines.get(index), horizontal, contentWidth) : "";
+            String line = TerminalScreen.DIM + TerminalScreen.pad(gutter, gutterWidth) + TerminalScreen.RESET;
+            if (contentWidth > 0) line += " " + TerminalScreen.pad(source, contentWidth);
+            if (index == cursor && index < sourceLines.size()) {
+                line = TerminalScreen.REVERSE + line + TerminalScreen.RESET;
+            }
+            output.add(line);
+        }
+    }
+
+    private boolean selectableTab() {
+        return tab == Tab.BROWSE || tab == Tab.CONTEXT || tab == Tab.FIELDS
+                || tab == Tab.METHODS || tab == Tab.FRAMES || tab == Tab.LOCALS
+                || tab == Tab.BREAKPOINTS || tab == Tab.THREADS;
+    }
+
+    private List<String> leftLines() {
+        List<String> result = new ArrayList<String>();
+        if (tab == Tab.BROWSE) {
+            for (TuiBrowserEntry entry : visibleBrowserEntries) result.add(entry.displayName());
+        } else if (tab == Tab.CONTEXT || tab == Tab.SOURCE) {
+            if (session.context().isSet()) {
+                List<String> stack = session.context().stack(128);
+                for (int index = 0; index < stack.size(); index++) result.add("#" + index + " " + stack.get(index));
+            }
+        } else if (tab == Tab.FIELDS) {
+            for (RemoteField field : visibleFields()) result.add(fieldLabel(field));
+        } else if (tab == Tab.METHODS) {
+            for (RemoteMethod method : visibleMethods()) result.add(methodLabel(method));
+        } else if (tab == Tab.FRAMES) {
+            for (JvmStackFrame frame : debuggerFrames) {
+                result.add((frame.depth() == debuggerFrameDepth ? "> " : "  ") + frame.display());
+            }
+        } else if (tab == Tab.LOCALS) {
+            for (JvmDebuggerLocal local : debuggerLocals) result.add(localLabel(local));
+        } else if (tab == Tab.BREAKPOINTS) {
+            for (BreakpointSpec breakpoint : breakpoints.values()) result.add(breakpointLabel(breakpoint));
+        } else if (tab == Tab.THREADS) {
+            for (RemoteJvmtiThread thread : debuggerThreads) {
+                result.add(debuggerThreadLabel(thread));
+            }
+        }
+        return result;
+    }
+
+    private List<String> rightLines() {
+        if (tab == Tab.CONTEXT) {
+            List<String> result = new ArrayList<String>(contextLines);
+            result.add("");
+            result.add("STACK MANAGEMENT");
+            addKeyHelp(result, "Enter", "Move selected item to top");
+            addKeyHelp(result, "Space", "Copy selected item to top");
+            addKeyHelp(result, "S", "Swap top two items");
+            addKeyHelp(result, "Delete", "Remove selected item");
+            addKeyHelp(result, "X", "Clear context stack");
+            return result;
+        }
+        if (tab == Tab.SOURCE) return sourceLines;
+        List<String> result = new ArrayList<String>();
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+            result.add(entry.kind() == TuiBrowserEntry.Kind.CLASS ? "Class: " + entry.name()
+                    : entry.kind() == TuiBrowserEntry.Kind.PARENT ? "Parent package: " + entry.name()
+                    : entry.kind() == TuiBrowserEntry.Kind.PACKAGE ? "Package: " + entry.name()
+                    : entry.kind() == TuiBrowserEntry.Kind.FIELD ? "Field: " + entry.name()
+                    : "Method: " + entry.name());
+            if (entry.kind() == TuiBrowserEntry.Kind.CLASS && entry.name().startsWith("[")) {
+                result.add("Kind: array class");
+                result.add("Initialization: arrays have no <init>/<clinit> and no classfile Code attribute");
+                result.add("To hook class initialization, select the component/owner class instead.");
+            }
+            RemoteClassInfo info = entry.classInfo();
+            if (info != null) {
+                result.add("Kind: " + (info.isInterface() ? "interface" : info.isEnum() ? "enum"
+                        : info.isArray() ? "array" : "class"));
+                result.add("Super: " + (info.superclass().isEmpty() ? "<none>" : info.superclass()));
+                result.add("Interfaces: " + info.interfaces());
+            }
+            if (entry.field() != null) {
+                RemoteField field = entry.field();
+                result.add("Owner:      " + field.declaringClass());
+                result.add("Type:       " + field.typeName());
+                result.add("Descriptor: " + field.descriptor());
+                result.add("Modifiers:  " + Modifier.toString(field.modifiers()));
+            } else if (entry.method() != null) {
+                RemoteMethod method = entry.method();
+                result.add("Owner:          " + method.declaringClass());
+                result.add("Return:         " + method.returnTypeName());
+                result.add("Parameters:     " + method.parameterTypeNames());
+                result.add("Descriptor:     " + method.descriptor());
+                result.add("Implementation: " + method.implementationKind());
+                result.add("Modifiers:      " + Modifier.toString(method.modifiers()));
+            }
+            result.add("");
+            result.add("SHORTCUTS");
+            addKeyHelp(result, "Enter", entry.kind() == TuiBrowserEntry.Kind.CLASS
+                    ? "Select this CLASS metadata context"
+                    : entry.kind() == TuiBrowserEntry.Kind.PACKAGE
+                            || entry.kind() == TuiBrowserEntry.Kind.PARENT
+                            ? "Open this package"
+                            : "Open declaring class and select member");
+            addKeyHelp(result, "Backspace", "Open parent package/context");
+            addKeyHelp(result, "F", "Find classes, fields, methods or packages");
+            addKeyHelp(result, "L", "Class.forName and initialize a target class");
+            addKeyHelp(result, "/", "Filter the current list");
+            addKeyHelp(result, "J", "Show/hide JDK runtime entries");
+            addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
+            addKeyHelp(result, "0", "Reset horizontal position");
+        } else if (tab == Tab.FIELDS) {
+            List<RemoteField> visible = visibleFields();
+            if (!visible.isEmpty()) {
+                RemoteField field = visible.get(selection());
+                result.add((field.isStatic() ? "STATIC " : "INSTANCE ")
+                        + Modifier.toString(field.modifiers()) + " " + field.typeName() + " " + field.name());
+                result.add("Declared by: " + field.declaringClass());
+                result.add("Descriptor:  " + field.descriptor());
+                result.add("");
+                if (!field.isStatic() && classContext) {
+                    result.add("Metadata-only virtual field: no object reference is required to find/watch it.");
+                    result.add("An OBJECT context is required only to read its value.");
+                } else {
+                    result.add("Reading pushes the result onto the shared context stack.");
+                }
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "Enter", "Read field value");
+                addKeyHelp(result, "U", "Toggle field-read watchpoint");
+                addKeyHelp(result, "W", "Toggle field-write watchpoint");
+                addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
+                addKeyHelp(result, "0", "Reset horizontal position");
+            }
+        } else if (tab == Tab.METHODS) {
+            List<RemoteMethod> visible = visibleMethods();
+            result.add("Object inheritance: " + (hideInheritedObjectMethods
+                    ? "hidden when not overridden" : "visible") + " (H toggles)");
+            result.add("");
+            if (!visible.isEmpty()) {
+                RemoteMethod method = visible.get(selection());
+                result.add((method.isStatic() ? "STATIC " : "INSTANCE ")
+                        + Modifier.toString(method.modifiers()) + " " + method.returnTypeName()
+                        + " " + method.name() + method.parameterTypeNames());
+                result.add("Declared by: " + method.declaringClass());
+                result.add("Descriptor:  " + method.descriptor());
+                result.add("Implementation: " + method.implementationKind());
+                if (method.isJvmSpecial()) {
+                    result.add("JVM lifecycle: " + ("<init>".equals(method.name())
+                            ? "instance constructor" : "class initialization"));
+                    result.add("Not a reflective call target; bytecode/debug actions remain available.");
+                    if ("<clinit>".equals(method.name())) {
+                        result.add("Note: <clinit> runs once; an already initialized class cannot hit it again.");
+                        result.add("Hook init at BCI 0 before initialization starts.");
+                    }
+                }
+                if (method.isNative()) result.add("Code: native implementation; no JVM Code attribute");
+                else if (method.isAbstract()) result.add("Code: abstract declaration; no JVM Code attribute");
+                else result.add("Code: JVM bytecode is available");
+                if (contextClass != null && !method.declaringClass().equals(contextClass.className())) {
+                    result.add("Inherited: bytecode/decompilation uses the declaring class above.");
+                }
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "H", "Hide/show unoverridden Object methods");
+                addKeyHelp(result, "K", "Show/hide <init> and <clinit>");
+                addKeyHelp(result, "Enter / B", "Open method bytecode");
+                addKeyHelp(result, "F9", "Toggle entry breakpoint at BCI 0");
+                addKeyHelp(result, "S", "Decompile selected method");
+                addKeyHelp(result, "A", "Decompile context class");
+                addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
+                addKeyHelp(result, "0", "Reset horizontal position");
+            }
+        } else if (tab == Tab.FRAMES) {
+            result.add("STACK FRAMES (" + debuggerFrames.size() + ")");
+            if ((debuggerState == null || !debuggerState.paused()) && !liveSampleAvailable) {
+                result.add("No paused thread or live-follow sample is available.");
+            } else if (debuggerFrames.isEmpty()) {
+                result.add("<stack unavailable>");
+            } else {
+                JvmStackFrame frame = debuggerFrames.get(selection());
+                result.add("Depth:      " + frame.depth());
+                result.add("Class:      " + frame.className());
+                result.add("Method:     " + frame.methodName());
+                result.add("Descriptor: " + frame.descriptor());
+                result.add("Location:   " + (frame.hasJavaLocation()
+                        ? "BCI " + frame.location() : "native (no Java BCI)"));
+                result.add("Kind:       " + (frame.isNative() ? "NATIVE" : "JAVA BYTECODE"));
+                result.add("");
+                if (frame.depth() == 0) {
+                    result.add(liveSampleAvailable && (debuggerState == null || !debuggerState.paused())
+                            ? "This was the thread's actual top at sample time."
+                            : "This is the thread's actual suspension point.");
+                } else {
+                    result.add("This caller frame is inspectable; the actual top is frame #0.");
+                    result.add("Already executed bytecodes cannot be stepped backwards.");
+                }
+                if (frame.isNative()) {
+                    result.add("Select the nearest Java/application frame below this native frame.");
+                }
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "Enter", "Open this frame's bytecode and BCI");
+                addKeyHelp(result, "M", "Read locals for this paused/live-sampled frame");
+                addKeyHelp(result, "F9", "Set a persistent breakpoint after opening bytecode");
+                addKeyHelp(result, "T", "Return to all JVM threads");
+            }
+        } else if (tab == Tab.LOCALS) {
+            result.add("FRAME " + debuggerFrameDepth + " LOCALS");
+            if ((debuggerState == null || !debuggerState.paused()) && !liveSampleAvailable) {
+                result.add("No paused thread or live-follow sample is available.");
+                result.add("Enable F4 live follow, pause a thread, or wait for a breakpoint.");
+            } else if (debuggerLocals.isEmpty()) {
+                result.add(debuggerLocalsError.isEmpty() ? "<no readable locals>" : debuggerLocalsError);
+            } else {
+                JvmDebuggerLocal local = debuggerLocals.get(selection());
+                result.add("Name:       " + local.name());
+                result.add("Slot:       " + local.slot());
+                result.add("Descriptor: " + local.descriptor());
+                result.add("Scope:      BCI " + local.scopeStart() + ".."
+                        + (local.scopeStart() + local.scopeLength()));
+                result.add("Source:     " + (local.inferred() ? "inferred from maxLocals" : "LocalVariableTable"));
+                result.add("Value:      " + (local.available()
+                        ? local.value() == null ? "null" : local.value().displayValue()
+                        : "<" + local.error() + ">"));
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "Enter", "Push this local value onto Context");
+                addKeyHelp(result, "G", "Return to selected execution frame BCI");
+                addKeyHelp(result, "Tab", "Frames selects another stack depth");
+                addKeyHelp(result, "T", "Open JVM threads");
+            }
+        } else if (tab == Tab.BREAKPOINTS) {
+            result.add("MANAGED BREAKPOINTS (" + breakpoints.size() + ")");
+            List<BreakpointSpec> values = breakpointList();
+            if (values.isEmpty()) result.add("<none>");
+            else {
+                BreakpointSpec breakpoint = values.get(selection());
+                result.add("Class:      " + breakpoint.className);
+                result.add("Method:     " + breakpoint.methodName);
+                result.add("Descriptor: " + breakpoint.descriptor);
+                result.add("BCI:        " + breakpoint.bci);
+                result.add("Line:       " + (breakpoint.line < 0 ? "<unknown>" : breakpoint.line));
+                result.add("State:      enabled"
+                        + (isCurrentBreakpoint(breakpoint) ? " / CURRENT STOP" : ""));
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "Enter", "Open bytecode at this breakpoint");
+                addKeyHelp(result, "F9 / Delete", "Clear selected breakpoint");
+                addKeyHelp(result, "A", "Clear all managed breakpoints");
+            }
+        } else if (tab == Tab.THREADS) {
+            RemoteJvmtiThread thread = selectedDebuggerThread();
+            result.add("ALL JVM THREADS (" + debuggerThreads.size() + ")");
+            result.add("ANALYSIS FREEZE: " + (session.debugger().active()
+                    ? "ACTIVE (" + session.debugger().ownedThreadCount() + " owned)"
+                    : "off") + "  * toggles");
+            addFreezeDetails(result, 8);
+            if (thread == null) result.add("<none>");
+            else {
+                JvmDebuggerState stop = pausedStateForThread(thread);
+                result.add("Name:     " + thread.name());
+                result.add("State:    " + thread.stateSummary());
+                result.add("Priority: " + thread.priority());
+                result.add("Daemon:   " + thread.daemon());
+                result.add("Debugger: " + (thread.debuggerPaused() ? "PAUSED" : "running/waiting"));
+                if (stop != null) {
+                    result.add("STOP HIT: " + stop.reason());
+                    result.add("At:       " + stop.className() + "." + stop.methodName()
+                            + stop.descriptor() + " BCI " + stop.location()
+                            + (stop.sourceLine() < 0 ? "" : " line " + stop.sourceLine()));
+                }
+                result.add("");
+                result.add("Breakpoint/watchpoint hits automatically open their current BCI.");
+                result.add("");
+                result.add("SHORTCUTS");
+                addKeyHelp(result, "Enter / F6", stop == null
+                        ? "Pause and follow this thread" : "Open this stop in Debug");
+                addKeyHelp(result, "G", "Open current stop in Debug");
+                addKeyHelp(result, "F7", "Execute one bytecode while paused");
+                addKeyHelp(result, "F8", "Continue this thread");
+                addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
+                addKeyHelp(result, "0", "Reset horizontal position");
+            }
+        }
+        return result;
+    }
+
+    private static void addKeyHelp(List<String> lines, String key, String description) {
+        lines.add(String.format(Locale.ROOT, "%-11s %s", key, description));
+    }
+
+    private void renderWorkbench(List<String> output, int width, int bodyRows) {
+        if (inspectorFocused) {
+            renderFocusedInspector(output, width, bodyRows);
+            return;
+        }
+        boolean compactGutter = width < 78;
+        int gutterWidth = compactGutter ? Math.min(14, width) : Math.min(23, width);
+        int sideWidth = inspectorVisible(width) ? Math.min(64, Math.max(34, width * 31 / 100)) : 0;
+        int separators = gutterWidth < width ? (sideWidth == 0 ? 3 : 6) : 0;
+        int centerWidth = Math.max(0, width - gutterWidth - sideWidth - separators);
+        List<BytecodeInstruction> instructions = bytecode == null
+                ? Collections.<BytecodeInstruction>emptyList() : bytecode.instructions();
+        int cursor = bytecodeCursor();
+        int scroll = scrolls[tab.ordinal()];
+        if (cursor < scroll) scroll = cursor;
+        if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
+        scrolls[tab.ordinal()] = scroll;
+        List<String> side = debuggerSidePanel();
+        int sideRows = Math.max(0, bodyRows - 1);
+        inspectorScroll = clamp(inspectorScroll, 0, Math.max(0, side.size() - sideRows));
+        for (int row = 0; row < bodyRows; row++) {
+            int index = scroll + row;
+            String gutter = "";
+            String instructionText = "";
+            if (index < instructions.size()) {
+                BytecodeInstruction instruction = instructions.get(index);
+                boolean stopped = debuggerState != null && debuggerState.paused()
+                        && bytecodeClass.equals(debuggerState.className())
+                        && bytecodeMethod.equals(debuggerState.methodName())
+                        && bytecodeDescriptor.equals(debuggerState.descriptor())
+                        && instruction.offset() == debuggerState.location();
+                boolean breakpoint = breakpoints.containsKey(BreakpointSpec.id(
+                        bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset()));
+                String sourceLine = instruction.sourceLine() < 0 ? "-" : Integer.toString(instruction.sourceLine());
+                gutter = compactGutter
+                        ? String.format("%s%s %05d L%-4s", stopped ? ">" : " ", breakpoint ? "*" : " ",
+                                instruction.offset(), sourceLine)
+                        : String.format("%s%s #%04d B%05d L%-5s", stopped ? ">" : " ", breakpoint ? "*" : " ",
+                                index, instruction.offset(), sourceLine);
+                instructionText = instructionText(instruction);
+            } else if (index == 0 && bytecode == null) {
+                String foregroundActivity = tasks.activity();
+                instructionText = !foregroundActivity.isEmpty() ? foregroundActivity
+                        : tab == Tab.DEBUG
+                                ? "Waiting for a stop; press T to select any JVM thread, then F6 to pause it."
+                                : "Select a method and press B/Enter to load bytecode.";
+            }
+            else if (index == 0 && instructions.isEmpty()) instructionText = "<no Code attribute: native or abstract method>";
+            String gutterCell = TerminalScreen.pad(gutter, gutterWidth);
+            String visibleInstruction = TuiViewport.horizontal(
+                    instructionText, horizontalOffsets[tab.ordinal()], centerWidth);
+            String centerCell = TerminalScreen.pad(visibleInstruction, centerWidth);
+            if (index == cursor && index < instructions.size()) {
+                gutterCell = TerminalScreen.REVERSE + gutterCell + TerminalScreen.RESET;
+                centerCell = TerminalScreen.REVERSE + centerCell + TerminalScreen.RESET;
+            }
+            String line = gutterCell;
+            if (centerWidth > 0) line += " | " + centerCell;
+            if (sideWidth > 0) {
+                String sideText;
+                if (row == 0) {
+                    int last = Math.min(side.size(), inspectorScroll + sideRows);
+                    sideText = "INFO [" + (side.isEmpty() ? 0 : inspectorScroll + 1)
+                            + "-" + last + "/" + side.size() + "]  I open";
+                } else {
+                    int sideIndex = inspectorScroll + row - 1;
+                    sideText = sideIndex < side.size() ? side.get(sideIndex) : "";
+                }
+                line += " | " + TerminalScreen.pad(TuiViewport.horizontal(
+                        sideText, inspectorHorizontal, sideWidth), sideWidth);
+            }
+            output.add(line);
+        }
+    }
+
+    private void renderFocusedInspector(List<String> output, int width, int bodyRows) {
+        List<String> lines = debuggerSidePanel();
+        int contentRows = Math.max(0, bodyRows - 1);
+        inspectorScroll = clamp(inspectorScroll, 0, Math.max(0, lines.size() - contentRows));
+        int last = Math.min(lines.size(), inspectorScroll + contentRows);
+        output.add(TerminalScreen.REVERSE + TerminalScreen.pad(
+                " DEBUG INFO  lines " + (lines.isEmpty() ? 0 : inspectorScroll + 1) + "-" + last
+                        + "/" + lines.size() + "  I/Esc back  arrows/Pg scroll  [/]/0 horizontal",
+                width) + TerminalScreen.RESET);
+        for (int row = 0; row < contentRows; row++) {
+            int index = inspectorScroll + row;
+            String value = index < lines.size() ? lines.get(index) : "";
+            String number = index < lines.size() ? String.format("%4d ", index + 1) : "     ";
+            int textWidth = Math.max(0, width - number.length());
+            output.add(TerminalScreen.DIM + number + TerminalScreen.RESET
+                    + TerminalScreen.pad(TuiViewport.horizontal(value, inspectorHorizontal, textWidth), textWidth));
+        }
+    }
+
+    private List<String> debuggerSidePanel() {
+        List<String> result = new ArrayList<String>();
+        result.add("BYTECODE");
+        result.add(bytecodeClass.isEmpty() ? "<none>" : bytecodeClass + "." + bytecodeMethod);
+        result.add(bytecodeDescriptor);
+        result.add(bytecode == null ? "" : "maxStack=" + bytecode.maxStack()
+                + " maxLocals=" + bytecode.maxLocals());
+        if (bytecode != null) result.add("implementation=" + bytecode.implementationKind()
+                + (bytecode.isNative() || bytecode.isAbstract() ? " (no Code attribute)" : ""));
+        result.add("");
+        result.add("DEBUGGER");
+        result.add("ANALYSIS FREEZE: " + (session.debugger().active()
+                ? "ACTIVE; " + session.debugger().ownedThreadCount() + " thread(s) owned"
+                : "off") + "  (* toggles safely)");
+        addFreezeDetails(result, 5);
+        if (debuggerState == null) result.add("Checking state... (F5 refreshes now)");
+        else if (debuggerState.paused()) {
+            result.add("PAUSED: " + debuggerState.reason());
+            result.add("ACTUAL TOP: " + debuggerState.className() + "."
+                    + debuggerState.methodName() + debuggerState.descriptor());
+            result.add(debuggerState.location() < 0 ? "TOP LOCATION: native (BCI -1)"
+                    : "TOP LOCATION: BCI " + debuggerState.location()
+                            + "  line " + debuggerState.sourceLine());
+            JvmStackFrame viewed = viewedDebuggerFrame();
+            if (viewed != null) {
+                result.add("VIEW FRAME #" + viewed.depth() + ": " + viewed.className()
+                        + "." + viewed.methodName() + viewed.descriptor());
+                result.add(viewed.hasJavaLocation() ? "VIEW LOCATION: BCI " + viewed.location()
+                        : "VIEW LOCATION: native; choose a Java frame");
+            }
+            result.add("F7 steps; F8 continues this thread");
+            if (debuggerState.location() < 0) {
+                result.add("F7 waits for the native call to return; it cannot reverse into a caller.");
+            }
+        } else if (debuggerState.enabled()) {
+            result.add("RUNNING" + (liveFollowEnabled && !followedThreadName.isEmpty()
+                    ? " - LIVE FOLLOW " + followedThreadName : " - waiting for next stop"));
+            result.add("F4 live follow: " + (liveFollowEnabled ? "ON" : "off"));
+            if (liveSampleAvailable) {
+                result.add("LIVE SAMPLE age=" + Math.max(0L,
+                        System.currentTimeMillis() - liveSampleCapturedAt) + "ms");
+                result.add("ACTUAL: " + liveSampleActual);
+                result.add("VIEW:   " + liveSampleView);
+                result.add("The thread was resumed immediately after this sample.");
+            } else if (!liveSampleError.isEmpty()) {
+                result.add("LIVE SAMPLE: " + liveSampleError);
+            }
+            result.add("Breakpoints are detected automatically");
+            if (!lastStopSummary.isEmpty()) {
+                result.add("Last stop: " + lastStopSummary);
+                if (lastStopSummary.startsWith("main_entry")) {
+                    result.add("main-entry is one-shot and is now cleared");
+                    result.add("Use F9 on a reachable BCI to stop again");
+                }
+            }
+        } else result.add("DISABLED - F9 enables it when setting a breakpoint");
+        result.add("");
+        result.add("STOPPED THREADS (" + pausedDebuggerCount() + ")");
+        for (JvmDebuggerState state : debuggerStates) {
+            if (!state.paused()) continue;
+            result.add((state == debuggerState ? "> " : "  ")
+                    + (state.thread() == null ? "<unknown>" : state.thread().displayValue()));
+            result.add("    " + state.className() + "." + state.methodName()
+                    + " @" + state.location() + " seq=" + state.sequence());
+        }
+        if (pausedDebuggerCount() == 0) result.add("<target running; no event thread is stopped>");
+        result.add("");
+        result.add("ALL JVM THREADS (" + debuggerThreads.size() + ")  T opens list");
+        int shownThreads = 0;
+        for (RemoteJvmtiThread thread : debuggerThreads) {
+            if (shownThreads++ >= 12) {
+                result.add("... " + (debuggerThreads.size() - 12) + " more; T opens full list");
+                break;
+            }
+            JvmDebuggerState stop = pausedStateForThread(thread);
+            result.add(stop == null ? "  " + thread.name() + "  " + thread.stateSummary()
+                    : ">> STOP " + stop.reason() + "  " + thread.name()
+                            + "  " + stop.methodName() + "@" + stop.location());
+        }
+        if (debuggerThreads.isEmpty()) result.add("<refreshing>");
+        result.add("");
+        if (debuggerState != null && debuggerState.paused()) {
+            result.add("LOCALS (view frame " + debuggerFrameDepth + ")");
+            if (!debuggerLocalsError.isEmpty()) result.add("<unavailable: " + debuggerLocalsError + ">");
+            else if (debuggerLocals.isEmpty()) result.add("<no active variables or LocalVariableTable>");
+            else for (JvmDebuggerLocal local : debuggerLocals) {
+                result.add((local.inferred() ? "~" : "") + "[" + local.slot() + "] "
+                        + local.name() + " " + local.descriptor());
+                result.add("    " + (local.available()
+                        ? local.value() == null ? "null" : local.value().displayValue()
+                        : "<" + local.error() + ">"));
+            }
+        } else if (liveSampleAvailable) {
+            result.add("LIVE SAMPLE LOCALS (frame " + debuggerFrameDepth + ")");
+            if (!debuggerLocalsError.isEmpty()) result.add("<unavailable: " + debuggerLocalsError + ">");
+            else if (debuggerLocals.isEmpty()) result.add("<no active variables or LocalVariableTable>");
+            else for (JvmDebuggerLocal local : debuggerLocals) {
+                result.add((local.inferred() ? "~" : "") + "[" + local.slot() + "] "
+                        + local.name() + " " + local.descriptor());
+                result.add("    " + (local.available()
+                        ? local.value() == null ? "null" : local.value().displayValue()
+                        : "<" + local.error() + ">"));
+            }
+        } else {
+            result.add("LAST STOP LOCALS (snapshot)");
+            if (lastDebuggerLocals.isEmpty()) result.add("<no stop captured yet>");
+            else result.addAll(lastDebuggerLocals);
+        }
+        result.add("");
+        if (debuggerState != null && debuggerState.paused()) {
+            result.add("STACK TRACE (current; Frames tab selects depth)");
+            if (debuggerStack.isEmpty()) result.add("<unavailable>");
+            else for (int depth = 0; depth < debuggerStack.size(); depth++) {
+                result.add((depth == debuggerFrameDepth ? "> " : "  ")
+                        + "#" + depth + " " + debuggerStack.get(depth));
+            }
+        } else if (liveSampleAvailable) {
+            result.add("LIVE SAMPLE STACK (thread already resumed)");
+            if (debuggerStack.isEmpty()) result.add("<unavailable>");
+            else for (int depth = 0; depth < debuggerStack.size(); depth++) {
+                result.add((depth == debuggerFrameDepth ? "> " : "  ")
+                        + "#" + depth + " " + debuggerStack.get(depth));
+            }
+        } else {
+            result.add("LAST STOP STACK (snapshot)");
+            if (lastDebuggerStack.isEmpty()) result.add("<no stop captured yet>");
+            else for (String frame : lastDebuggerStack) result.add("  " + frame);
+        }
+        result.add("");
+        result.add("SEARCH");
+        result.add(viewSearch.isEmpty() ? "<none>" : viewSearch);
+        for (String match : debugSearchResults) result.add("  " + match);
+        result.add("");
+        result.add("BREAKPOINTS (" + breakpoints.size() + ")");
+        if (breakpoints.isEmpty()) result.add("<none>");
+        else for (BreakpointSpec breakpoint : breakpoints.values()) {
+            result.add("* " + breakpoint.methodName + " @" + breakpoint.bci
+                    + (breakpoint.line < 0 ? "" : " L" + breakpoint.line));
+        }
+        result.add("WATCHPOINTS (" + fieldWatches.size() + ")");
+        if (fieldWatches.isEmpty()) result.add("<none; U/W in Fields adds read/write watches>");
+        else for (String watch : fieldWatches.values()) result.add("* " + watch);
+        result.add("");
+        result.add("CONTEXT");
+        result.add(session.context().isSet() ? session.context().description() : "<unset>");
+        if (!errors.isEmpty()) {
+            result.add("");
+            result.add("RECENT ERRORS");
+            for (String error : errors) result.add("! " + error);
+        }
+        result.add("");
+        result.add("TOOLS");
+        addKeyHelp(result, "I", "Open full information view");
+        addKeyHelp(result, "T", "Open all JVM threads");
+        addKeyHelp(result, "F4", "Toggle live RUNNING-thread sampling");
+        addKeyHelp(result, "Tab", "Open Frames to inspect native callers");
+        addKeyHelp(result, "G", "Jump to current execution BCI");
+        addKeyHelp(result, "Y", "Continue all stopped threads");
+        addKeyHelp(result, "*", session.debugger().active()
+                ? "Restore analysis-freeze thread states" : "Freeze eligible threads for analysis");
+        addKeyHelp(result, "F9", "Toggle breakpoint at selected BCI");
+        addKeyHelp(result, "F7", "Step one bytecode");
+        addKeyHelp(result, "F8", "Continue selected thread");
+        addKeyHelp(result, "/", "Search current bytecode/debug view");
+        addKeyHelp(result, "S", "Decompile current method");
+        addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
+        addKeyHelp(result, "0", "Reset horizontal position");
+        return result;
+    }
+
+    private void addFreezeDetails(List<String> result, int limit) {
+        if (lastFreezeReport == null) return;
+        int shown = 0;
+        for (DebuggerFreezeReport.Entry entry : lastFreezeReport.entries()) {
+            if (entry.action() != DebuggerFreezeReport.Action.FAILED
+                    && entry.action() != DebuggerFreezeReport.Action.EXCLUDED) continue;
+            if (shown++ >= limit) {
+                result.add("... more freeze details available from CLI: debugger freeze-status");
+                break;
+            }
+            result.add(entry.action().name() + " " + entry.threadName() + ": " + entry.detail());
+        }
+    }
+
+    private List<String> helpTokens() {
+        List<String> result = new ArrayList<String>();
+        if (inspectorFocused) {
+            Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "I/Esc Bytecode",
+                    "Up/Down Info", "PgUp/PgDn Page", "Home/End Edge",
+                    "F7 Step", "F8 Run", "F2 CLI", "Q Back");
+            return result;
+        }
+        Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "L Class.forName",
+                "M Locals", "Z Breakpoints");
+        if (tab == Tab.BROWSE) Collections.addAll(result,
+                "/ Filter", "F Find", "P Package", "J JDK", "A Arrays", "Backspace Parent");
+        else if (tab == Tab.FIELDS) Collections.addAll(result,
+                "/ Filter", "Enter Read", "U Break Read", "W Break Write",
+                "Backspace Context", "D Dump");
+        else if (tab == Tab.METHODS) Collections.addAll(result,
+                "/ Filter", "H Hide Object", "K <init>/<clinit>", "Enter/B Bytecode",
+                "F9 Entry Break", "S Method Decompile", "A Class Decompile");
+        else if (tab == Tab.SOURCE) Collections.addAll(result,
+                "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break",
+                "O Export");
+        else if (tab == Tab.BYTECODE) Collections.addAll(result,
+                "/ Search", "n/N Match", "g BCI/Line", "F9 Break", "S Decompile", "I Info");
+        else if (tab == Tab.DEBUG) Collections.addAll(result,
+                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "F7 Step", "F8 Run", "Y Run All", "* Freeze/Thaw",
+                "/ Search", "S Decompile", "I Info");
+        else if (tab == Tab.FRAMES) Collections.addAll(result,
+                "Enter Open Frame", "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
+        else if (tab == Tab.LOCALS) Collections.addAll(result,
+                "Enter To Context", "G Current BCI", "T Threads", "F4 Live Follow", "F5 Refresh");
+        else if (tab == Tab.BREAKPOINTS) Collections.addAll(result,
+                "Enter Open", "F9/Delete Clear", "A Clear All", "G Current BCI");
+        else if (tab == Tab.THREADS) Collections.addAll(result,
+                "Enter/F6 Pause", "G Open Stop", "F7 Step", "F8 Run",
+                "T Next", "F5 Refresh", "Y Run All", "* Freeze/Thaw");
+        else Collections.addAll(result, "Backspace Context", "D Dump", "O Export");
+        Collections.addAll(result, "Up/Down Move", "PgUp/PgDn Page", "Home/End Edge",
+                horizontallyScrollable() ? "Left/Right Scroll" : "Left/Right Tab",
+                "Tab View", "Enter Open", "F2 CLI", "Q Back");
+        return result;
+    }
+
+    private String fieldLabel(RemoteField field) {
+        String inherited = contextClass != null && !field.declaringClass().equals(contextClass.className()) ? "^" : " ";
+        return (field.isStatic() ? "S" : "V") + inherited + " " + field.typeName() + " " + field.name();
+    }
+
+    private String methodLabel(RemoteMethod method) {
+        String inherited = contextClass != null && !method.declaringClass().equals(contextClass.className()) ? "^" : " ";
+        String special = method.isJvmSpecial() ? "J" : method.isNative() ? "N"
+                : method.isAbstract() ? "A" : " ";
+        return (method.isStatic() ? "S" : "V") + inherited + special + " " + method.returnTypeName() + " "
+                + method.name() + "(" + String.join(", ", method.parameterTypeNames()) + ")";
+    }
+
+    private static String localLabel(JvmDebuggerLocal local) {
+        String availability = local.available() ? " " : "!";
+        String inferred = local.inferred() ? "~" : " ";
+        String value = local.available() && local.value() != null
+                ? local.value().displayValue() : local.error();
+        return availability + inferred + "[" + local.slot() + "] " + local.name()
+                + " " + local.descriptor() + " = " + value;
+    }
+
+    private String breakpointLabel(BreakpointSpec breakpoint) {
+        return (isCurrentBreakpoint(breakpoint) ? "> HIT " : "  ")
+                + breakpoint.className + "." + breakpoint.methodName
+                + " @" + breakpoint.bci
+                + (breakpoint.line < 0 ? "" : " L" + breakpoint.line);
+    }
+
+    private boolean isCurrentBreakpoint(BreakpointSpec breakpoint) {
+        return debuggerState != null && debuggerState.paused()
+                && breakpoint.className.equals(debuggerState.className())
+                && breakpoint.methodName.equals(debuggerState.methodName())
+                && breakpoint.descriptor.equals(debuggerState.descriptor())
+                && breakpoint.bci == debuggerState.location();
+    }
+
+    private void releasePausedDebugger() {
+        try {
+            if (session.debugger().active()) session.debugger().restore();
+            List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+            try {
+                boolean paused = false;
+                for (JvmDebuggerState state : states) paused |= state.paused();
+                if (paused) session.jvmti().continueAllExecutions();
+            } finally {
+                for (JvmDebuggerState state : states) state.close();
+            }
+        } catch (RuntimeException ignored) { }
+    }
+
+    private static String instructionText(BytecodeInstruction instruction) {
+        return String.format("%-16s %s", instruction.mnemonic(), instruction.operands());
+    }
+
+    private static String shortTabName(Tab value) {
+        switch (value) {
+            case BROWSE: return "brw";
+            case CONTEXT: return "ctx";
+            case FIELDS: return "fld";
+            case METHODS: return "mth";
+            case SOURCE: return "dec";
+            case BYTECODE: return "bc";
+            case DEBUG: return "dbg";
+            case FRAMES: return "frm";
+            case LOCALS: return "loc";
+            case BREAKPOINTS: return "bp";
+            case THREADS: return "thr";
+            default: return value.name().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    private static String safeFileName(String value) {
+        String normalized = value == null ? "export" : value.replaceAll("[<>:\"/\\\\|?*\\p{Cntrl}]", "_")
+                .replaceAll("\\s+", "_").replaceAll("_+", "_");
+        while (normalized.endsWith(".") || normalized.endsWith("_")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        if (normalized.isEmpty()) normalized = "export";
+        return normalized.length() <= 120 ? normalized : normalized.substring(0, 120);
+    }
+
+    private static String joinLines(List<String> lines) {
+        StringBuilder result = new StringBuilder();
+        for (String line : lines) result.append(line == null ? "" : line).append(System.lineSeparator());
+        return result.toString();
+    }
+
+    private static String glob(String expression) {
+        if (expression == null || expression.trim().isEmpty()) return "*";
+        String value = expression.trim();
+        return value.indexOf('*') >= 0 || value.indexOf('?') >= 0 ? value : "*" + value + "*";
+    }
+
+    private static void addLines(List<String> target, String value) {
+        Collections.addAll(target, value.split("\\r?\\n", -1));
+    }
+
+    private static boolean sameMethod(RemoteMethod left, RemoteMethod right) {
+        return left.declaringClass().equals(right.declaringClass())
+                && left.name().equals(right.name()) && left.descriptor().equals(right.descriptor());
+    }
+
+    private static int clamp(int value, int minimum, int maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private static String rootMessage(Throwable failure) {
+        Throwable current = failure;
+        while (current.getCause() != null) current = current.getCause();
+        return current.getMessage() == null ? current.toString() : current.getMessage();
+    }
+
+    private static final class SearchResult {
+        private final List<String> packages;
+        private final List<RemoteClassInfo> classes;
+        private final List<RemoteField> fields;
+        private final List<RemoteMethod> methods;
+        private SearchResult(List<String> packages, List<RemoteClassInfo> classes,
+                List<RemoteField> fields, List<RemoteMethod> methods) {
+            this.packages = packages; this.classes = classes;
+            this.fields = fields; this.methods = methods;
+        }
+    }
+
+    private static final class MemberPattern {
+        private final String ownerGlob;
+        private final String nameGlob;
+        private MemberPattern(String ownerGlob, String nameGlob) {
+            this.ownerGlob = ownerGlob; this.nameGlob = nameGlob;
+        }
+        private static MemberPattern parse(String expression) {
+            String value = expression == null ? "" : expression.trim();
+            int separator = value.indexOf('#');
+            if (separator < 0) return new MemberPattern("*", glob(value));
+            return new MemberPattern(glob(value.substring(0, separator)),
+                    glob(value.substring(separator + 1)));
+        }
+    }
+
+    private static final class ExportPayload {
+        private final String baseName;
+        private final String extension;
+        private final String content;
+        private ExportPayload(String baseName, String extension, String content) {
+            this.baseName = baseName;
+            this.extension = extension;
+            this.content = content;
+        }
+    }
+
+    private static final class ContextSnapshot {
+        private final RemoteClass type;
+        private final boolean classContext;
+        private final List<RemoteField> fields;
+        private final List<RemoteMethod> methods;
+        private final List<String> valueLines;
+        private final String specialError;
+        private ContextSnapshot(RemoteClass type, boolean classContext,
+                List<RemoteField> fields, List<RemoteMethod> methods, List<String> valueLines,
+                String specialError) {
+            this.type = type; this.classContext = classContext; this.fields = fields;
+            this.methods = methods; this.valueLines = valueLines;
+            this.specialError = specialError;
+        }
+    }
+
+    private static final class LiveExecutionSample {
+        private final String threadName;
+        private final DebuggerSnapshot snapshot;
+        private final String error;
+        private final boolean realStopDetected;
+        private final long previouslyObserved;
+
+        private LiveExecutionSample(String threadName, DebuggerSnapshot snapshot,
+                String error, boolean realStopDetected, long previouslyObserved) {
+            this.threadName = threadName;
+            this.snapshot = snapshot;
+            this.error = error;
+            this.realStopDetected = realStopDetected;
+            this.previouslyObserved = previouslyObserved;
+        }
+
+        private static LiveExecutionSample captured(String threadName,
+                DebuggerSnapshot snapshot) {
+            return new LiveExecutionSample(threadName, snapshot, "", false, -1L);
+        }
+
+        private static LiveExecutionSample error(String threadName, String error) {
+            return new LiveExecutionSample(threadName, null, error, false, -1L);
+        }
+
+        private static LiveExecutionSample realStop(long previouslyObserved) {
+            return new LiveExecutionSample("", null, "", true, previouslyObserved);
+        }
+    }
+
+    private static final class DebuggerSnapshot implements AutoCloseable {
+        private final List<JvmDebuggerState> states;
+        private final int selected;
+        private final List<RemoteJvmtiThread> threads;
+        private final List<String> stack;
+        private final List<JvmStackFrame> frames;
+        private final int frameDepth;
+        private final List<JvmDebuggerLocal> locals;
+        private final String localsError;
+        private final ClassFileView stopBytecodeView;
+        private final String stopBytecodeClass;
+        private final String stopBytecodeMethod;
+        private final String stopBytecodeDescriptor;
+        private final long stopBytecodeLocation;
+        private final String stopBytecodeError;
+        private DebuggerSnapshot(List<JvmDebuggerState> states, int selected,
+                List<RemoteJvmtiThread> threads, List<String> stack,
+                List<JvmStackFrame> frames, int frameDepth,
+                List<JvmDebuggerLocal> locals, String localsError,
+                ClassFileView stopBytecodeView, String stopBytecodeClass,
+                String stopBytecodeMethod, String stopBytecodeDescriptor,
+                long stopBytecodeLocation, String stopBytecodeError) {
+            this.states = states; this.selected = selected; this.threads = threads; this.stack = stack;
+            this.frames = frames; this.frameDepth = frameDepth;
+            this.locals = locals; this.localsError = localsError;
+            this.stopBytecodeView = stopBytecodeView;
+            this.stopBytecodeClass = stopBytecodeClass;
+            this.stopBytecodeMethod = stopBytecodeMethod;
+            this.stopBytecodeDescriptor = stopBytecodeDescriptor;
+            this.stopBytecodeLocation = stopBytecodeLocation;
+            this.stopBytecodeError = stopBytecodeError;
+        }
+        private JvmDebuggerState selectedState() {
+            return states.isEmpty() ? null : states.get(clamp(selected, 0, states.size() - 1));
+        }
+        private long newestSequence() { return newestPausedSequence(states); }
+        @Override public void close() {
+            for (JvmDebuggerState state : states) state.close();
+            for (RemoteJvmtiThread thread : threads) thread.close();
+            for (JvmDebuggerLocal local : locals) local.close();
+        }
+    }
+
+    private static final class BreakpointSpec {
+        private final String className;
+        private final String methodName;
+        private final String descriptor;
+        private final long bci;
+        private final int line;
+        private BreakpointSpec(String className, String methodName, String descriptor, long bci, int line) {
+            this.className = className; this.methodName = methodName; this.descriptor = descriptor;
+            this.bci = bci; this.line = line;
+        }
+        private String id() { return id(className, methodName, descriptor, bci); }
+        private static String id(String className, String methodName, String descriptor, long bci) {
+            return className + '|' + methodName + '|' + descriptor + '|' + bci;
+        }
+    }
+
+    private static final class BreakpointClearResult {
+        private final List<String> cleared;
+        private final List<String> failures;
+
+        private BreakpointClearResult(List<String> cleared, List<String> failures) {
+            this.cleared = cleared;
+            this.failures = failures;
+        }
+    }
+}

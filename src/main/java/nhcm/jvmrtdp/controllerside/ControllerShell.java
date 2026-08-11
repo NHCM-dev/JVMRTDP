@@ -7,6 +7,7 @@ import nhcm.jvmrtdp.command.CommandLine;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.controllerside.command.ShellCommand;
 import nhcm.jvmrtdp.controllerside.command.ShellCommandRegistry;
+import nhcm.jvmrtdp.controllerside.tui.ControllerTui;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -28,15 +29,21 @@ public class ControllerShell {
             new ShellCommandRegistry<ControllerShell>();
 
     public ControllerShell(JVMRTDP controller, InputStream input, PrintStream output, PrintStream error) {
+        this(new BufferedReader(new InputStreamReader(
+                Objects.requireNonNull(input, "input"), StandardCharsets.UTF_8)),
+                controller, output, error);
+    }
+
+    public ControllerShell(BufferedReader input, JVMRTDP controller, PrintStream output, PrintStream error) {
         this.controller = Objects.requireNonNull(controller, "controller");
-        this.input = new BufferedReader(new InputStreamReader(
-                Objects.requireNonNull(input, "input"), StandardCharsets.UTF_8));
+        this.input = Objects.requireNonNull(input, "input");
         this.output = Objects.requireNonNull(output, "output");
         this.error = Objects.requireNonNull(error, "error");
         commands.register(new HelpCommand());
         commands.register(new PsCommand());
         commands.register(new AttachCommand());
         commands.register(new VersionCommand());
+        commands.register(new TuiCommand());
         commands.register(new ExitCommand());
     }
 
@@ -214,6 +221,21 @@ public class ControllerShell {
                 shell.output.println(BuildInfo.displayVersion());
             }
             return true;
+        }
+    }
+
+    private static class TuiCommand extends ShellCommand<ControllerShell> {
+        private TuiCommand() {
+            super("tui", "tui", "Switches to the full-screen process explorer.");
+        }
+
+        @Override
+        public boolean execute(ControllerShell shell, List<String> arguments) {
+            if (!arguments.isEmpty()) {
+                shell.error.println("Usage: " + usage());
+                return true;
+            }
+            return new ControllerTui(shell.controller, shell.input, shell.output, shell.error).run();
         }
     }
 }
