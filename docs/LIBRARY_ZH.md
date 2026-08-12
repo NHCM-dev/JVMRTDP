@@ -20,7 +20,7 @@ repositories {
 }
 
 dependencies {
-    implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0")
+    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.0")
 }
 ```
 
@@ -30,11 +30,11 @@ Maven：
 <dependency>
   <groupId>nhcm.jvmrtdp</groupId>
   <artifactId>jvmrtdp</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.0</version>
 </dependency>
 ```
 
-本地文件依赖使用 `build/libs/jvmrtdp-2.0.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 JLine 运行时依赖；使用文件依赖并调用终端控制类时，需要自行添加 JLine。`build/libs/JVMRTDP-2.0.0.jar` 仍是自包含可执行程序。
+本地文件依赖使用 `build/libs/jvmrtdp-2.1.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 JLine 运行时依赖；使用文件依赖并调用终端控制类时，需要自行添加 JLine。`build/libs/JVMRTDP-2.1.0.jar` 仍是自包含可执行程序。
 
 发布产物包括库 JAR、源码包、Javadoc 和 Maven POM。自动模块名为 `nhcm.jvmrtdp`。
 
@@ -190,4 +190,18 @@ Capability 取决于 JVM 阶段。需要仅限 `OnLoad` 的能力时，应在目
 - 嵌入式命令返回 `JvmRtdpCommandResult`；需要异常处理方式时调用 `requireSuccess()`。
 - 类型化 API 会针对目标错误、成员缺失、句柄失效和不支持的 JVMTI 操作抛出运行时异常。
 - 客户端、会话和可关闭远程句柄应始终使用 try-with-resources。
+## 新增 library 调试与插桩 API
+
+- `session.jvmti().setEventBreakpoint(...)`：方法进入、退出和异常事件断点。
+- `stepOut(thread)`：运行到当前 Java frame 返回后，在 caller 的第一条字节码暂停。
+- `setDebuggerLocal(...)`：修改暂停 frame 的 local。
+- `forceEarlyReturn(...)` / `forceEarlyReturnVoid(...)`：提前返回并替换结果。
+- `session.instrumentation()`：统一管理源码/JAR 部署、hook、class-file transformer、
+  retransform 和 redefine。
+
+abstract/interface 方法使用 `JvmEventBreakpointSpec.includingSubtypes()` 断到实现方法。
+部署的事件处理器实现 `JvmtiEventHandler`；字节码转换器实现 `JvmtiClassFileTransformer`。
+观察类 hook 优先用异步投递；需要同步修改 class bytes 的 transformer 使用同步投递。
+所有 session、远程对象、deployment 和 callback handle 都应确定性关闭。
+
 <!-- English LIBRARY.md is canonical. -->

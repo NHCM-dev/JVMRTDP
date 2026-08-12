@@ -6,6 +6,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.controllerside.RemoteArgumentList;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
@@ -320,7 +322,12 @@ public final class TargetTui implements AutoCloseable {
         else if (key == TuiKey.F4) toggleLiveFollow();
         else if (key == TuiKey.F6) pauseSelectedThread();
         else if (key == TuiKey.F7) step();
+        else if (key == TuiKey.SHIFT_F7) stepOut();
         else if (key == TuiKey.F8) continueExecution();
+        else if (key == TuiKey.CTRL_R && tab == Tab.DEBUG) forceEarlyReturn();
+        else if (key == TuiKey.CTRL_E && tab == Tab.METHODS) toggleMethodEventBreakpoint(true);
+        else if (key == TuiKey.CTRL_X && tab == Tab.METHODS) toggleMethodEventBreakpoint(false);
+        else if (key == TuiKey.CTRL_X && tab == Tab.DEBUG) toggleExceptionBreakpoint();
         return null;
     }
 
@@ -1832,6 +1839,151 @@ public final class TargetTui implements AutoCloseable {
         });
     }
 
+    private void stepOut() {
+        if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
+        if (debuggerState == null || !debuggerState.paused()) {
+            status = "Shift+F7 steps out of a paused Java frame. Pause a thread first.";
+            tab = Tab.THREADS;
+            if (!tasks.busy()) requestDebuggerRefresh();
+            return;
+        }
+        final long sequence = debuggerState.sequence();
+        final RemoteObject thread = debuggerState.thread();
+        submit("Running until the current Java frame returns...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() throws Exception {
+                session.jvmti().stepOut(thread);
+                DebuggerSnapshot latest = null;
+                for (int attempt = 0; attempt < 250; attempt++) {
+                    Thread.sleep(20L);
+                    if (latest != null) latest.close();
+                    latest = debuggerSnapshot(sequence);
+                    JvmDebuggerState selected = latest.selectedState();
+                    if (selected != null && selected.paused() && selected.sequence() > sequence) return latest;
+                }
+                return latest;
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) { applyDebuggerSnapshot(value, true); }
+        });
+    }
+
+    private void forceEarlyReturn() throws IOException {
+        if (debuggerState == null || !debuggerState.paused()) {
+            status = "Ctrl+R forces a currently paused Java frame to return.";
+            return;
+        }
+        if (debuggerState.reason().startsWith("method_exit")) {
+            status = "The method has already returned; force return at entry, a BCI breakpoint, or a step stop.";
+            return;
+        }
+        final RemoteObject thread = debuggerState.thread();
+        final String descriptor = debuggerState.descriptor();
+        int close = descriptor == null ? -1 : descriptor.lastIndexOf(')');
+        final boolean returnsVoid = close >= 0 && close + 1 < descriptor.length()
+                && descriptor.charAt(close + 1) == 'V';
+        if (returnsVoid) {
+            final String confirmation = editText("Force this void method to return now? Type yes", "");
+            if (!"yes".equalsIgnoreCase(confirmation == null ? "" : confirmation.trim())) {
+                status = confirmation == null ? status : "Force return cancelled.";
+                return;
+            }
+            submit("Forcing the current void method to return...", new Callable<DebuggerSnapshot>() {
+                @Override public DebuggerSnapshot call() {
+                    session.jvmti().forceEarlyReturnVoid(thread);
+                    return debuggerSnapshot();
+                }
+            }, new Consumer<DebuggerSnapshot>() {
+                @Override public void accept(DebuggerSnapshot value) {
+                    applyDebuggerSnapshot(value, true);
+                    status = "Forced the selected void method to return";
+                }
+            });
+            return;
+        }
+        final String expression = editText("Force return value (literal, @reference, or {expression})", "");
+        if (expression == null) return;
+        submit("Forcing the current Java method to return...", new Callable<DebuggerSnapshot>() {
+            @Override public DebuggerSnapshot call() {
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(expression))) {
+                    session.jvmti().forceEarlyReturn(thread, values.only());
+                }
+                return debuggerSnapshot();
+            }
+        }, new Consumer<DebuggerSnapshot>() {
+            @Override public void accept(DebuggerSnapshot value) {
+                applyDebuggerSnapshot(value, true);
+                status = "Forced the selected method to return " + expression;
+            }
+        });
+    }
+
+    private void toggleMethodEventBreakpoint(final boolean entry) {
+        final RemoteMethod method = selectedMethodForAction();
+        if (method == null) { status = "Select a method first."; return; }
+        JvmEventBreakpointSpec candidate = entry
+                ? JvmEventBreakpointSpec.methodEntry(method.declaringClass(), method.name(), method.descriptor())
+                : JvmEventBreakpointSpec.methodExit(method.declaringClass(), method.name(), method.descriptor());
+        if (method.isAbstract()) candidate = candidate.includingSubtypes();
+        final JvmEventBreakpointSpec spec = candidate;
+        JvmEventBreakpointInfo found = null;
+        for (JvmEventBreakpointInfo installed : session.jvmti().managedEventBreakpoints()) {
+            JvmEventBreakpointSpec value = installed.spec();
+            if (value.kind() == spec.kind() && value.classPattern().equals(spec.classPattern())
+                    && value.methodPattern().equals(spec.methodPattern())
+                    && value.descriptorPattern().equals(spec.descriptorPattern())
+                    && value.includeSubtypes() == spec.includeSubtypes()) { found = installed; break; }
+        }
+        final JvmEventBreakpointInfo existing = found;
+        submit((existing == null ? "Setting " : "Clearing ")
+                + (entry ? "method-entry" : "method-exit") + " event breakpoint...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        if (existing == null) {
+                            session.jvmti().configureDebugger(true);
+                            session.jvmti().setEventBreakpoint(spec);
+                            return Boolean.TRUE;
+                        }
+                        session.jvmti().clearEventBreakpoint(existing);
+                        return Boolean.FALSE;
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        status = (entry ? "Method-entry" : "Method-exit") + " event breakpoint "
+                                + (enabled.booleanValue() ? "set" : "cleared") + " on "
+                                + method.declaringClass() + "." + method.name()
+                                + (spec.includeSubtypes() ? " (implementations included)" : "");
+                    }
+                });
+    }
+
+    private void toggleExceptionBreakpoint() {
+        JvmEventBreakpointInfo found = null;
+        for (JvmEventBreakpointInfo installed : session.jvmti().managedEventBreakpoints()) {
+            JvmEventBreakpointSpec spec = installed.spec();
+            if (spec.kind() == nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointKind.EXCEPTION_THROW
+                    && "*".equals(spec.classPattern())) { found = installed; break; }
+        }
+        final JvmEventBreakpointInfo existing = found;
+        submit(existing == null ? "Enabling pause on thrown exceptions..."
+                : "Disabling pause on thrown exceptions...", new Callable<Boolean>() {
+            @Override public Boolean call() {
+                if (existing == null) {
+                    session.jvmti().configureDebugger(true);
+                    session.jvmti().setEventBreakpoint(JvmEventBreakpointSpec.exception("*"));
+                    return Boolean.TRUE;
+                }
+                session.jvmti().clearEventBreakpoint(existing);
+                return Boolean.FALSE;
+            }
+        }, new Consumer<Boolean>() {
+            @Override public void accept(Boolean enabled) {
+                status = enabled.booleanValue() ? "Debugger will pause when any exception is thrown"
+                        : "Pause-on-exception disabled";
+            }
+        });
+    }
+
     private void continueExecution() {
         if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
         if (debuggerState == null || !debuggerState.paused()) {
@@ -3322,6 +3474,7 @@ public final class TargetTui implements AutoCloseable {
                         ? "Pause and follow this thread" : "Open this stop in Debug");
                 addKeyHelp(result, "G", "Open current stop in Debug");
                 addKeyHelp(result, "F7", "Execute one bytecode while paused");
+                addKeyHelp(result, "Shift+F7", "Run until the current Java frame returns");
                 addKeyHelp(result, "F8", "Continue this thread");
                 addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
                 addKeyHelp(result, "0", "Reset horizontal position");
@@ -3448,9 +3601,17 @@ public final class TargetTui implements AutoCloseable {
             result.add("PAUSED: " + debuggerState.reason());
             result.add("ACTUAL TOP: " + debuggerState.className() + "."
                     + debuggerState.methodName() + debuggerState.descriptor());
-            result.add(debuggerState.location() < 0 ? "TOP LOCATION: native (BCI -1)"
+            result.add(debuggerState.location() < 0
+                    ? debuggerState.reason().startsWith("method_exit")
+                            ? "TOP LOCATION: method return event (no next BCI in this frame)"
+                            : "TOP LOCATION: native (BCI -1)"
                     : "TOP LOCATION: BCI " + debuggerState.location()
                             + "  line " + debuggerState.sourceLine());
+            if (!debuggerState.returnState().isEmpty()) {
+                result.add("RETURN: " + (debuggerState.returnValue() == null
+                        ? debuggerState.returnState() : debuggerState.returnValue().displayValue()));
+                result.add("METHOD_EXIT is observational; force return before this event.");
+            }
             JvmStackFrame viewed = viewedDebuggerFrame();
             if (viewed != null) {
                 result.add("VIEW FRAME #" + viewed.depth() + ": " + viewed.className()
@@ -3458,8 +3619,9 @@ public final class TargetTui implements AutoCloseable {
                 result.add(viewed.hasJavaLocation() ? "VIEW LOCATION: BCI " + viewed.location()
                         : "VIEW LOCATION: native; choose a Java frame");
             }
-            result.add("F7 steps; F8 continues this thread");
-            if (debuggerState.location() < 0) {
+            result.add("F7 steps; Shift+F7 steps out; F8 continues; Ctrl+R forces return");
+            if (debuggerState.location() < 0
+                    && !debuggerState.reason().startsWith("method_exit")) {
                 result.add("F7 waits for the native call to return; it cannot reverse into a caller.");
             }
         } else if (debuggerState.enabled()) {
@@ -3594,7 +3756,10 @@ public final class TargetTui implements AutoCloseable {
         addKeyHelp(result, "F9", "Toggle normal breakpoint at selected BCI");
         addKeyHelp(result, "Shift+F9", "Toggle breakpoint for current object only");
         addKeyHelp(result, "F7", "Step one bytecode");
+        addKeyHelp(result, "Shift+F7", "Step out to the caller");
         addKeyHelp(result, "F8", "Continue selected thread");
+        addKeyHelp(result, "Ctrl+R", "Force the paused Java frame to return");
+        addKeyHelp(result, "Ctrl+X", "Toggle pause on all thrown exceptions");
         addKeyHelp(result, "/", "Search current bytecode/debug view");
         addKeyHelp(result, "S", "Decompile current method");
         addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
@@ -3636,7 +3801,8 @@ public final class TargetTui implements AutoCloseable {
         else if (tab == Tab.METHODS) Collections.addAll(result,
                 "/ Filter", "f Find List", "F Global Find", "@ Static", "# Virtual",
                 "H Hide Object", "K <init>/<clinit>", "x/X Invoke/Exact", "Enter/B Bytecode",
-                "F9 Break", "Shift+F9 Object Break", "S Method Decompile", "A Class Decompile");
+                "F9 Break", "Shift+F9 Object Break", "Ctrl+E Entry Event", "Ctrl+X Exit Event",
+                "S Method Decompile", "A Class Decompile");
         else if (tab == Tab.SOURCE) Collections.addAll(result,
                 "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break", "Shift+F9 Object Break",
                 "A Class Decompile", "O Export");
@@ -3644,7 +3810,7 @@ public final class TargetTui implements AutoCloseable {
                 "/ Search", "n/N Match", "g BCI/Line", "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
                 "A Class Decompile", "I Info");
         else if (tab == Tab.DEBUG) Collections.addAll(result,
-                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "F8 Run", "Y Run All", "* Freeze/Thaw",
+                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
                 "/ Search", "S Method Decompile", "A Class Decompile", "I Info");
         else if (tab == Tab.FRAMES) Collections.addAll(result,
                 "Enter Open Frame", "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
@@ -3653,7 +3819,7 @@ public final class TargetTui implements AutoCloseable {
         else if (tab == Tab.BREAKPOINTS) Collections.addAll(result,
                 "Enter Open", "F9/Delete Clear", "A Clear All", "G Current BCI");
         else if (tab == Tab.THREADS) Collections.addAll(result,
-                "Enter/F6 Pause", "G Open Stop", "F7 Step", "F8 Run",
+                "Enter/F6 Pause", "G Open Stop", "F7 Step", "Shift+F7 Step Out", "F8 Run",
                 "T Next", "F5 Refresh", "Y Run All", "* Freeze/Thaw");
         else Collections.addAll(result, "= Set Source", "A Class Decompile", "Backspace Context", "D Dump", "O Export");
         Collections.addAll(result, "Up/Down Move", "PgUp/PgDn Page", "Home/End Edge",

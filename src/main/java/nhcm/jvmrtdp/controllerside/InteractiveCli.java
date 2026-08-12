@@ -42,6 +42,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -1560,8 +1562,11 @@ public class InteractiveCli {
                             + "break|clear <class> <method> <descriptor> <bci>|"
                             + "break-context|clear-context <method> <descriptor> <bci> [caller-class [caller-method [caller-descriptor]]]|"
                             + "breakpoints [clear-all]|"
+                            + "event-break <entry|exit> <class> <method> <descriptor> [subtypes]|"
+                            + "exception-break <class-glob>|event-breakpoints [clear-all]|event-clear <index>|"
                             + "watch <read|write> <set|clear> <class> <field> <descriptor>|watches [clear-all]|"
-                            + "continue [thread-index|all]|step [thread-index]|"
+                            + "continue [thread-index|all]|step [thread-index]|step-out [thread-index]|"
+                            + "force-return <thread-index> <value>|force-return-void <thread-index>|"
                             + "snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]> ...",
                     "Controls the shared multi-thread debugger, reversible analysis freeze, and structured exports.", "dbg");
         }
@@ -1780,6 +1785,51 @@ public class InteractiveCli {
                 else return InteractiveCli.usage(session, this);
                 return true;
             }
+            if (arguments.size() >= 5 && arguments.size() <= 6
+                    && "event-break".equalsIgnoreCase(arguments.get(0))) {
+                JvmEventBreakpointSpec spec;
+                if ("entry".equalsIgnoreCase(arguments.get(1))) {
+                    spec = JvmEventBreakpointSpec.methodEntry(arguments.get(2), arguments.get(3), arguments.get(4));
+                } else if ("exit".equalsIgnoreCase(arguments.get(1))) {
+                    spec = JvmEventBreakpointSpec.methodExit(arguments.get(2), arguments.get(3), arguments.get(4));
+                } else return InteractiveCli.usage(session, this);
+                if (arguments.size() == 6 && "subtypes".equalsIgnoreCase(arguments.get(5))) {
+                    spec = spec.includingSubtypes();
+                }
+                session.jvmti().configureDebugger(true);
+                session.output().println("installed " + session.jvmti().setEventBreakpoint(spec));
+                return true;
+            }
+            if (arguments.size() == 2 && "exception-break".equalsIgnoreCase(arguments.get(0))) {
+                session.jvmti().configureDebugger(true);
+                session.output().println("installed " + session.jvmti().setEventBreakpoint(
+                        JvmEventBreakpointSpec.exception(arguments.get(1))));
+                return true;
+            }
+            if (!arguments.isEmpty() && "event-breakpoints".equalsIgnoreCase(arguments.get(0))
+                    && arguments.size() <= 2) {
+                if (arguments.size() == 2 && "clear-all".equalsIgnoreCase(arguments.get(1))) {
+                    session.jvmti().clearManagedEventBreakpoints();
+                    session.output().println("cleared all managed event breakpoints");
+                } else if (arguments.size() == 1) {
+                    List<JvmEventBreakpointInfo> values = session.jvmti().managedEventBreakpoints();
+                    for (int index = 0; index < values.size(); index++) {
+                        session.output().printf("[%d] %s id=%s%n", index, values.get(index), values.get(index).id());
+                    }
+                    if (values.isEmpty()) session.output().println("<no managed event breakpoints>");
+                } else return InteractiveCli.usage(session, this);
+                return true;
+            }
+            if (arguments.size() == 2 && "event-clear".equalsIgnoreCase(arguments.get(0))) {
+                List<JvmEventBreakpointInfo> values = session.jvmti().managedEventBreakpoints();
+                int index = integer(arguments.get(1), "event breakpoint index");
+                if (index < 0 || index >= values.size()) {
+                    throw new IllegalArgumentException("No event breakpoint at index " + index);
+                }
+                session.jvmti().clearEventBreakpoint(values.get(index));
+                session.output().println("cleared event breakpoint " + index);
+                return true;
+            }
             if (arguments.size() == 6 && "watch".equalsIgnoreCase(arguments.get(0))) {
                 boolean modification;
                 if ("read".equalsIgnoreCase(arguments.get(1))) modification = false;
@@ -1824,6 +1874,38 @@ public class InteractiveCli {
                     resumeDebuggerThread(session, integer(arguments.get(1), "thread index"), true);
                 } else session.jvmti().stepInstruction();
                 session.output().println("stepping");
+                return true;
+            }
+            if (!arguments.isEmpty() && arguments.size() <= 2
+                    && ("step-out".equalsIgnoreCase(arguments.get(0))
+                    || "finish".equalsIgnoreCase(arguments.get(0)))) {
+                if (arguments.size() == 2) {
+                    List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                    try {
+                        session.jvmti().stepOut(pausedDebuggerState(states,
+                                integer(arguments.get(1), "thread index")).thread());
+                    } finally { closeDebuggerStates(states); }
+                } else session.jvmti().stepOut();
+                session.output().println("running until current frame returns");
+                return true;
+            }
+            if (arguments.size() == 3 && "force-return".equalsIgnoreCase(arguments.get(0))) {
+                List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                try (RemoteArgumentList values = RemoteArgumentList.resolve(session,
+                        Collections.singletonList(arguments.get(2)))) {
+                    session.jvmti().forceEarlyReturn(pausedDebuggerState(states,
+                            integer(arguments.get(1), "thread index")).thread(), values.only());
+                } finally { closeDebuggerStates(states); }
+                session.output().println("early return scheduled; continue the thread to apply it");
+                return true;
+            }
+            if (arguments.size() == 2 && "force-return-void".equalsIgnoreCase(arguments.get(0))) {
+                List<JvmDebuggerState> states = session.jvmti().debuggerStates();
+                try {
+                    session.jvmti().forceEarlyReturnVoid(pausedDebuggerState(states,
+                            integer(arguments.get(1), "thread index")).thread());
+                } finally { closeDebuggerStates(states); }
+                session.output().println("void early return scheduled; continue the thread to apply it");
                 return true;
             }
             return InteractiveCli.usage(session, this);

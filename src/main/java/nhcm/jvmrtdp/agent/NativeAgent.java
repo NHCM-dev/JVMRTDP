@@ -116,6 +116,21 @@ public class NativeAgent {
         NativeJvmtiBridge.debuggerConfigure(enabled);
     }
 
+    public static void setDebugEventBreakpoint(int kind, Class<?> declaredType,
+            String classPattern, String methodPattern, String descriptorPattern,
+            boolean includeSubtypes, String registrationId, boolean enabled) {
+        requireAvailable();
+        if (kind < 0 || kind > 2) throw new IllegalArgumentException("Unknown event breakpoint kind: " + kind);
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setDebugEventBreakpoint(kind, declaredType,
+                classPattern == null ? "*" : classPattern,
+                methodPattern == null ? "*" : methodPattern,
+                descriptorPattern == null ? "*" : descriptorPattern,
+                includeSubtypes, registrationId, enabled);
+    }
+
     public static Object[] debuggerSnapshot() {
         requireAvailable();
         return NativeJvmtiBridge.debuggerSnapshot();
@@ -135,6 +150,17 @@ public class NativeAgent {
         requireAvailable();
         if (thread == null && singleStep) throw new IllegalArgumentException("Cannot single-step all threads");
         NativeJvmtiBridge.debuggerResumeThread(thread, singleStep ? 1 : 0);
+    }
+
+    public static void stepOutDebugger() {
+        requireAvailable();
+        NativeJvmtiBridge.debuggerResume(2);
+    }
+
+    public static void stepOutDebugger(Thread thread) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        NativeJvmtiBridge.debuggerResumeThread(thread, 2);
     }
 
     public static void pauseDebugger(Thread thread) {
@@ -166,6 +192,12 @@ public class NativeAgent {
             throw new IllegalArgumentException("descriptor must not be empty");
         }
         NativeJvmtiBridge.debuggerSetLocal(thread, depth, slot, descriptor, value);
+    }
+
+    public static void forceDebuggerReturn(Thread thread, Object value) {
+        requireAvailable();
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        NativeJvmtiBridge.debuggerForceReturn(thread, value);
     }
 
     public static void setFieldWatch(Class<?> type, String fieldName, String descriptor,

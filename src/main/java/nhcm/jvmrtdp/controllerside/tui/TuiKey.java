@@ -13,6 +13,7 @@ final class TuiKey {
     static final int F5 = 0x1015;
     static final int F6 = 0x1016;
     static final int F7 = 0x1017;
+    static final int SHIFT_F7 = 0x1117;
     static final int F8 = 0x1018;
     static final int F9 = 0x1019;
     static final int SHIFT_F9 = 0x1119;
@@ -24,6 +25,9 @@ final class TuiKey {
     static final int CTRL_U = 21;
     static final int CTRL_C = 3;
     static final int CTRL_G = 7;
+    static final int CTRL_E = 5;
+    static final int CTRL_R = 18;
+    static final int CTRL_X = 24;
     static final int ENTER = 13;
     static final int TAB = 9;
     static final int ESCAPE = 27;

@@ -52,6 +52,8 @@ Load the agent at JVM startup with `-agentpath` when method-entry events, breakp
 - Breakpoint set and clear
 - Field access and modification watchpoints
 - Single-step, method entry/exit, exception, thread, class, monitor, GC, and VM events
+- Persistent method-entry, method-exit, and exception event breakpoints
+- Step into, step out, local-variable writes, and early return from paused Java frames
 - Event notification enable/disable and selected generated events
 - Java callback deployment and event dispatch
 
@@ -73,6 +75,7 @@ Callback handlers must be static and use a descriptor compatible with the event 
 
 - JVMTI does not expose the current JVM operand stack; `maxStack` is only the maximum depth declared by the class file.
 - Native frames have no Java BCI, bytecode, or local variables.
+- `ForceEarlyReturn` applies only to a suspended Java frame. A `METHOD_EXIT` callback is too late to replace the completed return value.
 - Without a `LocalVariableTable`, locals can only be sampled by slot and inferred type.
 - HotSpot class redefinition cannot arbitrarily add, remove, or structurally change fields and methods.
 - Standard JVMTI cannot force a capability that is no longer potential during the `LIVE` phase.
@@ -92,7 +95,7 @@ These interfaces require additional lifecycle, callback, and concurrency guarant
 
 ## Java Library API
 
-An attached `JvmRtdpSession` exposes the typed `RemoteJVMTIEnv` through `session.jvmti()`. Library code can query capabilities, enumerate threads, inspect stacks and locals, configure breakpoints or watchpoints, manage tags, transform classes, and deploy callbacks without parsing CLI output.
+An attached `JvmRtdpSession` exposes typed low-level control through `session.jvmti()` and a high-level deployment/instrumentation facade through `session.instrumentation()`. Library code can query capabilities, inspect threads and locals, set bytecode/event breakpoints, force early returns, deploy handlers or transformers, and retransform/redefine classes without parsing CLI output.
 
 ```java
 try (JvmRtdpClient client = JvmRtdpClient.open();

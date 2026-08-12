@@ -4,6 +4,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.handles.jvm.RemoteJvmtiThread;
@@ -60,6 +62,7 @@ public final class DebuggerAnalysisExporter {
         result.pid = session.server().process().pid();
         result.freeze = session.debugger().status();
         result.breakpoints.addAll(session.jvmti().managedBreakpoints());
+        result.eventBreakpoints.addAll(session.jvmti().managedEventBreakpoints());
         result.watches.addAll(session.jvmti().managedFieldWatches());
 
         List<RemoteJvmtiThread> threads = session.jvmti().threads();
@@ -116,7 +119,7 @@ public final class DebuggerAnalysisExporter {
 
     private static String json(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
-        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 2,");
+        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 3,");
         field(out, "capturedAt", value.capturedAt, true, 2);
         out.append(",\n  \"target\": {\"pid\": ").append(value.pid).append("},");
         out.append("\n  \"freeze\": ");
@@ -145,6 +148,11 @@ public final class DebuggerAnalysisExporter {
             if (index > 0) out.append(',');
             appendWatch(out, value.watches.get(index));
         }
+        out.append("],\n  \"eventBreakpoints\": [");
+        for (int index = 0; index < value.eventBreakpoints.size(); index++) {
+            if (index > 0) out.append(',');
+            appendEventBreakpoint(out, value.eventBreakpoints.get(index));
+        }
         out.append("]\n}\n");
         return out.toString();
     }
@@ -152,7 +160,7 @@ public final class DebuggerAnalysisExporter {
     private static String jsonLines(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
         out.append("{\"type\":\"meta\",\"schema\":\"jvmrtdp.debug-analysis\","
-                + "\"version\":2,\"capturedAt\":");
+                + "\"version\":3,\"capturedAt\":");
         quote(out, value.capturedAt);
         out.append(",\"pid\":").append(value.pid).append(",\"freeze\":");
         appendFreeze(out, value.freeze);
@@ -175,6 +183,11 @@ public final class DebuggerAnalysisExporter {
         for (JvmFieldWatchInfo watch : value.watches) {
             out.append("{\"type\":\"fieldWatch\",\"data\":");
             appendWatch(out, watch);
+            out.append("}\n");
+        }
+        for (JvmEventBreakpointInfo breakpoint : value.eventBreakpoints) {
+            out.append("{\"type\":\"eventBreakpoint\",\"data\":");
+            appendEventBreakpoint(out, breakpoint);
             out.append("}\n");
         }
         return out.toString();
@@ -222,8 +235,10 @@ public final class DebuggerAnalysisExporter {
         out.append(",\"bci\":").append(value.location)
                 .append(",\"sourceLine\":").append(value.sourceLine)
                 .append(",\"sequence\":").append(value.sequence)
-                .append(",\"preferredFrameDepth\":").append(value.preferredFrameDepth)
-                .append(",\"stack\":[");
+                .append(",\"preferredFrameDepth\":").append(value.preferredFrameDepth);
+        nullableField(out, "returnState", emptyToNull(value.returnState));
+        nullableField(out, "returnValue", value.returnValue);
+        out.append(",\"stack\":[");
         strings(out, value.stack);
         out.append(']');
         nullableField(out, "stackError", value.stackError);
@@ -300,6 +315,17 @@ public final class DebuggerAnalysisExporter {
         out.append(",\"receiverId\":").append(value.receiverId()).append('}');
     }
 
+    private static void appendEventBreakpoint(StringBuilder out, JvmEventBreakpointInfo value) {
+        JvmEventBreakpointSpec spec = value.spec();
+        out.append('{');
+        field(out, "registrationId", value.id(), true, 0);
+        field(out, "kind", spec.kind().wireName(), false, 0);
+        field(out, "classPattern", spec.classPattern(), false, 0);
+        field(out, "methodPattern", spec.methodPattern(), false, 0);
+        field(out, "descriptorPattern", spec.descriptorPattern(), false, 0);
+        out.append(",\"includeSubtypes\":").append(spec.includeSubtypes()).append('}');
+    }
+
     private static void strings(StringBuilder out, List<String> values) {
         for (int index = 0; index < values.size(); index++) {
             if (index > 0) out.append(',');
@@ -361,6 +387,7 @@ public final class DebuggerAnalysisExporter {
         private final List<ThreadRow> threads = new ArrayList<ThreadRow>();
         private final List<StopRow> stops = new ArrayList<StopRow>();
         private final List<JvmBreakpointInfo> breakpoints = new ArrayList<JvmBreakpointInfo>();
+        private final List<JvmEventBreakpointInfo> eventBreakpoints = new ArrayList<JvmEventBreakpointInfo>();
         private final List<JvmFieldWatchInfo> watches = new ArrayList<JvmFieldWatchInfo>();
     }
 
@@ -397,6 +424,8 @@ public final class DebuggerAnalysisExporter {
         private final long location;
         private final int sourceLine;
         private final long sequence;
+        private final String returnState;
+        private final String returnValue;
         private final List<String> stack = new ArrayList<String>();
         private final List<FrameRow> frames = new ArrayList<FrameRow>();
         private final List<LocalRow> locals = new ArrayList<LocalRow>();
@@ -414,6 +443,8 @@ public final class DebuggerAnalysisExporter {
             this.location = state.location();
             this.sourceLine = state.sourceLine();
             this.sequence = state.sequence();
+            this.returnState = state.returnState();
+            this.returnValue = state.returnValue() == null ? null : state.returnValue().displayValue();
         }
     }
 

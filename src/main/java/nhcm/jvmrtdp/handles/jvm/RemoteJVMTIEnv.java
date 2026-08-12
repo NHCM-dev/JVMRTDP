@@ -26,6 +26,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
+import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -46,6 +48,8 @@ public class RemoteJVMTIEnv extends RemoteHandle {
             new LinkedHashMap<String, BreakpointRegistration>();
     private final Map<String, JvmFieldWatchInfo> managedFieldWatches =
             new LinkedHashMap<String, JvmFieldWatchInfo>();
+    private final Map<String, JvmEventBreakpointInfo> managedEventBreakpoints =
+            new LinkedHashMap<String, JvmEventBreakpointInfo>();
     public enum DefinitionMode { CHILD, SAME_LOADER }
     public enum JarScope { CHILD, SYSTEM, BOOTSTRAP }
 
@@ -375,6 +379,45 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         executeForOutput(CommandLine.of("jvmti", enabled ? "debug.enable" : "debug.disable"));
     }
 
+    /** Installs a method-entry, method-exit, or exception event breakpoint. */
+    public JvmEventBreakpointInfo setEventBreakpoint(JvmEventBreakpointSpec spec) {
+        if (spec == null) throw new IllegalArgumentException("spec must not be null");
+        String raw = spec.kind().wireName() + '|' + spec.classPattern() + '|'
+                + spec.methodPattern() + '|' + spec.descriptorPattern() + '|'
+                + spec.includeSubtypes();
+        String id = "event-" + Base64.getUrlEncoder().withoutPadding().encodeToString(
+                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        executeForOutput(CommandLine.of("jvmti", "debug.event-breakpoint", "set",
+                spec.kind().wireName(), spec.classPattern(), optional(spec.methodPattern()),
+                optional(spec.descriptorPattern()), Boolean.toString(spec.includeSubtypes()), id));
+        JvmEventBreakpointInfo info = new JvmEventBreakpointInfo(id, spec);
+        synchronized (managedEventBreakpoints) { managedEventBreakpoints.put(id, info); }
+        return info;
+    }
+
+    public void clearEventBreakpoint(JvmEventBreakpointInfo breakpoint) {
+        if (breakpoint == null) throw new IllegalArgumentException("breakpoint must not be null");
+        JvmEventBreakpointSpec spec = breakpoint.spec();
+        executeForOutput(CommandLine.of("jvmti", "debug.event-breakpoint", "clear",
+                spec.kind().wireName(), spec.classPattern(), optional(spec.methodPattern()),
+                optional(spec.descriptorPattern()), Boolean.toString(spec.includeSubtypes()),
+                breakpoint.id()));
+        synchronized (managedEventBreakpoints) { managedEventBreakpoints.remove(breakpoint.id()); }
+    }
+
+    public List<JvmEventBreakpointInfo> managedEventBreakpoints() {
+        synchronized (managedEventBreakpoints) {
+            return Collections.unmodifiableList(new ArrayList<JvmEventBreakpointInfo>(
+                    managedEventBreakpoints.values()));
+        }
+    }
+
+    public void clearManagedEventBreakpoints() {
+        for (JvmEventBreakpointInfo breakpoint : managedEventBreakpoints()) {
+            clearEventBreakpoint(breakpoint);
+        }
+    }
+
     public JvmDebuggerState debuggerState() {
         return decodeDebuggerState(executeForOutput(CommandLine.of("jvmti", "debug.status")));
     }
@@ -388,13 +431,21 @@ public class RemoteJVMTIEnv extends RemoteHandle {
     }
 
     private JvmDebuggerState decodeDebuggerState(String row) {
-        List<String> fields = TextWireCodec.decode(row, 10);
+        List<String> fields;
+        try { fields = TextWireCodec.decode(row, 12); }
+        catch (IllegalArgumentException legacy) {
+            fields = new ArrayList<String>(TextWireCodec.decode(row, 10));
+            fields.add("");
+            fields.add("");
+        }
         RemoteObject thread = fields.get(0).isEmpty()
                 ? null : object(RemoteObjectDescriptor.decode(fields.get(0)));
+        RemoteObject returnValue = fields.get(10).isEmpty()
+                ? null : object(RemoteObjectDescriptor.decode(fields.get(10)));
         return new JvmDebuggerState(thread, Boolean.parseBoolean(fields.get(1)),
                 Boolean.parseBoolean(fields.get(2)), fields.get(3), fields.get(4), fields.get(5),
                 fields.get(6), Long.parseLong(fields.get(7)), Integer.parseInt(fields.get(8)),
-                Long.parseLong(fields.get(9)));
+                Long.parseLong(fields.get(9)), returnValue, fields.get(11));
     }
 
     public void continueExecution() {
@@ -431,6 +482,16 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         executeForOutput(CommandLine.of("jvmti", "debug.step-thread", objectId(thread)));
     }
 
+    /** Continues until the selected frame returns and stops at the first caller bytecode. */
+    public void stepOut() {
+        executeForOutput(CommandLine.of("jvmti", "debug.step-out"));
+    }
+
+    public void stepOut(RemoteObject thread) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        executeForOutput(CommandLine.of("jvmti", "debug.step-out-thread", objectId(thread)));
+    }
+
     public List<JvmDebuggerLocal> debuggerLocals(RemoteObject thread, int depth) {
         if (thread == null) throw new IllegalArgumentException("thread must not be null");
         if (depth < 0) throw new IllegalArgumentException("depth must not be negative");
@@ -456,6 +517,19 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         }
         executeForOutput(CommandLine.of("jvmti", "debug.set-local", objectId(thread),
                 Integer.toString(depth), Integer.toString(slot), descriptor, objectId(value)));
+    }
+
+    /** Forces the current Java frame to return with the supplied target-JVM value. */
+    public void forceEarlyReturn(RemoteObject thread, RemoteObject value) {
+        if (thread == null || value == null) throw new IllegalArgumentException("thread and value must not be null");
+        executeForOutput(CommandLine.of("jvmti", "debug.force-return",
+                objectId(thread), objectId(value)));
+    }
+
+    /** Forces the current Java frame to return from a void method. */
+    public void forceEarlyReturnVoid(RemoteObject thread) {
+        if (thread == null) throw new IllegalArgumentException("thread must not be null");
+        executeForOutput(CommandLine.of("jvmti", "debug.force-return-void", objectId(thread)));
     }
 
     public void setFieldWatch(String className, String fieldName, String descriptor,

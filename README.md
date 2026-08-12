@@ -40,12 +40,12 @@ The controller, target JVM, and native agent must use compatible architectures. 
 Build outputs:
 
 ```text
-build/libs/JVMRTDP-2.0.0.jar
-build/libs/jvmrtdp-2.0.0-library.jar
+build/libs/JVMRTDP-2.1.0.jar
+build/libs/jvmrtdp-2.1.0-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
 
-`JVMRTDP-2.0.0.jar` is the self-contained executable. `jvmrtdp-2.0.0-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
+`JVMRTDP-2.1.0.jar` is the self-contained executable. `jvmrtdp-2.1.0-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
 
 To publish the agent DLL to the conventional location:
 
@@ -66,13 +66,13 @@ The agent embedded in the JAR and a DLL preloaded by the target JVM should come 
 Start the default TUI:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.0.0.jar
+java -jar build\libs\JVMRTDP-2.1.0.jar
 ```
 
 Start in command-line mode:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.0.0.jar --cli
+java -jar build\libs\JVMRTDP-2.1.0.jar --cli
 ```
 
 Basic CLI workflow:
@@ -113,6 +113,15 @@ java -agentpath:<path-to-jvmrtdp-agent.dll>=break-main=com.example.Application,b
 ```
 
 Class names may use dotted or JVM internal slash notation.
+
+The agent can also stop before the controller attaches. Method specs use
+`class#method#descriptor`; the descriptor is optional and may be replaced by `*`:
+
+```powershell
+java -agentpath:<path-to-jvmrtdp-agent.dll>=break-entry=com.example.Service#run#()V -jar application.jar
+java -agentpath:<path-to-jvmrtdp-agent.dll>=break-exit=com.example.Service#run#()V -jar application.jar
+java -agentpath:<path-to-jvmrtdp-agent.dll>=break-exception=java.lang.*Exception -jar application.jar
+```
 
 ## TUI Navigation
 
@@ -187,8 +196,22 @@ debugger pause <thread-index>
 debugger current <paused-index> 0 12
 debugger locals <paused-index> 0
 debugger step <paused-index>
+debugger step-out <paused-index>
 debugger continue <paused-index>
 ```
+
+Method events also cover methods without Java bytecode:
+
+```text
+debugger event-break entry java.lang.Runnable run "()V" subtypes
+debugger event-break exit java.lang.Object wait "()V"
+debugger exception-break "java.lang.*Exception"
+debugger event-breakpoints
+```
+
+Use `debugger force-return <paused-index> <value>` or `force-return-void` while stopped
+inside a Java frame. JVMTI cannot force-return a native frame or alter a value after its
+`METHOD_EXIT` event has already fired.
 
 Sample a running thread:
 
@@ -251,7 +274,7 @@ Publish the current build to the local Maven repository:
 
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0") }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.0") }
 ```
 
 Discover and attach to a JVM from Java:
@@ -268,7 +291,7 @@ try (JvmRtdpClient client = JvmRtdpClient.open();
 }
 ```
 
-The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, and direct access to JNI, JVMTI, contexts, remote objects, decompilation, and debugger services. See the [Java Library Guide](docs/LIBRARY.md).
+The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, direct JNI/JVMTI access, and `session.instrumentation()` for source/JAR deployment, hooks, transformers, retransformation, and redefinition. See the [Java Library Guide](docs/LIBRARY.md).
 
 ## Safety and Behavior
 

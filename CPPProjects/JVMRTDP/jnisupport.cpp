@@ -99,6 +99,9 @@ bool gDebuggerEnabled = false;
 bool gStartupBreakpointInstalled = false;
 bool gStartupClinitBreakpointInstalled = false;
 std::atomic<bool> gStartupClassPrepareOwned{false};
+std::atomic<bool> gJavaMethodEntryDispatchEnabled{false};
+std::atomic<bool> gJavaMethodExitDispatchEnabled{false};
+std::atomic<bool> gJavaExceptionDispatchEnabled{false};
 jmethodID gStartupMainMethod = nullptr;
 jlocation gStartupMainLocation = 0;
 jmethodID gStartupClinitMethod = nullptr;
@@ -109,6 +112,7 @@ std::string gStartupClinitClass;
 
 struct DebuggerStop {
     jobject thread = nullptr;
+    jobject returnValue = nullptr;
     bool paused = true;
     // Breakpoint/single-step callbacks wait on gDebuggerChanged. A thread paused
     // from the debugger console is instead suspended with JVMTI SuspendThread.
@@ -120,9 +124,39 @@ struct DebuggerStop {
     std::string descriptor;
     jlocation location = 0;
     jint line = -1;
+    std::string returnState;
 };
 
 std::vector<std::shared_ptr<DebuggerStop>> gDebuggerStops;
+
+enum class DebugEventKind : jint {
+    METHOD_ENTRY = 0,
+    METHOD_EXIT = 1,
+    EXCEPTION_THROW = 2,
+};
+
+struct DebugEventBreakpoint {
+    std::string id;
+    DebugEventKind kind = DebugEventKind::METHOD_ENTRY;
+    jobject declaredClass = nullptr;
+    std::string classPattern;
+    std::string methodPattern;
+    std::string descriptorPattern;
+    bool includeSubtypes = false;
+};
+
+std::mutex gDebugEventBreakpointMutex;
+std::vector<DebugEventBreakpoint> gDebugEventBreakpoints;
+
+// Step-out is completed at the first bytecode in the caller. A FramePop event
+// alone fires while the returning frame is still visible and is therefore too early.
+std::mutex gStepOutMutex;
+std::vector<jobject> gStepOutAwaitingPop;
+std::vector<jobject> gStepOutAwaitingCallerStep;
+
+std::string gStartupEntrySpec;
+std::string gStartupExitSpec;
+std::string gStartupExceptionPattern;
 
 struct PersistentBreakpoint {
     std::string id;
@@ -660,6 +694,109 @@ bool GlobMatches(const std::string& pattern, const std::string& value) {
     return source == pattern.size();
 }
 
+bool MatchesDebugMethodEvent(JNIEnv* env, DebugEventKind kind, jmethodID method) {
+    if (env == nullptr || method == nullptr) return false;
+    {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        bool interested = false;
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            if (breakpoint.kind == kind) { interested = true; break; }
+        }
+        if (!interested) return false;
+    }
+    const MethodDetails details = DescribeMethod(env, method);
+    jclass actualClass = nullptr;
+    gJvmti->GetMethodDeclaringClass(method, &actualClass);
+    bool matched = false;
+    {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            if (breakpoint.kind != kind
+                    || !GlobMatches(breakpoint.methodPattern, details.name)
+                    || !GlobMatches(breakpoint.descriptorPattern, details.descriptor)) continue;
+            bool classMatches = GlobMatches(breakpoint.classPattern, details.className);
+            if (!classMatches && breakpoint.includeSubtypes && actualClass != nullptr
+                    && breakpoint.declaredClass != nullptr) {
+                classMatches = env->IsAssignableFrom(actualClass,
+                    static_cast<jclass>(breakpoint.declaredClass)) == JNI_TRUE;
+            }
+            if (classMatches) { matched = true; break; }
+        }
+    }
+    if (actualClass != nullptr) env->DeleteLocalRef(actualClass);
+    return matched;
+}
+
+bool MatchesDebugException(JNIEnv* env, jobject exception) {
+    if (env == nullptr || exception == nullptr) return false;
+    {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        bool interested = false;
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            if (breakpoint.kind == DebugEventKind::EXCEPTION_THROW) { interested = true; break; }
+        }
+        if (!interested) return false;
+    }
+    jclass exceptionClass = env->GetObjectClass(exception);
+    const std::string className = BinaryClassName(exceptionClass);
+    bool matched = false;
+    {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            if (breakpoint.kind == DebugEventKind::EXCEPTION_THROW
+                    && GlobMatches(breakpoint.classPattern, className)) {
+                matched = true;
+                break;
+            }
+        }
+    }
+    if (exceptionClass != nullptr) env->DeleteLocalRef(exceptionClass);
+    return matched;
+}
+
+void RemoveStepOutState(JNIEnv* env, jthread thread) {
+    std::lock_guard<std::mutex> guard(gStepOutMutex);
+    const auto remove = [env, thread](std::vector<jobject>& references) {
+        for (auto iterator = references.begin(); iterator != references.end();) {
+            if (thread == nullptr || env->IsSameObject(thread, *iterator) == JNI_TRUE) {
+                if (gJvmti != nullptr) {
+                    gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP,
+                        static_cast<jthread>(*iterator));
+                    gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_FRAME_POP,
+                        static_cast<jthread>(*iterator));
+                }
+                env->DeleteGlobalRef(*iterator);
+                iterator = references.erase(iterator);
+            } else ++iterator;
+        }
+    };
+    remove(gStepOutAwaitingPop);
+    remove(gStepOutAwaitingCallerStep);
+}
+
+bool AdvanceStepOutAfterFramePop(JNIEnv* env, jthread thread) {
+    std::lock_guard<std::mutex> guard(gStepOutMutex);
+    for (auto iterator = gStepOutAwaitingPop.begin(); iterator != gStepOutAwaitingPop.end(); ++iterator) {
+        if (env->IsSameObject(thread, *iterator) != JNI_TRUE) continue;
+        gStepOutAwaitingCallerStep.push_back(*iterator);
+        gStepOutAwaitingPop.erase(iterator);
+        return true;
+    }
+    return false;
+}
+
+bool CompleteStepOutAtCaller(JNIEnv* env, jthread thread) {
+    std::lock_guard<std::mutex> guard(gStepOutMutex);
+    for (auto iterator = gStepOutAwaitingCallerStep.begin();
+            iterator != gStepOutAwaitingCallerStep.end(); ++iterator) {
+        if (env->IsSameObject(thread, *iterator) != JNI_TRUE) continue;
+        env->DeleteGlobalRef(*iterator);
+        gStepOutAwaitingCallerStep.erase(iterator);
+        return true;
+    }
+    return false;
+}
+
 /** Returns true when any logical registration at this physical BCI accepts the hit. */
 bool MatchesPersistentBreakpoint(JNIEnv* env, jthread thread,
         jmethodID method, jlocation location) {
@@ -732,7 +869,7 @@ bool IsJvmrtdpServiceThread(JNIEnv* env, jthread thread) {
 }
 
 void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation location,
-        const char* reason) {
+        const char* reason, jobject returnValue = nullptr, const char* returnState = nullptr) {
     if (env == nullptr || thread == nullptr || method == nullptr) return;
     // Breakpoints in java.lang.String/collections can also be reached by the agent's
     // protocol implementation. Never stop the only threads capable of resuming a target.
@@ -742,15 +879,18 @@ void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation locat
     if (threadReference == nullptr) return;
     std::shared_ptr<DebuggerStop> stop = std::make_shared<DebuggerStop>();
     stop->thread = threadReference;
+    stop->returnValue = returnValue == nullptr ? nullptr : env->NewGlobalRef(returnValue);
     stop->reason = reason == nullptr ? "breakpoint" : reason;
     stop->className = details.className;
     stop->methodName = details.name;
     stop->descriptor = details.descriptor;
     stop->location = location;
     stop->line = LineAtLocation(method, location);
+    stop->returnState = returnState == nullptr ? "" : returnState;
     std::unique_lock<std::mutex> lock(gDebuggerMutex);
     if (!gDebuggerEnabled || gDebuggerStops.size() >= 128) {
         lock.unlock();
+        if (stop->returnValue != nullptr) env->DeleteGlobalRef(stop->returnValue);
         env->DeleteGlobalRef(threadReference);
         return;
     }
@@ -760,6 +900,7 @@ void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation locat
     gDebuggerChanged.wait(lock, [&stop] { return !stop->paused || !gDebuggerEnabled; });
     gDebuggerStops.erase(std::remove(gDebuggerStops.begin(), gDebuggerStops.end(), stop), gDebuggerStops.end());
     lock.unlock();
+    if (stop->returnValue != nullptr) env->DeleteGlobalRef(stop->returnValue);
     env->DeleteGlobalRef(threadReference);
 }
 
@@ -770,15 +911,47 @@ void ConfigureStartupDebugger(const char* options) {
         std::size_t position = input.find(key);
         if (position == std::string::npos) return std::string();
         position += key.size();
-        const std::size_t end = input.find_first_of(",;", position);
-        std::string value = input.substr(position,
+        // Comma is the option separator. Semicolons are valid inside JVM descriptors.
+        const std::size_t end = input.find(',', position);
+        return input.substr(position,
             end == std::string::npos ? std::string::npos : end - position);
-        std::replace(value.begin(), value.end(), '/', '.');
-        return value;
     };
     gStartupMainClass = option("break-main=");
     gStartupClinitClass = option("break-clinit=");
-    if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()) gDebuggerEnabled = true;
+    std::replace(gStartupMainClass.begin(), gStartupMainClass.end(), '/', '.');
+    std::replace(gStartupClinitClass.begin(), gStartupClinitClass.end(), '/', '.');
+    gStartupEntrySpec = option("break-entry=");
+    gStartupExitSpec = option("break-exit=");
+    gStartupExceptionPattern = option("break-exception=");
+    const auto rememberMethodEvent = [](DebugEventKind kind, const std::string& spec,
+            const char* id) {
+        if (spec.empty()) return;
+        const std::size_t first = spec.find('#');
+        const std::size_t second = first == std::string::npos
+            ? std::string::npos : spec.find('#', first + 1);
+        DebugEventBreakpoint breakpoint;
+        breakpoint.id = id;
+        breakpoint.kind = kind;
+        breakpoint.classPattern = first == std::string::npos ? spec : spec.substr(0, first);
+        std::replace(breakpoint.classPattern.begin(), breakpoint.classPattern.end(), '/', '.');
+        breakpoint.methodPattern = first == std::string::npos ? "*" : spec.substr(first + 1,
+            second == std::string::npos ? std::string::npos : second - first - 1);
+        breakpoint.descriptorPattern = second == std::string::npos ? "*" : spec.substr(second + 1);
+        gDebugEventBreakpoints.push_back(std::move(breakpoint));
+    };
+    rememberMethodEvent(DebugEventKind::METHOD_ENTRY, gStartupEntrySpec, "startup-entry");
+    rememberMethodEvent(DebugEventKind::METHOD_EXIT, gStartupExitSpec, "startup-exit");
+    if (!gStartupExceptionPattern.empty()) {
+        DebugEventBreakpoint breakpoint;
+        breakpoint.id = "startup-exception";
+        breakpoint.kind = DebugEventKind::EXCEPTION_THROW;
+        breakpoint.classPattern = gStartupExceptionPattern;
+        std::replace(breakpoint.classPattern.begin(), breakpoint.classPattern.end(), '/', '.');
+        gDebugEventBreakpoints.push_back(std::move(breakpoint));
+    }
+    if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()
+            || !gStartupEntrySpec.empty() || !gStartupExitSpec.empty()
+            || !gStartupExceptionPattern.empty()) gDebuggerEnabled = true;
 }
 
 void ReleaseStartupClassPrepareIfReady() {
@@ -1228,14 +1401,22 @@ void JNICALL ClassPrepare(jvmtiEnv*, JNIEnv* env, jthread thread, jclass klass) 
 
 void JNICALL SingleStep(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
     gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP, thread);
+    const bool stepOut = CompleteStepOutAtCaller(env, thread);
     DispatchEvent(env, "single_step", thread, nullptr, method, location, nullptr, 0);
-    DebuggerTrap(env, thread, method, location, "single_step");
+    DebuggerTrap(env, thread, method, location, stepOut ? "step_out" : "single_step");
 }
 
 void JNICALL FramePop(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
         jboolean wasPoppedByException) {
     DispatchEvent(env, "frame_pop", thread, nullptr, method, 0, nullptr,
         wasPoppedByException == JNI_TRUE ? 1 : 0);
+    if (AdvanceStepOutAfterFramePop(env, thread)) {
+        gJvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_FRAME_POP, thread);
+        if (gJvmti->SetEventNotificationMode(JVMTI_ENABLE,
+                JVMTI_EVENT_SINGLE_STEP, thread) != JVMTI_ERROR_NONE) {
+            RemoveStepOutState(env, thread);
+        }
+    }
 }
 
 void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
@@ -1293,18 +1474,25 @@ void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID
 
 void JNICALL MethodEntry(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method) {
     if (tInJavaCallback || tCapturingMethodEvent) return;
-    tCapturingMethodEvent = true;
-    try {
-        DispatchMethodEvent(env, "method_entry", thread, method, false, nullptr, 0, nullptr);
-    } catch (...) {
-        gNativeDropped.fetch_add(1);
+    const bool shouldStop = MatchesDebugMethodEvent(env, DebugEventKind::METHOD_ENTRY, method);
+    if (gJavaMethodEntryDispatchEnabled.load()) {
+        tCapturingMethodEvent = true;
+        try {
+            DispatchMethodEvent(env, "method_entry", thread, method, false, nullptr, 0, nullptr);
+        } catch (...) {
+            gNativeDropped.fetch_add(1);
+        }
+        tCapturingMethodEvent = false;
     }
-    tCapturingMethodEvent = false;
+    if (shouldStop) DebuggerTrap(env, thread, method, 0, "method_entry");
 }
 
 void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
         jboolean poppedByException, jvalue returnValue) {
     if (tInJavaCallback || tCapturingMethodEvent) return;
+    const bool shouldStop = MatchesDebugMethodEvent(env, DebugEventKind::METHOD_EXIT, method);
+    const bool dispatchEvent = gJavaMethodExitDispatchEnabled.load();
+    // Always suppress recursive method events caused by boxing the return value.
     tCapturingMethodEvent = true;
     try {
     const MethodDetails details = DescribeMethod(env, method);
@@ -1319,8 +1507,14 @@ void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
         env->ExceptionClear();
         boxedReturn = nullptr;
     }
-    DispatchMethodEvent(env, "method_exit", thread, method, poppedByException == JNI_TRUE,
-        subject, bits, boxedReturn);
+    if (dispatchEvent) {
+        DispatchMethodEvent(env, "method_exit", thread, method, poppedByException == JNI_TRUE,
+            subject, bits, boxedReturn);
+    }
+    if (shouldStop) DebuggerTrap(env, thread, method, -1,
+        poppedByException == JNI_TRUE ? "method_exit_exception" : "method_exit",
+        boxedReturn, poppedByException == JNI_TRUE ? "exception"
+            : returnKind == 'V' ? "void" : "value");
     if (boxedReturn != nullptr && returnKind != 'L' && returnKind != '[') {
         env->DeleteLocalRef(boxedReturn);
     }
@@ -1332,8 +1526,13 @@ void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
 
 void JNICALL Exception(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
         jlocation location, jobject exception, jmethodID catchMethod, jlocation catchLocation) {
-    DispatchEvent(env, "exception", thread, nullptr, method, location, exception, 0,
-        catchMethod, catchLocation);
+    if (gJavaExceptionDispatchEnabled.load()) {
+        DispatchEvent(env, "exception", thread, nullptr, method, location, exception, 0,
+            catchMethod, catchLocation);
+    }
+    if (MatchesDebugException(env, exception)) {
+        DebuggerTrap(env, thread, method, location, "exception");
+    }
 }
 
 void JNICALL ExceptionCatch(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -1956,6 +2155,24 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
         ThrowJava(env, "java/lang/IllegalArgumentException", "Unsupported JVMTI event: " + eventName);
         return;
     }
+    if (event == JVMTI_EVENT_METHOD_ENTRY) {
+        gJavaMethodEntryDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_METHOD_EXIT) {
+        gJavaMethodExitDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_EXCEPTION) {
+        gJavaExceptionDispatchEnabled.store(enabled == JNI_TRUE);
+    }
+    if (enabled != JNI_TRUE && (event == JVMTI_EVENT_METHOD_ENTRY
+            || event == JVMTI_EVENT_METHOD_EXIT || event == JVMTI_EVENT_EXCEPTION)) {
+        const DebugEventKind kind = event == JVMTI_EVENT_METHOD_ENTRY
+            ? DebugEventKind::METHOD_ENTRY : event == JVMTI_EVENT_METHOD_EXIT
+                ? DebugEventKind::METHOD_EXIT : DebugEventKind::EXCEPTION_THROW;
+        std::lock_guard<std::mutex> breakpointGuard(gDebugEventBreakpointMutex);
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            // Java callback leases may be released independently of debugger leases.
+            if (breakpoint.kind == kind) return;
+        }
+    }
     std::lock_guard<std::recursive_mutex> guard(gEventMutex);
     const jvmtiError error = gJvmti->SetEventNotificationMode(
         enabled == JNI_TRUE ? JVMTI_ENABLE : JVMTI_DISABLE, event, nullptr);
@@ -2033,7 +2250,77 @@ void JNICALL NativeDebuggerConfigure(JNIEnv* env, jclass, jboolean enabled) {
         }
     }
     for (jobject reference : release) env->DeleteGlobalRef(reference);
+    if (enabled != JNI_TRUE) RemoveStepOutState(env, nullptr);
     gDebuggerChanged.notify_all();
+}
+
+void JNICALL NativeSetDebugEventBreakpoint(JNIEnv* env, jclass, jint kindValue,
+        jclass declaredClass, jstring classPatternValue, jstring methodPatternValue,
+        jstring descriptorPatternValue, jboolean includeSubtypes, jstring registrationIdValue,
+        jboolean enabled) {
+    if (kindValue < static_cast<jint>(DebugEventKind::METHOD_ENTRY)
+            || kindValue > static_cast<jint>(DebugEventKind::EXCEPTION_THROW)) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Unknown debugger event breakpoint kind");
+        return;
+    }
+    const std::string registrationId = JStringToUtf8(env, registrationIdValue);
+    if (registrationId.empty()) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Event breakpoint id must not be empty");
+        return;
+    }
+    const DebugEventKind kind = static_cast<DebugEventKind>(kindValue);
+    bool remainingKind = false;
+    jobject declaredReference = enabled == JNI_TRUE && declaredClass != nullptr
+        ? env->NewGlobalRef(declaredClass) : nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        for (auto iterator = gDebugEventBreakpoints.begin();
+                iterator != gDebugEventBreakpoints.end();) {
+            if (iterator->id != registrationId) { ++iterator; continue; }
+            if (iterator->declaredClass != nullptr) env->DeleteGlobalRef(iterator->declaredClass);
+            iterator = gDebugEventBreakpoints.erase(iterator);
+        }
+        if (enabled == JNI_TRUE) {
+            DebugEventBreakpoint breakpoint;
+            breakpoint.id = registrationId;
+            breakpoint.kind = kind;
+            breakpoint.declaredClass = declaredReference;
+            breakpoint.classPattern = JStringToUtf8(env, classPatternValue);
+            breakpoint.methodPattern = JStringToUtf8(env, methodPatternValue);
+            breakpoint.descriptorPattern = JStringToUtf8(env, descriptorPatternValue);
+            breakpoint.includeSubtypes = includeSubtypes == JNI_TRUE;
+            std::replace(breakpoint.classPattern.begin(), breakpoint.classPattern.end(), '/', '.');
+            if (breakpoint.classPattern.empty()) breakpoint.classPattern = "*";
+            if (breakpoint.methodPattern.empty()) breakpoint.methodPattern = "*";
+            if (breakpoint.descriptorPattern.empty()) breakpoint.descriptorPattern = "*";
+            gDebugEventBreakpoints.push_back(std::move(breakpoint));
+        }
+        for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+            if (breakpoint.kind == kind) { remainingKind = true; break; }
+        }
+    }
+    const jvmtiEvent event = kind == DebugEventKind::METHOD_ENTRY ? JVMTI_EVENT_METHOD_ENTRY
+        : kind == DebugEventKind::METHOD_EXIT ? JVMTI_EVENT_METHOD_EXIT : JVMTI_EVENT_EXCEPTION;
+    if (enabled != JNI_TRUE) {
+        const bool callbackOwned = kind == DebugEventKind::METHOD_ENTRY
+            ? gJavaMethodEntryDispatchEnabled.load() : kind == DebugEventKind::METHOD_EXIT
+                ? gJavaMethodExitDispatchEnabled.load() : gJavaExceptionDispatchEnabled.load();
+        if (!remainingKind && !callbackOwned) {
+            gJvmti->SetEventNotificationMode(JVMTI_DISABLE, event, nullptr);
+        }
+        return;
+    }
+    const jvmtiError error = gJvmti->SetEventNotificationMode(JVMTI_ENABLE, event, nullptr);
+    if (error != JVMTI_ERROR_NONE) {
+        std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+        for (auto iterator = gDebugEventBreakpoints.begin();
+                iterator != gDebugEventBreakpoints.end();) {
+            if (iterator->id != registrationId) { ++iterator; continue; }
+            if (iterator->declaredClass != nullptr) env->DeleteGlobalRef(iterator->declaredClass);
+            iterator = gDebugEventBreakpoints.erase(iterator);
+        }
+        ThrowJvmti(env, "Enable debugger event breakpoint", error);
+    }
 }
 
 void JNICALL NativeDebuggerPauseThread(JNIEnv* env, jclass, jobject requestedThread,
@@ -2121,7 +2408,7 @@ void JNICALL NativeDebuggerPauseThread(JNIEnv* env, jclass, jobject requestedThr
 static jobjectArray NewDebuggerSnapshot(JNIEnv* env, const std::shared_ptr<DebuggerStop>& stop) {
     jclass objectClass = env->FindClass("java/lang/Object");
     if (objectClass == nullptr) return nullptr;
-    jobjectArray result = env->NewObjectArray(10, objectClass, nullptr);
+    jobjectArray result = env->NewObjectArray(12, objectClass, nullptr);
     env->DeleteLocalRef(objectClass);
     if (result == nullptr) return nullptr;
 
@@ -2130,6 +2417,13 @@ static jobjectArray NewDebuggerSnapshot(JNIEnv* env, const std::shared_ptr<Debug
         if (thread != nullptr) {
             env->SetObjectArrayElement(result, 0, thread);
             env->DeleteLocalRef(thread);
+        }
+    }
+    if (stop != nullptr && stop->returnValue != nullptr) {
+        jobject value = env->NewLocalRef(stop->returnValue);
+        if (value != nullptr) {
+            env->SetObjectArrayElement(result, 10, value);
+            env->DeleteLocalRef(value);
         }
     }
     const std::string fields[] = {
@@ -2149,6 +2443,11 @@ static jobjectArray NewDebuggerSnapshot(JNIEnv* env, const std::shared_ptr<Debug
             env->SetObjectArrayElement(result, index + 1, value);
             env->DeleteLocalRef(value);
         }
+    }
+    jstring returnState = env->NewStringUTF(stop == nullptr ? "" : stop->returnState.c_str());
+    if (returnState != nullptr) {
+        env->SetObjectArrayElement(result, 11, returnState);
+        env->DeleteLocalRef(returnState);
     }
     return result;
 }
@@ -2311,6 +2610,90 @@ void JNICALL NativeDebuggerSetLocal(JNIEnv* env, jclass, jobject requestedThread
         ThrowJvmti(env, "Set debugger local", error);
     } else if (!env->ExceptionCheck() && resumeError != JVMTI_ERROR_NONE) {
         ThrowJvmti(env, "Resume debugger thread after local write", resumeError);
+    }
+}
+
+void JNICALL NativeDebuggerForceReturn(JNIEnv* env, jclass, jobject requestedThread,
+        jobject value) {
+    if (requestedThread == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "A paused debugger thread is required");
+        return;
+    }
+    jthread thread = nullptr;
+    std::string stopReason;
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop->paused && stop->thread != nullptr
+                    && env->IsSameObject(requestedThread, stop->thread)) {
+                thread = static_cast<jthread>(env->NewLocalRef(stop->thread));
+                stopReason = stop->reason;
+                break;
+            }
+        }
+    }
+    if (thread == nullptr) {
+        ThrowJava(env, "java/lang/IllegalStateException", "Selected debugger thread is no longer paused");
+        return;
+    }
+    if (stopReason == "method_exit" || stopReason == "method_exit_exception") {
+        env->DeleteLocalRef(thread);
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "A METHOD_EXIT event observes a completed return. Force the return from method entry, a bytecode breakpoint, or a step stop.");
+        return;
+    }
+    bool suspendedHere = false;
+    jint state = 0;
+    jvmtiError error = gJvmti->GetThreadState(thread, &state);
+    if (error == JVMTI_ERROR_NONE && (state & JVMTI_THREAD_STATE_SUSPENDED) == 0) {
+        error = gJvmti->SuspendThread(thread);
+        if (error == JVMTI_ERROR_NONE) suspendedHere = true;
+    }
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_THREAD_SUSPENDED) {
+        env->DeleteLocalRef(thread);
+        ThrowJvmti(env, "Suspend debugger thread for forced return", error);
+        return;
+    }
+    jmethodID method = nullptr;
+    jlocation location = 0;
+    error = gJvmti->GetFrameLocation(thread, 0, &method, &location);
+    MethodDetails details;
+    jint modifiers = 0;
+    if (error == JVMTI_ERROR_NONE && method != nullptr) {
+        details = DescribeMethod(env, method);
+        error = gJvmti->GetMethodModifiers(method, &modifiers);
+    }
+    if (error == JVMTI_ERROR_NONE && (modifiers & kAccNative) != 0) {
+        error = JVMTI_ERROR_NATIVE_METHOD;
+    }
+    if (error == JVMTI_ERROR_NONE) {
+        const std::size_t close = details.descriptor.rfind(')');
+        const char kind = close == std::string::npos || close + 1 >= details.descriptor.size()
+            ? '\0' : details.descriptor[close + 1];
+        jvalue primitive{};
+        if (kind == 'V') error = gJvmti->ForceEarlyReturnVoid(thread);
+        else if (kind == 'L' || kind == '[') error = gJvmti->ForceEarlyReturnObject(thread, value);
+        else if (!UnboxDebuggerLocal(env, value, kind, &primitive)) error = JVMTI_ERROR_NONE;
+        else if (kind == 'J') error = gJvmti->ForceEarlyReturnLong(thread, primitive.j);
+        else if (kind == 'F') error = gJvmti->ForceEarlyReturnFloat(thread, primitive.f);
+        else if (kind == 'D') error = gJvmti->ForceEarlyReturnDouble(thread, primitive.d);
+        else {
+            const jint intValue = kind == 'Z' ? static_cast<jint>(primitive.z)
+                : kind == 'B' ? static_cast<jint>(primitive.b)
+                : kind == 'C' ? static_cast<jint>(primitive.c)
+                : kind == 'S' ? static_cast<jint>(primitive.s) : primitive.i;
+            error = gJvmti->ForceEarlyReturnInt(thread, intValue);
+        }
+    }
+    const jvmtiError resumeError = suspendedHere ? gJvmti->ResumeThread(thread) : JVMTI_ERROR_NONE;
+    env->DeleteLocalRef(thread);
+    if (!env->ExceptionCheck() && error == JVMTI_ERROR_NATIVE_METHOD) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "JVMTI cannot force an early return from a native frame; stop in its Java caller instead");
+    } else if (!env->ExceptionCheck() && error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Force early return", error);
+    } else if (!env->ExceptionCheck() && resumeError != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "Resume debugger thread after forced return", resumeError);
     }
 }
 
@@ -2532,16 +2915,61 @@ jobjectArray JNICALL NativeDebuggerLocals(JNIEnv* env, jclass, jobject requested
 
 static bool ResumeDebuggerStop(JNIEnv* env, const std::shared_ptr<DebuggerStop>& stop, jint action) {
     if (stop == nullptr || !stop->paused || stop->thread == nullptr) return false;
-    if (action != 0 && action != 1) {
-        ThrowJava(env, "java/lang/IllegalArgumentException", "Debugger action must be 0 (continue) or 1 (step)");
+    if (action < 0 || action > 2) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "Debugger action must be 0 (continue), 1 (step into), or 2 (step out)");
         return false;
     }
+    RemoveStepOutState(env, static_cast<jthread>(stop->thread));
     jvmtiError error = gJvmti->SetEventNotificationMode(
         action == 1 ? JVMTI_ENABLE : JVMTI_DISABLE,
         JVMTI_EVENT_SINGLE_STEP, static_cast<jthread>(stop->thread));
     if (error != JVMTI_ERROR_NONE && !(action == 0 && error == JVMTI_ERROR_NOT_AVAILABLE)) {
         ThrowJvmti(env, action == 1 ? "Enable single-step" : "Disable single-step", error);
         return false;
+    }
+    if (action == 2) {
+        bool suspendedForNotify = false;
+        jint state = 0;
+        error = gJvmti->GetThreadState(static_cast<jthread>(stop->thread), &state);
+        if (error == JVMTI_ERROR_NONE && (state & JVMTI_THREAD_STATE_SUSPENDED) == 0) {
+            error = gJvmti->SuspendThread(static_cast<jthread>(stop->thread));
+            suspendedForNotify = error == JVMTI_ERROR_NONE;
+        }
+        if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_THREAD_SUSPENDED) {
+            ThrowJvmti(env, "Suspend thread for step out", error);
+            return false;
+        }
+        jint frameCount = 0;
+        error = gJvmti->GetFrameCount(static_cast<jthread>(stop->thread), &frameCount);
+        if (error == JVMTI_ERROR_NONE && frameCount < 2) {
+            if (suspendedForNotify) gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+            ThrowJava(env, "java/lang/IllegalStateException",
+                "Cannot step out because the selected frame has no caller");
+            return false;
+        }
+        if (error != JVMTI_ERROR_NONE) {
+            if (suspendedForNotify) gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+            ThrowJvmti(env, "Read frame count for step out", error);
+            return false;
+        }
+        error = gJvmti->NotifyFramePop(static_cast<jthread>(stop->thread), 0);
+        if (error == JVMTI_ERROR_NONE) {
+            error = gJvmti->SetEventNotificationMode(JVMTI_ENABLE,
+                JVMTI_EVENT_FRAME_POP, static_cast<jthread>(stop->thread));
+        }
+        if (suspendedForNotify) {
+            const jvmtiError resume = gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
+            if (error == JVMTI_ERROR_NONE) error = resume;
+        }
+        if (error != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Enable step-out frame notification", error);
+            return false;
+        }
+        jobject reference = env->NewGlobalRef(stop->thread);
+        if (reference == nullptr) return false;
+        std::lock_guard<std::mutex> stepGuard(gStepOutMutex);
+        gStepOutAwaitingPop.push_back(reference);
     }
     if (stop->externallySuspended) {
         error = gJvmti->ResumeThread(static_cast<jthread>(stop->thread));
@@ -3532,6 +3960,9 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("setBreakpoint"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZLjava/lang/String;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
+    {const_cast<char*>("setDebugEventBreakpoint"),
+     const_cast<char*>("(ILjava/lang/Class;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZLjava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeSetDebugEventBreakpoint)},
     {const_cast<char*>("debuggerConfigure"), const_cast<char*>("(Z)V"),
      reinterpret_cast<void*>(&NativeDebuggerConfigure)},
     {const_cast<char*>("debuggerSnapshot"), const_cast<char*>("()[Ljava/lang/Object;"),
@@ -3550,6 +3981,9 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("debuggerSetLocal"),
      const_cast<char*>("(Ljava/lang/Thread;IILjava/lang/String;Ljava/lang/Object;)V"),
      reinterpret_cast<void*>(&NativeDebuggerSetLocal)},
+    {const_cast<char*>("debuggerForceReturn"),
+     const_cast<char*>("(Ljava/lang/Thread;Ljava/lang/Object;)V"),
+     reinterpret_cast<void*>(&NativeDebuggerForceReturn)},
     {const_cast<char*>("setFieldWatch"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;Ljava/lang/Object;)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatch)},
@@ -3845,6 +4279,15 @@ extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options, void*)
                 != JVMTI_ERROR_NONE) return JNI_ERR;
         gStartupClassPrepareOwned.store(true);
     }
+    if (!gStartupEntrySpec.empty()
+            && gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_METHOD_ENTRY, nullptr)
+                != JVMTI_ERROR_NONE) return JNI_ERR;
+    if (!gStartupExitSpec.empty()
+            && gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_METHOD_EXIT, nullptr)
+                != JVMTI_ERROR_NONE) return JNI_ERR;
+    if (!gStartupExceptionPattern.empty()
+            && gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_EXCEPTION, nullptr)
+                != JVMTI_ERROR_NONE) return JNI_ERR;
     return JNI_OK;
 }
 
@@ -3909,6 +4352,14 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
             }
             gPersistentFieldWatches.clear();
         }
+        {
+            std::lock_guard<std::mutex> guard(gDebugEventBreakpointMutex);
+            for (const DebugEventBreakpoint& breakpoint : gDebugEventBreakpoints) {
+                if (breakpoint.declaredClass != nullptr) env->DeleteGlobalRef(breakpoint.declaredClass);
+            }
+            gDebugEventBreakpoints.clear();
+        }
+        RemoveStepOutState(env, nullptr);
         if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
         ReleaseCallbackTypes(env);
     }
@@ -3916,6 +4367,9 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     gDispatchMethod = nullptr;
     gTransformMethod = nullptr;
     gClassFileHookEnabled.store(false);
+    gJavaMethodEntryDispatchEnabled.store(false);
+    gJavaMethodExitDispatchEnabled.store(false);
+    gJavaExceptionDispatchEnabled.store(false);
     gStartupBreakpointInstalled = false;
     gStartupClinitBreakpointInstalled = false;
     gStartupMainMethod = nullptr;
@@ -3924,6 +4378,9 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     gStartupClinitLocation = 0;
     gStartupMainClass.clear();
     gStartupClinitClass.clear();
+    gStartupEntrySpec.clear();
+    gStartupExitSpec.clear();
+    gStartupExceptionPattern.clear();
     gStartupClassPrepareOwned.store(false);
     gCallbacksInstalled.store(false);
     gCapabilitiesRequested.store(false);

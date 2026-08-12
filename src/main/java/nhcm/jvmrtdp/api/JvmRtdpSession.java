@@ -30,6 +30,7 @@ public final class JvmRtdpSession implements AutoCloseable {
     private final PrintStream discard;
     private final TargetSession target;
     private final InteractiveCli commands;
+    private final JvmInstrumentation instrumentation;
     private final Object commandLock = new Object();
     private final AtomicBoolean open = new AtomicBoolean(true);
     private volatile Runnable closeListener;
@@ -50,6 +51,7 @@ public final class JvmRtdpSession implements AutoCloseable {
         });
         this.target = new TargetSession(server, discard, discard);
         this.commands = new InteractiveCli(new ByteArrayInputStream(new byte[0]), discard, discard);
+        this.instrumentation = new JvmInstrumentation(target.jvmti());
     }
 
     void setCloseListener(Runnable listener) {
@@ -168,6 +170,12 @@ public final class JvmRtdpSession implements AutoCloseable {
         return target.jvmti();
     }
 
+    /** High-level target-code deployment, hook, transformer and redefine facade. */
+    public JvmInstrumentation instrumentation() {
+        ensureOpen();
+        return instrumentation;
+    }
+
     public RemoteOperations operations() {
         ensureOpen();
         return target.operations();
@@ -198,6 +206,11 @@ public final class JvmRtdpSession implements AutoCloseable {
     public void close() {
         if (!open.compareAndSet(true, false)) return;
         try {
+            // Controller-owned stops must never strand application threads after a library client exits.
+            try { target.jvmti().clearManagedEventBreakpoints(); } catch (RuntimeException ignored) { }
+            try { target.jvmti().clearManagedBreakpoints(); } catch (RuntimeException ignored) { }
+            try { target.jvmti().clearManagedFieldWatches(); } catch (RuntimeException ignored) { }
+            try { target.jvmti().configureDebugger(false); } catch (RuntimeException ignored) { }
             target.close();
         } finally {
             try {

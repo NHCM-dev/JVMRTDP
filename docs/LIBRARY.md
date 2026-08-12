@@ -20,7 +20,7 @@ repositories {
 }
 
 dependencies {
-    implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0")
+    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.0")
 }
 ```
 
@@ -30,11 +30,11 @@ Maven:
 <dependency>
   <groupId>nhcm.jvmrtdp</groupId>
   <artifactId>jvmrtdp</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.0</version>
 </dependency>
 ```
 
-For a local file dependency, use `build/libs/jvmrtdp-2.0.0-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies JLine as a runtime dependency; file-based consumers that use terminal controller classes must add JLine themselves. The standalone `build/libs/JVMRTDP-2.0.0.jar` remains a self-contained executable.
+For a local file dependency, use `build/libs/jvmrtdp-2.1.0-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies JLine as a runtime dependency; file-based consumers that use terminal controller classes must add JLine themselves. The standalone `build/libs/JVMRTDP-2.1.0.jar` remains a self-contained executable.
 
 Published artifacts include the library JAR, sources, Javadocs, and Maven POM. The automatic module name is `nhcm.jvmrtdp`.
 
@@ -135,6 +135,7 @@ Important accessors:
 | `session.forceLoadClass()` | Run target-side `Class.forName` |
 | `session.jni()` | Classes, objects, fields, methods, arrays, search, and materialization |
 | `session.jvmti()` | Capabilities, threads, stacks, locals, events, breakpoints, tags, and class operations |
+| `session.instrumentation()` | Source/JAR deployment, hooks, transformers, retransform, and redefine |
 | `session.operations()` | Workspace-oriented construct/call/get/set helpers |
 | `session.context()` | Context stack used by embedded CLI commands |
 | `session.workspace()` | Named class and object handles |
@@ -172,11 +173,67 @@ JvmBreakpointCondition condition = JvmBreakpointCondition.receiver(serviceObject
 session.jvmti().setBreakpoint(
         "com.example.Service", "run", "()V", 0, condition, true);
 
+// Event breakpoints also work for native methods and abstract declarations.
+JvmEventBreakpointInfo entry = session.jvmti().setEventBreakpoint(
+        JvmEventBreakpointSpec.methodEntry(
+                "java.lang.Runnable", "run", "()V").includingSubtypes());
+JvmEventBreakpointInfo exceptions = session.jvmti().setEventBreakpoint(
+        JvmEventBreakpointSpec.exception("com.example.*Exception"));
+
+try (RemoteObject replacementInteger = session.jni().valueOf(42);
+     JvmDebuggerState stop = session.jvmti().debuggerState()) {
+    if (stop.paused()) {
+        session.jvmti().setDebuggerLocal(stop.thread(), 0, 1, "I", replacementInteger);
+        session.jvmti().stepOut(stop.thread());
+    }
+}
+
 session.execute("debugger snapshot output/debugger.json json")
         .requireSuccess();
 ```
 
 `managedBreakpoints()` and debugger JSON/JSONL exports include the registration ID, receiver identity, and condition summary. Use `clearBreakpoint(info)` to clear a listed registration even after its original object handle is no longer selected. Callback handles support `enable()`, `disable()`, and `resetStatistics()` in addition to `close()`.
+
+`forceEarlyReturn(thread, value)` and `forceEarlyReturnVoid(thread)` replace the result of the
+currently paused Java frame; continue the thread afterward. Native frames are opaque to
+`ForceEarlyReturn`, and a `METHOD_EXIT` stop occurs after the result has already been committed.
+At an exit stop, `JvmDebuggerState.returnState()` identifies `value`, `void`, or `exception`, and
+`returnValue()` exposes the boxed target-JVM value when one exists.
+
+### Hooks, transformers, and redefine
+
+`session.instrumentation()` is the high-level facade for code running inside the target JVM:
+
+```java
+JvmInstrumentation instrumentation = session.instrumentation();
+
+try (RemoteCodeDeployment deployment = instrumentation.deploySource(
+        "audit-hook", "example.AuditHook", hookSource);
+     RemoteJvmtiCallback hook = instrumentation.hook(
+        deployment, "example.AuditHook",
+        java.util.EnumSet.of(JvmtiEventType.METHOD_ENTRY), false)) {
+    // The deployed class implements JvmtiEventHandler.
+    session.jvmti().retransformClass("com.example.Service");
+}
+
+try (RemoteCodeDeployment deployment = instrumentation.deploySource(
+        "transformer", "example.ServiceTransformer", transformerSource);
+     RemoteJvmtiCallback transformer = instrumentation.transformer(
+        deployment, "example.ServiceTransformer", true)) {
+    // ServiceTransformer implements JvmtiClassFileTransformer and returns class bytes.
+    instrumentation.retransform("com.example.Service");
+}
+
+instrumentation.redefine("com.example.Service", java.nio.file.Paths.get("Service.class"));
+
+// A controller-side bytecode editor can also replace the current class in one operation.
+byte[] installed = instrumentation.transformAndRedefine(
+        "com.example.Service", bytes -> bytecodeEditor.transform(bytes));
+```
+
+Use synchronous delivery only when the hook must affect the callback result, such as a class-file
+transformer. Asynchronous delivery avoids blocking the application thread for observational hooks.
+HotSpot redefine/retransform schema limits still apply; transformers must return a valid class file.
 
 Capabilities depend on the JVM phase. Use `-agentpath` at target startup when an `OnLoad`-only capability is required. Dynamic attach cannot force capabilities that HotSpot no longer reports as potential.
 

@@ -29,8 +29,9 @@ public class JvmtiCommand implements RemoteCommand {
                 + "phase|time|timer-info|current-thread.cpu-time|processors|location-format|"
                 + "class.info|class.interfaces|class.loader-classes|class.source-debug|class.constant-pool|"
                 + "method.info|method.bytecodes|method.lines|field.info|events|events.generate|verbose|retransform|redefine|"
-                + "breakpoint|debug.enable|debug.disable|debug.status|debug.status-all|debug.continue|"
-                + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.locals|debug.set-local|"
+                + "breakpoint|debug.event-breakpoint|debug.enable|debug.disable|debug.status|debug.status-all|debug.continue|"
+                + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.step-out|debug.step-out-thread|"
+                + "debug.locals|debug.set-local|debug.force-return|debug.force-return-void|"
                 + "watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
                 + "thread.cpu-time|thread.owned-monitors|thread.contended-monitor|thread.suspend|thread.resume|"
                 + "thread.interrupt|thread.frame-pop|object.size|object.hash|object.monitor-usage|"
@@ -189,6 +190,21 @@ public class JvmtiCommand implements RemoteCommand {
             NativeAgent.configureDebugger(false);
             return success("ok");
         }
+        if ("debug.event-breakpoint".equals(operation) && arguments.size() == 8) {
+            boolean enabled = toggle(arguments.get(1));
+            int kind;
+            if ("entry".equalsIgnoreCase(arguments.get(2))) kind = 0;
+            else if ("exit".equalsIgnoreCase(arguments.get(2))) kind = 1;
+            else if ("exception".equalsIgnoreCase(arguments.get(2))) kind = 2;
+            else throw new IllegalArgumentException("Event breakpoint kind must be entry, exit, or exception");
+            boolean includeSubtypes = Boolean.parseBoolean(arguments.get(6));
+            Class<?> declaredType = enabled && includeSubtypes && kind != 2
+                    ? NativeAgent.findLoadedClass(arguments.get(3)) : null;
+            NativeAgent.setDebugEventBreakpoint(kind, declaredType, arguments.get(3),
+                    optionalPattern(arguments, 4), optionalPattern(arguments, 5),
+                    includeSubtypes, arguments.get(7), enabled);
+            return success("ok");
+        }
         if ("debug.status".equals(operation) && arguments.size() == 1) {
             return success(encodeDebuggerState(handle, NativeAgent.debuggerSnapshot()));
         }
@@ -208,6 +224,14 @@ public class JvmtiCommand implements RemoteCommand {
                 && arguments.size() == 2) {
             NativeAgent.resumeDebugger(thread(handle, arguments.get(1)),
                     "debug.step-thread".equals(operation));
+            return success("ok");
+        }
+        if ("debug.step-out".equals(operation) && arguments.size() == 1) {
+            NativeAgent.stepOutDebugger();
+            return success("ok");
+        }
+        if ("debug.step-out-thread".equals(operation) && arguments.size() == 2) {
+            NativeAgent.stepOutDebugger(thread(handle, arguments.get(1)));
             return success("ok");
         }
         if ("debug.pause-thread".equals(operation)
@@ -238,6 +262,15 @@ public class JvmtiCommand implements RemoteCommand {
                     Integer.parseInt(arguments.get(2)), Integer.parseInt(arguments.get(3)),
                     arguments.get(4), handle.targetObjects().resolveExternal(
                             Long.parseLong(arguments.get(5))));
+            return success("ok");
+        }
+        if ("debug.force-return".equals(operation) && arguments.size() == 3) {
+            NativeAgent.forceDebuggerReturn(thread(handle, arguments.get(1)),
+                    handle.targetObjects().resolveExternal(Long.parseLong(arguments.get(2))));
+            return success("ok");
+        }
+        if ("debug.force-return-void".equals(operation) && arguments.size() == 2) {
+            NativeAgent.forceDebuggerReturn(thread(handle, arguments.get(1)), null);
             return success("ok");
         }
         if ("watch".equals(operation) && (arguments.size() == 6 || arguments.size() == 8)) {
@@ -364,10 +397,14 @@ public class JvmtiCommand implements RemoteCommand {
 
     private static String encodeDebuggerState(JRDHandle handle, Object[] state) {
         String thread = state[0] == null ? "" : handle.targetObjects().storeExternal(state[0]).encode();
+        String returnValue = state.length <= 10 || state[10] == null ? ""
+                : handle.targetObjects().storeExternalOpaque(state[10]).encode();
+        String returnState = state.length <= 11 || state[11] == null ? "" : String.valueOf(state[11]);
         return TextWireCodec.encode(thread,
                 String.valueOf(state[1]), String.valueOf(state[2]), String.valueOf(state[3]),
                 String.valueOf(state[4]), String.valueOf(state[5]), String.valueOf(state[6]),
-                String.valueOf(state[7]), String.valueOf(state[8]), String.valueOf(state[9]));
+                String.valueOf(state[7]), String.valueOf(state[8]), String.valueOf(state[9]),
+                returnValue, returnState);
     }
 
     private static CommandReply capabilityStatusReply() {

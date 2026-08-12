@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-本文档说明 JVMRTDP 2.0.0 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
+本文档说明 JVMRTDP 2.1.0 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
 
 ## 1. 基本约定
 
@@ -16,8 +16,8 @@
 ## 2. 启动与会话
 
 ```powershell
-java -jar JVMRTDP-2.0.0.jar
-java -jar JVMRTDP-2.0.0.jar --cli
+java -jar JVMRTDP-2.1.0.jar
+java -jar JVMRTDP-2.1.0.jar --cli
 ```
 
 控制端命令：
@@ -463,4 +463,30 @@ session.debugger()
 - `NATIVE_METHOD`：当前帧为原生方法，没有 Java 局部变量或 BCI。
 - `OPAQUE_FRAME`：当前帧不能执行所请求的栈操作。
 - `INVALID_SLOT` / `TYPE_MISMATCH`：局部变量槽无效、已经失活或类型不匹配。
+## 新增调试事件与控制
+
+启动时可在控制端连接前暂停：
+
+```text
+-agentpath:agent.dll=break-entry=类#方法#描述符
+-agentpath:agent.dll=break-exit=类#方法#描述符
+-agentpath:agent.dll=break-exception=异常类通配符
+```
+
+多个 agent 选项用逗号分隔。运行时命令：
+
+```text
+debugger event-break <entry|exit> <class> <method> <descriptor> [subtypes]
+debugger exception-break <class-glob>
+debugger event-breakpoints [clear-all]
+debugger event-clear <index>
+debugger step-out [paused-index]
+debugger force-return <paused-index> <value>
+debugger force-return-void <paused-index>
+```
+
+`subtypes` 可从 abstract/interface 声明断到实际实现。native 方法可以触发进入/退出事件，
+但 native frame 没有 Java BCI/local，也不能用标准 JVMTI 强制返回。`METHOD_EXIT` 发生时返回值
+已提交；要改返回值，应在方法进入、字节码断点或单步暂停时使用 `force-return`。
+
 <!-- English COMMANDS.md is canonical. -->

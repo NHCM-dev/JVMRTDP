@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-This document describes the TUI, command line, and debugger commands in JVMRTDP 2.0.0. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
+This document describes the TUI, command line, and debugger commands in JVMRTDP 2.1.0. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
 
 ## 1. Conventions
 
@@ -16,8 +16,8 @@ This document describes the TUI, command line, and debugger commands in JVMRTDP 
 ## 2. Startup and Sessions
 
 ```powershell
-java -jar JVMRTDP-2.0.0.jar
-java -jar JVMRTDP-2.0.0.jar --cli
+java -jar JVMRTDP-2.1.0.jar
+java -jar JVMRTDP-2.1.0.jar --cli
 ```
 
 Controller commands:
@@ -84,7 +84,11 @@ Debugger keys:
 | `F9` | Set or clear a normal breakpoint at the selected BCI |
 | `Shift+F9` | Set or clear a breakpoint limited to the current object Context |
 | `F7` | Step |
+| `Shift+F7` | Step out to the caller |
 | `F8` | Continue the current thread |
+| `Ctrl+R` in Debug | Force the paused Java frame to return; prompts for a value when non-void |
+| `Ctrl+E` / `Ctrl+X` in Methods | Toggle method-entry / method-exit event breakpoint |
+| `Ctrl+X` in Debug | Toggle pause on every thrown exception |
 | `F6` | Pause the selected thread |
 | `F4` | Toggle live following while the target runs |
 | `T` | Open the thread list |
@@ -258,7 +262,7 @@ debugger locations
 debugger locations
 ```
 
-Startup `break-main` and `break-clinit` stops are one-shot entry pauses. Normal breakpoints are reinstalled after a hit and remain active until cleared.
+Startup `break-main` and `break-clinit` stops are one-shot entry pauses. `break-entry=class#method#descriptor`, `break-exit=...`, and `break-exception=class-glob` install event stops before a controller attaches. Separate agent options with commas. Normal breakpoints remain active until cleared.
 
 ### 9.2 Breakpoints
 
@@ -272,6 +276,20 @@ debugger breakpoints clear-all
 ```
 
 Explicit class breakpoints apply to every receiver. `break-context` uses the current object as an identity condition for instance methods; from a class context (and for static methods) it applies globally. Caller patterns accept `*` and `?`. The same typed condition is available to library clients as `JvmBreakpointCondition`.
+
+Event breakpoints work even when a method has no Java `Code` attribute:
+
+```text
+debugger event-break <entry|exit> <class> <method> <descriptor> [subtypes]
+debugger exception-break <exception-class-glob>
+debugger event-breakpoints
+debugger event-breakpoints clear-all
+debugger event-clear <index>
+```
+
+Use `subtypes` for an abstract/interface declaration to stop in matching implementations.
+Native methods support entry and exit events, but native frames do not expose Java locals or BCI.
+Method-exit stops report the boxed return value, `void`, or exceptional completion in debugger state.
 
 ### 9.3 Field Watchpoints
 
@@ -297,6 +315,8 @@ debugger stack [paused-index] [max]
 debugger locals [paused-index] [depth]
 debugger local-context <paused-index> <depth> <slot>
 debugger local-set <paused-index> <depth> <local-index> <value>
+debugger force-return <paused-index> <value>
+debugger force-return-void <paused-index>
 debugger current [paused-index] [depth] [radius]
 debugger sample <all-thread-index> [depth] [radius]
 ```
@@ -311,8 +331,15 @@ Without a `LocalVariableTable`, JVMRTDP attempts to read slots up to `maxLocals`
 
 ```text
 debugger step [paused-index]
+debugger step-out [paused-index]
 debugger continue [paused-index|all]
 ```
+
+`step` stops after one JVM bytecode and enters invoked Java methods. `step-out` runs until
+the current Java frame returns, then stops at the first bytecode in its caller.
+`force-return` schedules a JVMTI early return; continue the thread to apply it. It is valid
+only before a Java method completes. A method-exit stop observes the completed return value,
+so standard JVMTI cannot replace that value at that point.
 
 ### 9.6 Analysis Freeze and Snapshots
 
@@ -324,12 +351,13 @@ debugger thaw
 debugger snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]
 ```
 
-Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshots support offline analysis and external tools.
+Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshot schema version 3 includes bytecode breakpoints, event breakpoints, field watches, paused frames/locals, and captured method-exit return values for offline analysis and external tools.
 
 ### 9.7 Debugging Limits
 
 - Standard JVMTI does not expose current operand-stack values.
 - Native frames have no Java BCI or locals.
+- Native frames cannot be force-returned by standard JVMTI; stop in the Java caller instead.
 - Optimization, missing debug tables, and dead slots may limit local-variable access.
 - Suspending UI, GC, class-loading, or lock-related threads may affect target responsiveness.
 

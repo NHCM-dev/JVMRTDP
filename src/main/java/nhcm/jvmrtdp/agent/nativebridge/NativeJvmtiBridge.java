@@ -18,13 +18,18 @@ public final class NativeJvmtiBridge {
             String descriptor, long location, boolean enabled, String registrationId,
             Object receiver, String callerClass, String callerMethod, String callerDescriptor);
 
+    /** kind: 0=method entry, 1=method exit, 2=exception throw. */
+    public static native void setDebugEventBreakpoint(int kind, Class<?> declaredType,
+            String classPattern, String methodPattern, String descriptorPattern,
+            boolean includeSubtypes, String registrationId, boolean enabled);
+
     public static native void debuggerConfigure(boolean enabled);
 
     public static native Object[] debuggerSnapshot();
 
     public static native Object[][] debuggerSnapshots();
 
-    /** action: 0=continue, 1=single-step one bytecode. */
+    /** action: 0=continue, 1=step into one bytecode, 2=step out to the caller. */
     public static native void debuggerResume(int action);
 
     /** A null thread with action 0 continues every paused debugger thread. */
@@ -39,6 +44,9 @@ public final class NativeJvmtiBridge {
     /** Replaces one live local in a paused debugger frame. */
     public static native void debuggerSetLocal(Thread thread, int depth, int slot,
             String descriptor, Object value);
+
+    /** Forces the current Java frame to return. Native frames are not supported by JVMTI. */
+    public static native void debuggerForceReturn(Thread thread, Object value);
 
     public static native void setFieldWatch(Class<?> type, String fieldName,
             String descriptor, boolean modification, boolean enabled,
