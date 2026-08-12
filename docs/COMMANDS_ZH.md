@@ -218,7 +218,10 @@ find <class|interface|enum|annotation|array> [name-glob] [--package glob] [--ext
 find <extends|implements> <type-glob> [name-glob] [--limit n]
 find field [name-glob] [--class glob] [--type glob] [--static|--virtual] [--limit n]
 find method [name-glob] [--class glob] [--returns glob] [--params glob] [--static|--virtual] [--limit n]
+find unloaded [class|field|method] [glob] [--class owner-glob] [--limit n]
 ```
+
+`find unloaded` 从控制端扫描目标 classpath 以及可用的 `rt.jar`/`jmods`，不触发类加载或初始化。结果与已加载类分开显示；指定未加载类时，`decompile` 和只读 `bytecode` 会直接使用 class bytes。
 
 `class load` 在目标 JVM 中执行等价于 `Class.forName` 的加载操作，可能触发类初始化。
 
@@ -301,6 +304,8 @@ debugger breakpoints
 debugger breakpoints clear-all
 ```
 
+`debugger break` 支持尚未加载的类。注册会保持 pending，在目标类触发 `ClassPrepare` 时自动解析方法并安装；在加载前执行 `clear` 会删除 pending 注册。
+
 ### 9.3 字段监视点
 
 ```text
@@ -311,6 +316,8 @@ debugger watch write clear <class> <field> <descriptor>
 debugger watches
 debugger watches clear-all
 ```
+
+字段 read/write watch 同样支持未加载 owner，并在 `ClassPrepare` 时安装。此时还没有对象引用，因此 pending 断点/watch 面向该成员的所有实例。
 
 监视点适用于字段读取或写入。调用点可通过目标方法入口 BCI 或包含调用指令的 BCI 设置断点。
 

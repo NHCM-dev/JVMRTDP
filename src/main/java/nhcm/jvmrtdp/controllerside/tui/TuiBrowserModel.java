@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.controllerside.tui;
 
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.handles.java.RemoteClassInfo;
 import nhcm.jvmrtdp.handles.java.RemoteField;
 import nhcm.jvmrtdp.handles.java.RemoteMethod;
@@ -83,6 +84,61 @@ final class TuiBrowserModel {
                     || entry.name().toLowerCase(Locale.ROOT).contains(needle)
                     || entry.displayName().toLowerCase(Locale.ROOT).contains(needle)) result.add(entry);
         }
+        return result;
+    }
+
+    static List<TuiBrowserEntry> unloadedPackageEntries(
+            JvmClassPathCatalog.PackageView source, boolean showRuntime) {
+        List<TuiBrowserEntry> result = new ArrayList<TuiBrowserEntry>();
+        if (!source.name().isEmpty()) {
+            result.add(TuiBrowserEntry.unloadedParent(parentPackage(source.name())));
+        }
+        for (String name : source.packages()) {
+            if (showRuntime || !runtimeNamespace(name)) result.add(TuiBrowserEntry.unloadedPackage(name));
+        }
+        for (JvmClassPathCatalog.ClassEntry entry : source.classes()) {
+            if (visibleClass(entry.name(), showRuntime, false)) {
+                result.add(TuiBrowserEntry.unloadedClass(entry));
+            }
+        }
+        sort(result);
+        return result;
+    }
+
+    static List<TuiBrowserEntry> unloadedMemberEntries(
+            JvmClassPathCatalog.ClassEntry owner) throws java.io.IOException {
+        List<TuiBrowserEntry> result = new ArrayList<TuiBrowserEntry>();
+        for (JvmClassPathCatalog.Member field : owner.metadata().fields()) {
+            result.add(TuiBrowserEntry.unloadedMember(owner, field));
+        }
+        for (JvmClassPathCatalog.Member method : owner.metadata().methods()) {
+            result.add(TuiBrowserEntry.unloadedMember(owner, method));
+        }
+        sort(result);
+        return result;
+    }
+
+    static List<TuiBrowserEntry> unloadedSearchEntries(
+            List<JvmClassPathCatalog.ClassEntry> classes, boolean showRuntime) {
+        List<TuiBrowserEntry> result = new ArrayList<TuiBrowserEntry>();
+        for (JvmClassPathCatalog.ClassEntry entry : classes) {
+            if (visibleClass(entry.name(), showRuntime, false)) {
+                result.add(TuiBrowserEntry.unloadedClass(entry));
+            }
+        }
+        sort(result);
+        return result;
+    }
+
+    static List<TuiBrowserEntry> unloadedMemberSearchEntries(
+            List<JvmClassPathCatalog.MemberMatch> matches, boolean showRuntime) {
+        List<TuiBrowserEntry> result = new ArrayList<TuiBrowserEntry>();
+        for (JvmClassPathCatalog.MemberMatch match : matches) {
+            if (visibleClass(match.owner().name(), showRuntime, false)) {
+                result.add(TuiBrowserEntry.unloadedMember(match.owner(), match.member()));
+            }
+        }
+        sort(result);
         return result;
     }
 

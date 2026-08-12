@@ -66,6 +66,23 @@ public class RemoteJNIEnv extends RemoteHandle {
         return new RemotePackage(packageName, packages, classes);
     }
 
+    /** Complete loaded-class name snapshot, including classes beyond search display limits. */
+    public List<String> loadedClassNames() {
+        String output = executeForOutput(CommandLine.of("object", "class.names"));
+        if (output.isEmpty()) return Collections.emptyList();
+        List<String> result = new ArrayList<String>();
+        Collections.addAll(result, output.split("\\r?\\n"));
+        return Collections.unmodifiableList(result);
+    }
+
+    /** Reads {@link System#getProperty(String)} inside the target JVM. */
+    public String systemProperty(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("name must not be empty");
+        }
+        return executeForOutput(CommandLine.of("object", "system.property", name));
+    }
+
     public List<RemoteClassInfo> searchClasses(RemoteClassQuery query) {
         if (query == null) throw new IllegalArgumentException("query must not be null");
         String output = executeForOutput(CommandLine.of(

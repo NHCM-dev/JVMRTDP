@@ -18,6 +18,11 @@ public final class NativeJvmtiBridge {
             String descriptor, long location, boolean enabled, String registrationId,
             Object receiver, String callerClass, String callerMethod, String callerDescriptor);
 
+    /** Symbolic registration that remains pending until the named class is prepared. */
+    public static native void setBreakpointByName(String className, String methodName,
+            String descriptor, long location, boolean enabled, String registrationId,
+            String callerClass, String callerMethod, String callerDescriptor);
+
     /** kind: 0=method entry, 1=method exit, 2=exception throw. */
     public static native void setDebugEventBreakpoint(int kind, Class<?> declaredType,
             String classPattern, String methodPattern, String descriptorPattern,
@@ -51,6 +56,10 @@ public final class NativeJvmtiBridge {
     public static native void setFieldWatch(Class<?> type, String fieldName,
             String descriptor, boolean modification, boolean enabled,
             String registrationId, Object receiver);
+
+    /** Symbolic registration that remains pending until the named class is prepared. */
+    public static native void setFieldWatchByName(String className, String fieldName,
+            String descriptor, boolean modification, boolean enabled, String registrationId);
 
     public static native void notifyFramePop(Thread thread, int depth);
 

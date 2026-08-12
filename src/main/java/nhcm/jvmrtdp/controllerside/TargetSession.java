@@ -2,12 +2,16 @@ package nhcm.jvmrtdp.controllerside;
 
 import nhcm.jvmrtdp.api.JvmInstrumentation;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 import nhcm.jvmrtdp.handles.jvm.RemoteJNIEnv;
 import nhcm.jvmrtdp.handles.jvm.RemoteJVMTIEnv;
 
+import java.io.IOException;
 import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /** Controller-side object graph for one attached JVM. */
@@ -23,6 +27,7 @@ public class TargetSession implements AutoCloseable {
     private final RemoteOperations operations;
     private final RemoteContext context;
     private final DebuggerControlService debugger;
+    private volatile JvmClassPathCatalog classPathCatalog;
     private boolean controllerExitRequested;
     private boolean tuiRequested;
 
@@ -92,6 +97,27 @@ public class TargetSession implements AutoCloseable {
     }
 
     public DebuggerControlService debugger() { return debugger; }
+
+    /**
+     * Returns a cached, non-loading view of class files on the target's application
+     * class path. Call {@link #refreshClassPathCatalog()} after the target loads classes
+     * or changes its class path.
+     */
+    public JvmClassPathCatalog classPathCatalog() throws IOException {
+        JvmClassPathCatalog current = classPathCatalog;
+        if (current != null) return current;
+        return refreshClassPathCatalog();
+    }
+
+    /** Re-scans class-path files and the current loaded-class snapshot. */
+    public synchronized JvmClassPathCatalog refreshClassPathCatalog() throws IOException {
+        List<String> loaded = new ArrayList<String>(jni.loadedClassNames());
+        classPathCatalog = JvmClassPathCatalog.discover(
+                jni.systemProperty("java.class.path"),
+                jni.systemProperty("user.dir"),
+                jni.systemProperty("java.home"), loaded);
+        return classPathCatalog;
+    }
 
     public void requestControllerExit() {
         controllerExitRequested = true;

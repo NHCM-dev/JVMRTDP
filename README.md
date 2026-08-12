@@ -140,7 +140,7 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `Left` / `Right` | Scroll horizontally |
 | `[` / `]` | Scroll horizontally faster |
 | `/` | Filter the current list; `Esc` cancels |
-| `f` / `F` | Find in the displayed list / search all loaded classes and members |
+| `f` / `F` | Find in the displayed list / search the active loaded or unloaded catalog |
 | `:` | Open an exact class, package, field, or method target |
 | `@` | Show or hide static members in Fields/Methods |
 | `#` | Show or hide instance fields and virtual methods in Fields/Methods |
@@ -148,6 +148,7 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `x` / `X` | Invoke the selected method virtually / invoke its declaring implementation |
 | `P` | Enter a package name |
 | `J` | Show or hide JDK types |
+| `U` (Browse) | Switch between loaded classes and the separate unloaded class-path catalog |
 | `a` | Show or hide array types in Browse |
 | `A` | Decompile the selected or current class |
 | `K` | Show or hide `<init>` / `<clinit>` |
@@ -166,6 +167,13 @@ Main views:
 - `frames` / `locals`: stack frames and local variables
 - `breakpoints`: breakpoint management
 - `threads`: all JVM threads and states
+
+Browse never mixes runtime classes with unloaded class files. Press `U` to open the
+unloaded target-class-path/JDK archive catalog; rows are marked `[U:C]`, `[U:M]`, and `[U:F]`.
+Opening bytecode or decompilation in this mode reads the class file on the controller and
+does not define or initialize it. `F9` registers a symbolic pending breakpoint, `u`/`W`
+register field read/write watches, and `Ctrl+E`/`Ctrl+X` register method entry/exit stops.
+The agent resolves these registrations during `ClassPrepare`, before ordinary class use.
 
 ## Decompilation and Bytecode
 
@@ -187,13 +195,20 @@ Set and inspect breakpoints:
 
 ```text
 debugger enable
+# The class may still be unloaded; this registration remains pending until ClassPrepare.
 debugger break com.example.Application run "()V" 0
+debugger watch read set com.example.Application state "I"
 context class com.example.Application
 debugger break-context run "()V" 0
 debugger breakpoints
 ```
 
 In the TUI, `F9` always creates a normal breakpoint and `Shift+F9` explicitly limits it to the object currently selected in Context. CLI/library callers can use `break-context` or `JvmBreakpointCondition` for receiver and caller conditions. TUI field watchpoints apply to every instance.
+
+`debugger break`, `debugger watch`, and exact method entry/exit event registrations accept
+unloaded class names. The controller keeps them as managed controls, and the native agent
+installs their JVMTI IDs at `ClassPrepare`. Receiver-specific conditions still require a
+live object; unloaded registrations therefore apply to every future instance.
 
 Inspect and control threads:
 

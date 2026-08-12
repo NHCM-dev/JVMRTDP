@@ -15,7 +15,7 @@ public class ObjectCommand implements RemoteCommand {
 
     @Override
     public String usage() {
-        return "object <value|construct|methods|fields|constructors|class.info|class.load|class.load.start|package|class.search|"
+        return "object <value|construct|methods|fields|constructors|class.info|class.names|system.property|class.load|class.load.start|package|class.search|"
                 + "package.search|field.search|method.search|call|call.special|"
                 + "field.get|field.set|instanceof|array.length|array.get|array.set|iterable|map|stats|debug|as|release> ...";
     }
@@ -48,6 +48,12 @@ public class ObjectCommand implements RemoteCommand {
         }
         if ("class.info".equals(operation) && arguments.size() == 2) {
             return success(objects.classInfo(arguments.get(1)));
+        }
+        if ("class.names".equals(operation) && arguments.size() == 1) {
+            return success(join(objects.loadedClassNames()));
+        }
+        if ("system.property".equals(operation) && arguments.size() == 2) {
+            return success(objects.systemProperty(arguments.get(1)));
         }
         if ("class.load".equals(operation) && arguments.size() == 2) {
             return success(objects.forceLoadClass(arguments.get(1)).getName());

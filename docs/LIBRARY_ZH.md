@@ -131,6 +131,7 @@ System.out.println(session.jvmti().capabilityStatuses());
 | API | 用途 |
 | --- | --- |
 | `session.findClass()` | 解析已加载类 |
+| `session.classPathCatalog()` / `refreshClassPathCatalog()` | 独立浏览 classpath 中尚未加载的 class 文件 |
 | `session.forceLoadClass()` | 在目标端执行 `Class.forName` |
 | `session.jni()` | 类、对象、字段、方法、数组、搜索和物化 |
 | `session.jvmti()` | capability、线程、栈、local、事件、断点、tag 和类操作 |

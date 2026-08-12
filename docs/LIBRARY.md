@@ -116,6 +116,7 @@ Use the typed API when output parsing is undesirable:
 
 ```java
 import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 
@@ -125,6 +126,11 @@ byte[] classBytes = service.getClassBytes();
 
 System.out.println(session.jvmti().phase());
 System.out.println(session.jvmti().capabilityStatuses());
+
+// Inspect class-path metadata without defining or initializing the target class.
+JvmClassPathCatalog catalog = session.refreshClassPathCatalog();
+JvmClassPathCatalog.ClassEntry pending = catalog.find("com.example.FutureService");
+System.out.println(pending.metadata().methods());
 ```
 
 Important accessors:
@@ -132,6 +138,7 @@ Important accessors:
 | API | Purpose |
 | --- | --- |
 | `session.findClass()` | Resolve a loaded class |
+| `session.classPathCatalog()` / `refreshClassPathCatalog()` | Browse class files separately from loaded runtime classes |
 | `session.forceLoadClass()` | Run target-side `Class.forName` |
 | `session.jni()` | Classes, objects, fields, methods, arrays, search, and materialization |
 | `session.jvmti()` | Capabilities, threads, stacks, locals, events, breakpoints, tags, and class operations |
@@ -164,6 +171,7 @@ Use `executeAgentBatch(List<String>)` to send multiple agent commands in one pro
 
 ```java
 session.jvmti().configureDebugger(true);
+// This also works before Service is loaded; the agent installs it at ClassPrepare.
 session.jvmti().setBreakpoint(
         "com.example.Service", "run", "()V", 0, true);
 
@@ -193,6 +201,11 @@ session.execute("debugger snapshot output/debugger.json json")
 ```
 
 `managedBreakpoints()` and debugger JSON/JSONL exports include the registration ID, receiver identity, and condition summary. Use `clearBreakpoint(info)` to clear a listed registration even after its original object handle is no longer selected. Callback handles support `enable()`, `disable()`, and `resetStatistics()` in addition to `close()`.
+
+String-based breakpoints, field watches, and method event breakpoints may target unloaded
+classes. Pending controls remain managed by `RemoteJVMTIEnv`, install natively at
+`ClassPrepare`, and can be cleared before loading. Object-specific conditions require a
+live `RemoteObject` and therefore use the loaded-class overloads.
 
 `forceEarlyReturn(thread, value)` and `forceEarlyReturnVoid(thread)` replace the result of the
 currently paused Java frame; continue the thread afterward. Native frames are opaque to

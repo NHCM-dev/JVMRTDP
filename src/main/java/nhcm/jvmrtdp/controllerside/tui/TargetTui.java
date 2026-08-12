@@ -16,6 +16,9 @@ import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
 import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
 import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
 import nhcm.jvmrtdp.controllerside.analysis.ClassFileView;
+import nhcm.jvmrtdp.controllerside.analysis.ClassDecompiler;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassFileParser;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
 import nhcm.jvmrtdp.controllerside.analysis.DecompilationResult;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
@@ -94,6 +97,10 @@ public final class TargetTui implements AutoCloseable {
     private boolean searchMode;
     private boolean showRuntime;
     private boolean showArrays;
+    /** Unloaded class files are browsed in a separate catalog, never mixed with live classes. */
+    private boolean browseUnloaded;
+    private String unloadedMemberOwner = "";
+    private JvmClassPathCatalog classPathCatalog;
     private boolean showSpecialMethods;
     /** Unoverridden java.lang.Object methods are noise in most application classes. */
     private boolean hideInheritedObjectMethods = true;
@@ -110,11 +117,13 @@ public final class TargetTui implements AutoCloseable {
     private String sourceClass = "";
     private String sourceMethod = "";
     private String sourceDescriptor = "";
+    private JvmClassPathCatalog.ClassEntry sourceCatalogClass;
     private final NavigableMap<Integer, Integer> sourceBciToLine = new TreeMap<Integer, Integer>();
     private ClassFileMethod bytecode;
     private String bytecodeClass = "";
     private String bytecodeMethod = "";
     private String bytecodeDescriptor = "";
+    private JvmClassPathCatalog.ClassEntry bytecodeCatalogClass;
     private int pendingBytecodeLocation = -1;
     private JvmDebuggerState debuggerState;
     private int debuggerFrameDepth;
@@ -289,6 +298,7 @@ public final class TargetTui implements AutoCloseable {
         else if (key == ':') openExact();
         else if (key == 'p' || key == 'P') goPackage();
         else if (key == 'l' || key == 'L') forceLoadClass();
+        else if (key == 'U' && tab == Tab.BROWSE) toggleUnloadedBrowser();
         else if (key == 'j' || key == 'J') toggleRuntime();
         else if (key == 'k' || key == 'K') toggleSpecialMethods();
         else if (key == 'h' || key == 'H') toggleInheritedObjectMethods();
@@ -332,8 +342,8 @@ public final class TargetTui implements AutoCloseable {
         else if (key == TuiKey.SHIFT_F7) stepOut();
         else if (key == TuiKey.F8) continueExecution();
         else if (key == TuiKey.CTRL_R && tab == Tab.DEBUG) forceEarlyReturn();
-        else if (key == TuiKey.CTRL_E && tab == Tab.METHODS) toggleMethodEventBreakpoint(true);
-        else if (key == TuiKey.CTRL_X && tab == Tab.METHODS) toggleMethodEventBreakpoint(false);
+        else if (key == TuiKey.CTRL_E && (tab == Tab.METHODS || tab == Tab.BROWSE)) toggleMethodEventBreakpoint(true);
+        else if (key == TuiKey.CTRL_X && (tab == Tab.METHODS || tab == Tab.BROWSE)) toggleMethodEventBreakpoint(false);
         else if (key == TuiKey.CTRL_X && tab == Tab.DEBUG) toggleExceptionBreakpoint();
         else if (key == '+' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) insertBytecode();
         else if (key == '-' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) deleteBytecode();
@@ -342,6 +352,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void requestPackage(final String requested) {
+        if (browseUnloaded) {
+            requestUnloadedPackage(requested, false);
+            return;
+        }
         final String normalized = requested == null || ".".equals(requested.trim())
                 ? "" : requested.trim().replace('/', '.');
         final boolean includeArrays = showArrays && normalized.isEmpty();
@@ -370,6 +384,47 @@ public final class TargetTui implements AutoCloseable {
                                 + (showArrays ? " (array classes visible)" : " (arrays hidden)");
                     }
                 });
+    }
+
+    private void requestUnloadedPackage(final String requested, final boolean rescan) {
+        final String normalized = requested == null || ".".equals(requested.trim())
+                ? "" : requested.trim().replace('/', '.');
+        submit((rescan ? "Scanning target class path" : "Opening unloaded package") + "...",
+                new Callable<UnloadedPackageResult>() {
+                    @Override public UnloadedPackageResult call() throws IOException {
+                        JvmClassPathCatalog catalog = rescan || classPathCatalog == null
+                                ? session.refreshClassPathCatalog() : classPathCatalog;
+                        return new UnloadedPackageResult(catalog, catalog.packageView(normalized));
+                    }
+                }, new Consumer<UnloadedPackageResult>() {
+                    @Override public void accept(UnloadedPackageResult result) {
+                        classPathCatalog = result.catalog;
+                        browserInitialized = true;
+                        packageName = normalized;
+                        unloadedMemberOwner = "";
+                        searchMode = false;
+                        browserTitle = "unloaded:" + (normalized.isEmpty() ? "<root>" : normalized);
+                        replaceBrowserEntries(TuiBrowserModel.unloadedPackageEntries(
+                                result.view, showRuntime));
+                        status = visibleBrowserEntries.size() + " item(s) in " + browserTitle
+                                + " | " + result.catalog.unloadedSize()
+                                + " discoverable unloaded class(es); U returns to live classes";
+                    }
+                });
+    }
+
+    private void toggleUnloadedBrowser() {
+        if (tasks.userOperationBusy()) { status = busyMessage(); return; }
+        browseUnloaded = !browseUnloaded;
+        unloadedMemberOwner = "";
+        browserFilter = "";
+        if (browseUnloaded) {
+            requestUnloadedPackage(packageName, true);
+        } else {
+            classPathCatalog = null;
+            requestPackage(packageName);
+            status = "Loaded-class browser enabled; U opens the separate unloaded catalog.";
+        }
     }
 
     private void findGlobal() throws IOException {
@@ -412,6 +467,17 @@ public final class TargetTui implements AutoCloseable {
         if ("package".equals(kind)) requestPackage(target);
         else if ("field".equals(kind) || "method".equals(kind)) requestSearch(kind + ":" + target);
         else if ("class".equals(kind)) {
+            if (browseUnloaded) {
+                try {
+                    JvmClassPathCatalog.ClassEntry entry = classPathCatalog == null
+                            ? null : classPathCatalog.find(target);
+                    if (entry == null || classPathCatalog.isLoaded(target)) {
+                        status = "No unloaded class named " + target
+                                + " is present in the discoverable target class path.";
+                    } else requestUnloadedMembers(entry);
+                } catch (RuntimeException failure) { status = "ERROR: " + rootMessage(failure); }
+                return;
+            }
             session.context().select(session.findClass(target));
             tab = Tab.CONTEXT;
             status = "Context <- class " + target + "; loading members...";
@@ -420,6 +486,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void requestSearch(final String query) {
+        if (browseUnloaded) {
+            requestUnloadedSearch(query);
+            return;
+        }
         submit("Searching " + query + "...", new Callable<SearchResult>() {
             @Override public SearchResult call() {
                 String lower = query.toLowerCase(Locale.ROOT);
@@ -484,6 +554,17 @@ public final class TargetTui implements AutoCloseable {
             requestPackage(entry.name());
             return;
         }
+        if (entry.unloaded()) {
+            if (entry.kind() == TuiBrowserEntry.Kind.CLASS) {
+                requestUnloadedMembers(entry.unloadedClass());
+            } else if (entry.kind() == TuiBrowserEntry.Kind.METHOD) {
+                requestUnloadedBytecode(entry, Tab.BYTECODE);
+            } else {
+                status = "Unloaded field selected: U sets a read watch, W sets a write watch; "
+                        + "the watch installs automatically at ClassPrepare.";
+            }
+            return;
+        }
         String owner = entry.ownerName();
         pendingMemberResult = entry.kind() == TuiBrowserEntry.Kind.FIELD
                 || entry.kind() == TuiBrowserEntry.Kind.METHOD ? entry : null;
@@ -491,6 +572,25 @@ public final class TargetTui implements AutoCloseable {
         tab = Tab.CONTEXT;
         status = "Context <- class " + owner + "; loading members...";
         requestContextRefresh();
+    }
+
+    private void requestUnloadedMembers(final JvmClassPathCatalog.ClassEntry owner) {
+        if (owner == null) return;
+        submit("Reading unloaded class metadata " + owner.name() + "...",
+                new Callable<List<TuiBrowserEntry>>() {
+                    @Override public List<TuiBrowserEntry> call() throws IOException {
+                        return TuiBrowserModel.unloadedMemberEntries(owner);
+                    }
+                }, new Consumer<List<TuiBrowserEntry>>() {
+                    @Override public void accept(List<TuiBrowserEntry> entries) {
+                        unloadedMemberOwner = owner.name();
+                        searchMode = false;
+                        browserTitle = "unloaded-class:" + owner.name();
+                        replaceBrowserEntries(entries);
+                        status = entries.size() + " member(s) in unloaded " + owner.name()
+                                + "; Enter/B opens method bytecode, U/W watches fields, F9 breaks entry";
+                    }
+                });
     }
 
     private void requestContextRefresh() {
@@ -862,6 +962,47 @@ public final class TargetTui implements AutoCloseable {
                 });
     }
 
+    private void requestUnloadedSearch(final String query) {
+        submit("Searching unloaded catalog " + query + "...",
+                new Callable<List<TuiBrowserEntry>>() {
+                    @Override public List<TuiBrowserEntry> call() throws IOException {
+                        JvmClassPathCatalog catalog = classPathCatalog == null
+                                ? session.refreshClassPathCatalog() : classPathCatalog;
+                        classPathCatalog = catalog;
+                        String lower = query.toLowerCase(Locale.ROOT);
+                        boolean fields = lower.startsWith("field:");
+                        boolean methods = lower.startsWith("method:");
+                        int prefix = fields ? 6 : methods ? 7
+                                : lower.startsWith("class:") ? 6
+                                : lower.startsWith("package:") ? 8 : 0;
+                        String expression = query.substring(prefix).trim();
+                        if (fields || methods) {
+                            MemberPattern pattern = MemberPattern.parse(expression);
+                            return TuiBrowserModel.unloadedMemberSearchEntries(
+                                    catalog.searchUnloadedMembers(pattern.ownerGlob,
+                                            pattern.nameGlob, fields
+                                                    ? JvmClassPathCatalog.MemberKind.FIELD
+                                                    : JvmClassPathCatalog.MemberKind.METHOD,
+                                            10000), showRuntime);
+                        }
+                        String search = lower.startsWith("package:")
+                                ? glob(expression) + ".*" : glob(expression);
+                        return TuiBrowserModel.unloadedSearchEntries(
+                                catalog.searchUnloaded(search, 10000), showRuntime);
+                    }
+                }, new Consumer<List<TuiBrowserEntry>>() {
+                    @Override public void accept(List<TuiBrowserEntry> entries) {
+                        searchMode = true;
+                        unloadedMemberOwner = "";
+                        browserTitle = "unloaded-find:" + query;
+                        replaceBrowserEntries(entries);
+                        tab = Tab.BROWSE;
+                        status = visibleBrowserEntries.size()
+                                + " unloaded search result(s); [U:*] rows are not loaded";
+                    }
+                });
+    }
+
     private JvmStackFrame viewedDebuggerFrame() {
         if (debuggerFrames.isEmpty()) return null;
         for (JvmStackFrame frame : debuggerFrames) {
@@ -1160,6 +1301,28 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void requestSource(boolean wholeClass) {
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+            if (entry.unloaded() && entry.unloadedClass() != null) {
+                if (wholeClass || entry.kind() == TuiBrowserEntry.Kind.CLASS) {
+                    startDecompileBytes(entry.unloadedClass(), "", "");
+                } else if (entry.kind() == TuiBrowserEntry.Kind.METHOD) {
+                    startDecompileBytes(entry.unloadedClass(), entry.unloadedMember().name(),
+                            entry.unloadedMember().descriptor());
+                } else status = "Select an unloaded class or method to decompile.";
+                return;
+            }
+        }
+        if (tab == Tab.SOURCE && sourceCatalogClass != null) {
+            startDecompileBytes(sourceCatalogClass, wholeClass ? "" : sourceMethod,
+                    wholeClass ? "" : sourceDescriptor);
+            return;
+        }
+        if ((tab == Tab.BYTECODE || tab == Tab.DEBUG) && bytecodeCatalogClass != null) {
+            startDecompileBytes(bytecodeCatalogClass, wholeClass ? "" : bytecodeMethod,
+                    wholeClass ? "" : bytecodeDescriptor);
+            return;
+        }
         final RemoteClass type;
         final String methodName;
         final String descriptor;
@@ -1216,7 +1379,55 @@ public final class TargetTui implements AutoCloseable {
             status = "Class decompile needs a class row; Enter opens this package first.";
             return;
         }
+        if (entry.unloaded() && entry.unloadedClass() != null) {
+            startDecompileBytes(entry.unloadedClass(), "", "");
+            return;
+        }
         startDecompile(session.findClass(entry.ownerName()), "", "");
+    }
+
+    private void startDecompileBytes(final JvmClassPathCatalog.ClassEntry type,
+            final String methodName, final String descriptor) {
+        final DecompilerEngine selectedEngine = engine;
+        final String title = methodName.isEmpty() ? type.name()
+                : type.name() + "." + methodName + descriptor;
+        if (!submit("Decompiling unloaded " + title + " with " + selectedEngine + "...",
+                new Callable<DecompilationResult>() {
+                    @Override public DecompilationResult call() throws IOException {
+                        byte[] bytes = type.bytes();
+                        ClassDecompiler decompiler = new ClassDecompiler();
+                        return methodName.isEmpty()
+                                ? decompiler.decompile(type.name(), bytes, selectedEngine)
+                                : decompiler.decompileMethodResult(
+                                        type.name(), bytes, methodName, descriptor, selectedEngine);
+                    }
+                }, new Consumer<DecompilationResult>() {
+                    @Override public void accept(DecompilationResult result) {
+                        sourceLines.clear();
+                        addLines(sourceLines, result.source());
+                        sourceClass = type.name();
+                        sourceMethod = methodName;
+                        sourceDescriptor = descriptor;
+                        sourceCatalogClass = type;
+                        sourceBciToLine.clear();
+                        if (!methodName.isEmpty()) {
+                            sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
+                        }
+                        status = "Decompiled unloaded " + title + " with " + selectedEngine
+                                + "; no class was defined or initialized";
+                    }
+                })) return;
+        sourceLines.clear();
+        sourceLines.add("Decompiling unloaded " + title + " with " + selectedEngine + "...");
+        sourceTitle = "[UNLOADED] " + title;
+        sourceClass = type.name();
+        sourceMethod = methodName;
+        sourceDescriptor = descriptor;
+        sourceCatalogClass = type;
+        sourceBciToLine.clear();
+        tab = Tab.SOURCE;
+        selections[Tab.SOURCE.ordinal()] = 0;
+        scrolls[Tab.SOURCE.ordinal()] = 0;
     }
 
     private void startDecompile(final RemoteClass type, final String methodName,
@@ -1237,6 +1448,7 @@ public final class TargetTui implements AutoCloseable {
                         sourceClass = type.className();
                         sourceMethod = methodName;
                         sourceDescriptor = descriptor;
+                        sourceCatalogClass = null;
                         sourceBciToLine.clear();
                         if (!methodName.isEmpty()) {
                             sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
@@ -1250,6 +1462,7 @@ public final class TargetTui implements AutoCloseable {
         sourceLines.clear();
         sourceLines.add("Decompiling " + title + " with " + selectedEngine + "...");
         sourceTitle = title;
+        sourceCatalogClass = null;
         tab = Tab.SOURCE;
         selections[Tab.SOURCE.ordinal()] = 0;
         scrolls[Tab.SOURCE.ordinal()] = 0;
@@ -1312,6 +1525,13 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void requestSelectedBytecode(Tab destination) {
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+            if (entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.METHOD) {
+                requestUnloadedBytecode(entry, destination);
+                return;
+            }
+        }
         if (!requireContext()) return;
         RemoteMethod method = selectedMethodForAction();
         if (method == null) {
@@ -1323,18 +1543,70 @@ public final class TargetTui implements AutoCloseable {
         requestBytecode(method.declaringClass(), method.name(), method.descriptor(), destination);
     }
 
-    private void requestBytecode(final String className, final String methodName,
-            final String descriptor, final Tab destination) {
-        if (!submit("Loading bytecode " + className + "." + methodName + "...",
+    private void requestUnloadedBytecode(final TuiBrowserEntry entry, final Tab destination) {
+        final JvmClassPathCatalog.ClassEntry owner = entry.unloadedClass();
+        final JvmClassPathCatalog.Member member = entry.unloadedMember();
+        if (owner == null || member == null
+                || member.kind() != JvmClassPathCatalog.MemberKind.METHOD) return;
+        final String className = owner.name();
+        final String methodName = member.name();
+        final String descriptor = member.descriptor();
+        if (!submit("Reading unloaded bytecode " + className + "." + methodName + "...",
                 new Callable<ClassFileView>() {
-                    @Override public ClassFileView call() {
-                        // Reflection lists inherited members. Class bytes must come from the method's
-                        // declaring class, not from the current context/runtime class.
-                        return session.findClass(className).classFileView();
+                    @Override public ClassFileView call() throws IOException {
+                        return new JvmClassFileParser().parse(owner.bytes());
                     }
                 }, new Consumer<ClassFileView>() {
                     @Override public void accept(ClassFileView view) {
                         bytecode = view.method(methodName, descriptor);
+                        constantPool.clear();
+                        constantPool.addAll(view.constants());
+                        status = bytecode.instructions().isEmpty()
+                                ? member.isNative() || member.isAbstract()
+                                        ? "Unloaded " + (member.isNative() ? "native" : "abstract")
+                                                + " method: use Ctrl+E/Ctrl+X event breakpoints"
+                                        : "No Code attribute in unloaded method"
+                                : "Loaded " + bytecode.instructions().size()
+                                        + " instruction(s) without loading " + className
+                                        + "; F9 creates a pending ClassPrepare breakpoint";
+                    }
+                })) return;
+        bytecode = null;
+        bytecodeClass = className;
+        bytecodeMethod = methodName;
+        bytecodeDescriptor = descriptor;
+        bytecodeCatalogClass = owner;
+        constantPool.clear();
+        debugSearchResults.clear();
+        tab = destination;
+        selections[destination.ordinal()] = 0;
+        scrolls[destination.ordinal()] = 0;
+    }
+
+    private void requestBytecode(final String className, final String methodName,
+            final String descriptor, final Tab destination) {
+        if (!submit("Loading bytecode " + className + "." + methodName + "...",
+                new Callable<BytecodeLoadResult>() {
+                    @Override public BytecodeLoadResult call() throws IOException {
+                        // Reflection lists inherited members. Class bytes must come from the method's
+                        // declaring class, not from the current context/runtime class.
+                        try {
+                            return new BytecodeLoadResult(
+                                    session.findClass(className).classFileView(), null);
+                        } catch (RuntimeException failure) {
+                            if (!classNotLoaded(failure)) throw failure;
+                            JvmClassPathCatalog catalog = session.refreshClassPathCatalog();
+                            JvmClassPathCatalog.ClassEntry entry = catalog.find(className);
+                            if (entry == null) throw failure;
+                            return new BytecodeLoadResult(
+                                    new JvmClassFileParser().parse(entry.bytes()), entry);
+                        }
+                    }
+                }, new Consumer<BytecodeLoadResult>() {
+                    @Override public void accept(BytecodeLoadResult loaded) {
+                        ClassFileView view = loaded.view;
+                        bytecode = view.method(methodName, descriptor);
+                        bytecodeCatalogClass = loaded.catalogEntry;
                         constantPool.addAll(view.constants());
                         alignDebuggerLocation(destination);
                         if (pendingBytecodeLocation >= 0) {
@@ -1343,7 +1615,9 @@ public final class TargetTui implements AutoCloseable {
                         }
                         status = bytecode.instructions().isEmpty()
                                 ? "No Code attribute (native or abstract method): " + className + "." + methodName
-                                : "Loaded " + bytecode.instructions().size() + " bytecode instruction(s) from " + className;
+                                : "Loaded " + bytecode.instructions().size() + " bytecode instruction(s) from " + className
+                                        + (loaded.catalogEntry == null ? ""
+                                                : " without loading it; breakpoint installation remains pending");
                         if (destination == Tab.DEBUG && debuggerState != null && debuggerState.paused()
                                 && className.equals(debuggerState.className())
                                 && methodName.equals(debuggerState.methodName())
@@ -1358,6 +1632,7 @@ public final class TargetTui implements AutoCloseable {
         bytecodeClass = className;
         bytecodeMethod = methodName;
         bytecodeDescriptor = descriptor;
+        bytecodeCatalogClass = null;
         constantPool.clear();
         debugSearchResults.clear();
         tab = destination;
@@ -1996,12 +2271,33 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void toggleMethodEventBreakpoint(final boolean entry) {
-        final RemoteMethod method = selectedMethodForAction();
-        if (method == null) { status = "Select a method first."; return; }
+        final String owner;
+        final String name;
+        final String descriptor;
+        final boolean abstractMethod;
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry selected = visibleBrowserEntries.get(selection());
+            if (!selected.unloaded() || selected.kind() != TuiBrowserEntry.Kind.METHOD
+                    || selected.unloadedMember() == null) {
+                status = "Select an unloaded method first.";
+                return;
+            }
+            owner = selected.ownerName();
+            name = selected.unloadedMember().name();
+            descriptor = selected.unloadedMember().descriptor();
+            abstractMethod = selected.unloadedMember().isAbstract();
+        } else {
+            final RemoteMethod method = selectedMethodForAction();
+            if (method == null) { status = "Select a method first."; return; }
+            owner = method.declaringClass();
+            name = method.name();
+            descriptor = method.descriptor();
+            abstractMethod = method.isAbstract();
+        }
         JvmEventBreakpointSpec candidate = entry
-                ? JvmEventBreakpointSpec.methodEntry(method.declaringClass(), method.name(), method.descriptor())
-                : JvmEventBreakpointSpec.methodExit(method.declaringClass(), method.name(), method.descriptor());
-        if (method.isAbstract()) candidate = candidate.includingSubtypes();
+                ? JvmEventBreakpointSpec.methodEntry(owner, name, descriptor)
+                : JvmEventBreakpointSpec.methodExit(owner, name, descriptor);
+        if (abstractMethod) candidate = candidate.includingSubtypes();
         final JvmEventBreakpointSpec spec = candidate;
         JvmEventBreakpointInfo found = null;
         for (JvmEventBreakpointInfo installed : session.jvmti().managedEventBreakpoints()) {
@@ -2028,7 +2324,7 @@ public final class TargetTui implements AutoCloseable {
                     @Override public void accept(Boolean enabled) {
                         status = (entry ? "Method-entry" : "Method-exit") + " event breakpoint "
                                 + (enabled.booleanValue() ? "set" : "cleared") + " on "
-                                + method.declaringClass() + "." + method.name()
+                                + owner + "." + name
                                 + (spec.includeSubtypes() ? " (implementations included)" : "");
                     }
                 });
@@ -2348,6 +2644,21 @@ public final class TargetTui implements AutoCloseable {
             clearSelectedBreakpoint();
             return;
         }
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+            JvmClassPathCatalog.Member member = entry.unloadedMember();
+            if (entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.METHOD && member != null) {
+                if (receiverOnly) {
+                    status = "An unloaded class has no receiver object; F9 creates an all-instance pending breakpoint.";
+                } else if (member.isNative() || member.isAbstract()) {
+                    toggleMethodEventBreakpoint(true);
+                } else {
+                    toggleBreakpointSpec(new BreakpointSpec(entry.ownerName(), member.name(),
+                            member.descriptor(), 0L, -1), " at unloaded method entry", false);
+                }
+                return;
+            }
+        }
         if (tab == Tab.SOURCE) {
             toggleSourceBreakpoint(receiverOnly);
             return;
@@ -2457,6 +2768,14 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void toggleSelectedFieldWatch(final boolean modification) {
+        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+            TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
+            if (entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.FIELD
+                    && entry.unloadedMember() != null) {
+                toggleUnloadedFieldWatch(entry, modification);
+                return;
+            }
+        }
         if (tab != Tab.FIELDS) {
             status = "U/W set field-read/field-write watchpoints from the Fields view.";
             return;
@@ -2487,6 +2806,36 @@ public final class TargetTui implements AutoCloseable {
                         status = kind + " watchpoint "
                                 + (enabled.booleanValue() ? "set" : "cleared") + " on "
                                 + field.declaringClass() + "." + field.name();
+                    }
+                });
+    }
+
+    private void toggleUnloadedFieldWatch(final TuiBrowserEntry entry,
+            final boolean modification) {
+        final JvmClassPathCatalog.Member member = entry.unloadedMember();
+        final String owner = entry.ownerName();
+        final String kind = modification ? "write" : "read";
+        final JvmFieldWatchInfo existing = findFieldWatch(
+                owner, member.name(), member.descriptor(), modification, 0L);
+        final boolean set = existing == null;
+        submit((set ? "Registering pending " : "Clearing pending ") + kind
+                        + " watch on " + owner + "." + member.name() + "...",
+                new Callable<Boolean>() {
+                    @Override public Boolean call() {
+                        if (set) {
+                            session.jvmti().configureDebugger(true);
+                            session.jvmti().setFieldWatch(owner, member.name(), member.descriptor(),
+                                    modification, null, true);
+                        } else session.jvmti().clearFieldWatch(existing);
+                        return Boolean.valueOf(set);
+                    }
+                }, new Consumer<Boolean>() {
+                    @Override public void accept(Boolean enabled) {
+                        synchronizeManagedControls();
+                        status = (enabled.booleanValue() ? "Pending " : "Cleared ") + kind
+                                + " watch for unloaded " + owner + "." + member.name()
+                                + (enabled.booleanValue()
+                                        ? "; it installs automatically at ClassPrepare" : "");
                     }
                 });
     }
@@ -2593,10 +2942,16 @@ public final class TargetTui implements AutoCloseable {
 
     private JvmFieldWatchInfo findFieldWatch(
             RemoteField field, boolean modification, long receiverId) {
+        return findFieldWatch(field.declaringClass(), field.name(), field.descriptor(),
+                modification, receiverId);
+    }
+
+    private JvmFieldWatchInfo findFieldWatch(String className, String fieldName,
+            String descriptor, boolean modification, long receiverId) {
         for (JvmFieldWatchInfo value : fieldWatches.values()) {
-            if (value.className().equals(field.declaringClass())
-                    && value.fieldName().equals(field.name())
-                    && value.descriptor().equals(field.descriptor())
+            if (value.className().equals(className)
+                    && value.fieldName().equals(fieldName)
+                    && value.descriptor().equals(descriptor)
                     && value.modification() == modification
                     && value.receiverId() == receiverId) return value;
         }
@@ -2812,6 +3167,12 @@ public final class TargetTui implements AutoCloseable {
             return;
         }
         if (tab == Tab.BROWSE) {
+            if (browseUnloaded && !unloadedMemberOwner.isEmpty()) {
+                String ownerPackage = TuiBrowserModel.parentPackage(unloadedMemberOwner);
+                unloadedMemberOwner = "";
+                requestPackage(ownerPackage);
+                return;
+            }
             if (searchMode) requestPackage(packageName);
             else if (!packageName.isEmpty()) requestPackage(TuiBrowserModel.parentPackage(packageName));
             return;
@@ -2845,7 +3206,8 @@ public final class TargetTui implements AutoCloseable {
     private void refresh() {
         if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         if (tab == Tab.BROWSE) {
-            if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
+            if (browseUnloaded) requestUnloadedPackage(packageName, true);
+            else if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
             else requestPackage(packageName);
         } else if (tab == Tab.DEBUG || tab == Tab.FRAMES
                 || tab == Tab.LOCALS || tab == Tab.THREADS) requestDebuggerRefresh();
@@ -2862,6 +3224,11 @@ public final class TargetTui implements AutoCloseable {
 
     private void toggleArrays() {
         if (tasks.userOperationBusy()) { status = busyMessage(); return; }
+        if (browseUnloaded) {
+            status = "Array classes are created by the VM and have no standalone class file; "
+                    + "press U for loaded classes, then a to show arrays.";
+            return;
+        }
         showArrays = !showArrays;
         status = showArrays
                 ? "Array classes enabled; opening package root (arrays have no Java package or <clinit>)"
@@ -3452,6 +3819,13 @@ public final class TargetTui implements AutoCloseable {
                     : entry.kind() == TuiBrowserEntry.Kind.PACKAGE ? "Package: " + entry.name()
                     : entry.kind() == TuiBrowserEntry.Kind.FIELD ? "Field: " + entry.name()
                     : "Method: " + entry.name());
+            if (entry.unloaded()) {
+                result.add("State: UNLOADED (catalog metadata only)");
+                if (entry.unloadedClass() != null) {
+                    result.add("Origin: " + entry.unloadedClass().origin());
+                }
+                result.add("ClassPrepare installs registered breakpoints/watchpoints automatically.");
+            }
             if (entry.kind() == TuiBrowserEntry.Kind.CLASS && entry.name().startsWith("[")) {
                 result.add("Kind: array class");
                 result.add("Initialization: arrays have no <init>/<clinit> and no classfile Code attribute");
@@ -3478,10 +3852,22 @@ public final class TargetTui implements AutoCloseable {
                 result.add("Descriptor:     " + method.descriptor());
                 result.add("Implementation: " + method.implementationKind());
                 result.add("Modifiers:      " + Modifier.toString(method.modifiers()));
+            } else if (entry.unloadedMember() != null) {
+                JvmClassPathCatalog.Member member = entry.unloadedMember();
+                result.add("Owner:          " + entry.ownerName());
+                result.add("Descriptor:     " + member.descriptor());
+                result.add("Type:           " + member.typeSummary());
+                result.add("Implementation: " + (member.isNative() ? "NATIVE"
+                        : member.isAbstract() ? "ABSTRACT" : "BYTECODE"));
+                result.add("Modifiers:      " + Modifier.toString(member.access()));
             }
             result.add("");
             result.add("SHORTCUTS");
-            addKeyHelp(result, "Enter", entry.kind() == TuiBrowserEntry.Kind.CLASS
+            addKeyHelp(result, "Enter", entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.CLASS
+                    ? "Browse this unloaded class' fields and methods"
+                    : entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.METHOD
+                            ? "Open bytecode without loading the class"
+                    : entry.kind() == TuiBrowserEntry.Kind.CLASS
                     ? "Select this CLASS metadata context"
                     : entry.kind() == TuiBrowserEntry.Kind.PACKAGE
                             || entry.kind() == TuiBrowserEntry.Kind.PARENT
@@ -3489,9 +3875,21 @@ public final class TargetTui implements AutoCloseable {
                             : "Open declaring class and select member");
             addKeyHelp(result, "Backspace", "Open parent package/context");
             addKeyHelp(result, "f", "Find only in this displayed list");
-            addKeyHelp(result, "F", "Search all loaded classes/members/packages");
+            addKeyHelp(result, "F", browseUnloaded
+                    ? "Search unloaded class-path classes/members"
+                    : "Search all loaded classes/members/packages");
             addKeyHelp(result, ":", "Open an exact class/package/member target");
             addKeyHelp(result, "L", "Class.forName and initialize a target class");
+            addKeyHelp(result, "U", browseUnloaded
+                    ? "Return to loaded classes"
+                    : "Open separate unloaded class-path catalog");
+            if (entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.METHOD) {
+                addKeyHelp(result, "F9", "Register pending BCI 0 breakpoint");
+                addKeyHelp(result, "Ctrl+E/X", "Register method entry/exit event breakpoint");
+                addKeyHelp(result, "B / S", "Open bytecode / decompile without loading");
+            } else if (entry.unloaded() && entry.kind() == TuiBrowserEntry.Kind.FIELD) {
+                addKeyHelp(result, "u / W", "Register pending field read / write watch");
+            }
             addKeyHelp(result, "/", "Filter the current list");
             addKeyHelp(result, "J", "Show/hide JDK runtime entries");
             addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
@@ -4026,8 +4424,9 @@ public final class TargetTui implements AutoCloseable {
         Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "L Class.forName",
                 "M Locals", "Z Breakpoints");
         if (tab == Tab.BROWSE) Collections.addAll(result,
-                "/ Filter", "f Find List", "F Global Find", ": Exact", "P Package", "J JDK", "a Arrays",
-                "A Class Decompile", "Backspace Parent");
+                "/ Filter", "f Find List", "F Global Find", ": Exact", "P Package", "J JDK",
+                browseUnloaded ? "U Loaded Classes" : "U Unloaded Classes", "a Arrays",
+                "A Class Decompile", "B Method Bytecode", "F9 Pending Break", "Backspace Parent");
         else if (tab == Tab.FIELDS) Collections.addAll(result,
                 "/ Filter", "f Find List", "F Global Find", "@ Static", "# Instance", "Enter Read", "= Set",
                 "U Break Read", "W Break Write",
@@ -4177,6 +4576,38 @@ public final class TargetTui implements AutoCloseable {
         Throwable current = failure;
         while (current.getCause() != null) current = current.getCause();
         return current.getMessage() == null ? current.toString() : current.getMessage();
+    }
+
+    private static boolean classNotLoaded(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message != null && (message.contains("Class is not loaded")
+                    || message.contains("Class not loaded")
+                    || message.contains("not a loaded class"))) return true;
+        }
+        return false;
+    }
+
+    private static final class BytecodeLoadResult {
+        private final ClassFileView view;
+        private final JvmClassPathCatalog.ClassEntry catalogEntry;
+
+        private BytecodeLoadResult(ClassFileView view,
+                JvmClassPathCatalog.ClassEntry catalogEntry) {
+            this.view = view;
+            this.catalogEntry = catalogEntry;
+        }
+    }
+
+    private static final class UnloadedPackageResult {
+        private final JvmClassPathCatalog catalog;
+        private final JvmClassPathCatalog.PackageView view;
+
+        private UnloadedPackageResult(JvmClassPathCatalog catalog,
+                JvmClassPathCatalog.PackageView view) {
+            this.catalog = catalog;
+            this.view = view;
+        }
     }
 
     private static final class SearchResult {

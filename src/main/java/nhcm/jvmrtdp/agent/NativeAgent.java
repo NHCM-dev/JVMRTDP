@@ -111,6 +111,24 @@ public class NativeAgent {
                 callerDescriptor == null ? "" : callerDescriptor);
     }
 
+    public static void setBreakpoint(String className, String methodName, String descriptor,
+            long location, boolean enabled, String registrationId, String callerClass,
+            String callerMethod, String callerDescriptor) {
+        requireAvailable();
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("className must not be empty");
+        }
+        if (methodName == null || methodName.isEmpty()) throw new IllegalArgumentException("methodName must not be empty");
+        if (descriptor == null || descriptor.isEmpty()) throw new IllegalArgumentException("descriptor must not be empty");
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setBreakpointByName(className, methodName, descriptor, location,
+                enabled, registrationId, callerClass == null ? "" : callerClass,
+                callerMethod == null ? "" : callerMethod,
+                callerDescriptor == null ? "" : callerDescriptor);
+    }
+
     public static void configureDebugger(boolean enabled) {
         requireAvailable();
         NativeJvmtiBridge.debuggerConfigure(enabled);
@@ -219,6 +237,21 @@ public class NativeAgent {
         }
         NativeJvmtiBridge.setFieldWatch(type, fieldName, descriptor, modification, enabled,
                 registrationId, receiver);
+    }
+
+    public static void setFieldWatch(String className, String fieldName, String descriptor,
+            boolean modification, boolean enabled, String registrationId) {
+        requireAvailable();
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("className must not be empty");
+        }
+        if (fieldName == null || fieldName.isEmpty()) throw new IllegalArgumentException("fieldName must not be empty");
+        if (descriptor == null || descriptor.isEmpty()) throw new IllegalArgumentException("descriptor must not be empty");
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setFieldWatchByName(className, fieldName, descriptor,
+                modification, enabled, registrationId);
     }
 
     public static void notifyFramePop(Thread thread, int depth) {

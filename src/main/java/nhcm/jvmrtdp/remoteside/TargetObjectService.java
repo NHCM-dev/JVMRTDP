@@ -50,6 +50,24 @@ public class TargetObjectService implements AutoCloseable {
         return NativeAgent.findLoadedClass(className);
     }
 
+    /** Complete JVMTI loaded-class name snapshot without the search command's display limit. */
+    public List<String> loadedClassNames() {
+        List<String> result = new ArrayList<String>();
+        for (String name : NativeAgent.listLoadedClassNames()) {
+            if (name != null) result.add(name);
+        }
+        return result;
+    }
+
+    /** Reads a regular Java system property in the target VM's application runtime. */
+    public String systemProperty(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("System property name must not be empty");
+        }
+        String value = System.getProperty(name);
+        return value == null ? "" : value;
+    }
+
     /** Loads and initializes a class in the target JVM, explicitly invoking Class.forName. */
     public Class<?> forceLoadClass(String className) {
         return resolveClassForName(className, true);

@@ -230,9 +230,15 @@ find <class|interface|enum|annotation|array> [name-glob] [--package glob] [--ext
 find <extends|implements> <type-glob> [name-glob] [--limit n]
 find field [name-glob] [--class glob] [--type glob] [--static|--virtual] [--limit n]
 find method [name-glob] [--class glob] [--returns glob] [--params glob] [--static|--virtual] [--limit n]
+find unloaded [class|field|method] [glob] [--class owner-glob] [--limit n]
 ```
 
 `class load` performs an operation equivalent to `Class.forName` in the target JVM and may initialize the class.
+
+`find unloaded` scans the target's class path and available `rt.jar`/`jmods` from the controller without
+loading classes. Its results are marked `unloaded` and remain separate from loaded search
+results. Explicit `decompile` and read-only `bytecode` commands automatically use catalog
+bytes when the requested class is still unloaded.
 
 Export and dump commands:
 
@@ -315,6 +321,10 @@ debugger breakpoints clear-all
 
 Explicit class breakpoints apply to every receiver. `break-context` uses the current object as an identity condition for instance methods; from a class context (and for static methods) it applies globally. Caller patterns accept `*` and `?`. The same typed condition is available to library clients as `JvmBreakpointCondition`.
 
+The class named by `debugger break` does not need to be loaded. The registration is kept
+symbolically and installed at `ClassPrepare`; clearing it before class preparation removes
+the pending registration. BCI and descriptor must match the discoverable class file.
+
 Event breakpoints work even when a method has no Java `Code` attribute:
 
 ```text
@@ -341,6 +351,9 @@ debugger watches clear-all
 ```
 
 Watchpoints stop on field reads or writes. Invocation sites can be observed by breaking at the target method entry or at a BCI containing an invocation instruction.
+
+Field watches also accept unloaded owner names and install at `ClassPrepare`. Unloaded
+breakpoints/watches are global to the field or method because no receiver object exists yet.
 
 ### 9.4 Threads, Frames, and Locals
 

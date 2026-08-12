@@ -176,10 +176,17 @@ public class JvmtiCommand implements RemoteCommand {
                             + arguments.get(4) + '|' + arguments.get(5);
             Object receiver = arguments.size() == 11 && !"0".equals(arguments.get(7))
                     ? handle.targetObjects().resolveExternal(Long.parseLong(arguments.get(7))) : null;
-            NativeAgent.setBreakpoint(NativeAgent.findLoadedClass(arguments.get(2)), arguments.get(3),
-                    arguments.get(4), Long.parseLong(arguments.get(5)), enabled, registrationId,
-                    receiver, optionalPattern(arguments, 8), optionalPattern(arguments, 9),
-                    optionalPattern(arguments, 10));
+            if (receiver == null) {
+                NativeAgent.setBreakpoint(arguments.get(2), arguments.get(3), arguments.get(4),
+                        Long.parseLong(arguments.get(5)), enabled, registrationId,
+                        optionalPattern(arguments, 8), optionalPattern(arguments, 9),
+                        optionalPattern(arguments, 10));
+            } else {
+                NativeAgent.setBreakpoint(NativeAgent.findLoadedClass(arguments.get(2)), arguments.get(3),
+                        arguments.get(4), Long.parseLong(arguments.get(5)), enabled, registrationId,
+                        receiver, optionalPattern(arguments, 8), optionalPattern(arguments, 9),
+                        optionalPattern(arguments, 10));
+            }
             return success("ok");
         }
         if ("debug.enable".equals(operation) && arguments.size() == 1) {
@@ -198,8 +205,15 @@ public class JvmtiCommand implements RemoteCommand {
             else if ("exception".equalsIgnoreCase(arguments.get(2))) kind = 2;
             else throw new IllegalArgumentException("Event breakpoint kind must be entry, exit, or exception");
             boolean includeSubtypes = Boolean.parseBoolean(arguments.get(6));
-            Class<?> declaredType = enabled && includeSubtypes && kind != 2
-                    ? NativeAgent.findLoadedClass(arguments.get(3)) : null;
+            Class<?> declaredType = null;
+            if (enabled && includeSubtypes && kind != 2) {
+                try {
+                    declaredType = NativeAgent.findLoadedClass(arguments.get(3));
+                } catch (IllegalArgumentException unloaded) {
+                    // ClassPrepare binds the exact declared type later. Until then the
+                    // class-name match already catches the declared method itself.
+                }
+            }
             NativeAgent.setDebugEventBreakpoint(kind, declaredType, arguments.get(3),
                     optionalPattern(arguments, 4), optionalPattern(arguments, 5),
                     includeSubtypes, arguments.get(7), enabled);
@@ -284,8 +298,13 @@ public class JvmtiCommand implements RemoteCommand {
                             + arguments.get(5) + '|' + arguments.get(1);
             Object receiver = arguments.size() == 8 && !"0".equals(arguments.get(7))
                     ? handle.targetObjects().resolveExternal(Long.parseLong(arguments.get(7))) : null;
-            NativeAgent.setFieldWatch(NativeAgent.findLoadedClass(arguments.get(3)), arguments.get(4),
-                    arguments.get(5), modification, enabled, registrationId, receiver);
+            if (receiver == null) {
+                NativeAgent.setFieldWatch(arguments.get(3), arguments.get(4), arguments.get(5),
+                        modification, enabled, registrationId);
+            } else {
+                NativeAgent.setFieldWatch(NativeAgent.findLoadedClass(arguments.get(3)), arguments.get(4),
+                        arguments.get(5), modification, enabled, registrationId, receiver);
+            }
             return success("ok");
         }
         if ("threads".equals(operation) && arguments.size() == 1) {

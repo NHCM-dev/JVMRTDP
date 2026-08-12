@@ -8,6 +8,9 @@ import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
 import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
 import nhcm.jvmrtdp.controllerside.analysis.DecompilationResult;
 import nhcm.jvmrtdp.controllerside.analysis.DecompilerEngine;
+import nhcm.jvmrtdp.controllerside.analysis.ClassDecompiler;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassFileParser;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.controllerside.tui.TargetSessionCoordinator;
 import nhcm.jvmrtdp.controllerside.tui.TuiResult;
 import nhcm.jvmrtdp.controllerside.script.ScriptEngine;
@@ -715,14 +718,18 @@ public class InteractiveCli {
                             + "find <extends|implements> <type-glob> [name-glob] [--limit n] | "
                             + "find field [name-glob] [--class glob] [--type glob] [--static|--virtual] [--limit n] | "
                             + "find method [name-glob] [--class glob] [--returns glob] [--params glob] "
-                            + "[--static|--virtual] [--limit n]",
-                    "Searches loaded packages, types and declared members with '*' and '?' wildcards.", "search");
+                            + "[--static|--virtual] [--limit n] | "
+                            + "find unloaded [class|field|method] [glob] [--class owner-glob] [--limit n]",
+                    "Searches loaded runtime metadata or a separate unloaded class-path catalog.", "search");
         }
 
         @Override
-        public boolean execute(TargetSession session, List<String> arguments) {
+        public boolean execute(TargetSession session, List<String> arguments) throws IOException {
             if (arguments.isEmpty()) return InteractiveCli.usage(session, this);
             String subject = lower(arguments.get(0));
+            if ("unloaded".equals(subject)) {
+                return unloaded(session, arguments.subList(1, arguments.size()));
+            }
             if ("package".equals(subject)) return packages(session, arguments.subList(1, arguments.size()));
             if ("field".equals(subject) || "method".equals(subject)) {
                 return members(session, subject, arguments.subList(1, arguments.size()));
@@ -732,6 +739,59 @@ public class InteractiveCli {
                 return classes(session, subject, arguments.subList(1, arguments.size()));
             }
             return InteractiveCli.usage(session, this);
+        }
+
+        private static boolean unloaded(TargetSession session, List<String> arguments)
+                throws IOException {
+            String kind = "class";
+            int index = 0;
+            if (index < arguments.size() && Arrays.asList("class", "field", "method")
+                    .contains(lower(arguments.get(index)))) kind = lower(arguments.get(index++));
+            String expression = "*";
+            if (index < arguments.size() && !arguments.get(index).startsWith("--")) {
+                expression = arguments.get(index++);
+            }
+            String owner = "*";
+            int limit = 200;
+            while (index < arguments.size()) {
+                String option = lower(arguments.get(index++));
+                if ("--class".equals(option) && index < arguments.size()) owner = arguments.get(index++);
+                else if ("--limit".equals(option) && index < arguments.size()) {
+                    limit = integer(arguments.get(index++), "limit");
+                } else throw new IllegalArgumentException("Unknown/incomplete unloaded search option: " + option);
+            }
+            if (limit < 1 || limit > 10000) {
+                throw new IllegalArgumentException("limit must be between 1 and 10000");
+            }
+            JvmClassPathCatalog catalog = session.refreshClassPathCatalog();
+            int count;
+            if ("class".equals(kind)) {
+                List<JvmClassPathCatalog.ClassEntry> results = catalog.searchUnloaded(expression, limit);
+                for (JvmClassPathCatalog.ClassEntry entry : results) {
+                    session.output().printf("[unloaded class] %s  origin=%s%n",
+                            entry.name(), entry.origin());
+                }
+                count = results.size();
+            } else {
+                JvmClassPathCatalog.MemberKind memberKind = "field".equals(kind)
+                        ? JvmClassPathCatalog.MemberKind.FIELD
+                        : JvmClassPathCatalog.MemberKind.METHOD;
+                List<JvmClassPathCatalog.MemberMatch> results = catalog.searchUnloadedMembers(
+                        owner, expression, memberKind, limit);
+                for (JvmClassPathCatalog.MemberMatch match : results) {
+                    JvmClassPathCatalog.Member member = match.member();
+                    session.output().printf("[unloaded %-6s] %s.%s%s  [%s]%n", kind,
+                            match.owner().name(), member.name(),
+                            memberKind == JvmClassPathCatalog.MemberKind.METHOD
+                                    ? member.descriptor() : " : " + member.descriptor(),
+                            Modifier.toString(member.access()));
+                }
+                count = results.size();
+            }
+            printSearchCount(session, count, limit);
+            session.output().printf("-- catalog: %,d class file(s), %,d currently unloaded%n",
+                    catalog.size(), catalog.unloadedSize());
+            return true;
         }
 
         private static boolean packages(TargetSession session, List<String> arguments) {
@@ -1495,26 +1555,45 @@ public class InteractiveCli {
             ParsedAnalysisOptions options = ParsedAnalysisOptions.parse(arguments.subList(1, arguments.size()));
             String text;
             if ("class".equals(mode)) {
-                RemoteClass type = options.positionals.isEmpty()
-                        ? session.context().remoteClass() : session.findClass(options.positionals.get(0));
                 if (options.positionals.size() > 1) return InteractiveCli.usage(session, this);
-                DecompilationResult result = type.decompile(options.engine);
+                DecompilationResult result;
+                if (!options.positionals.isEmpty()) {
+                    String className = options.positionals.get(0);
+                    try {
+                        result = session.findClass(className).decompile(options.engine);
+                    } catch (RuntimeException failure) {
+                        JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
+                                session, className, failure);
+                        result = new ClassDecompiler().decompile(
+                                unloaded.name(), unloaded.bytes(), options.engine);
+                        session.error().println("decompiler: using unloaded class-path bytes; target class remains unloaded");
+                    }
+                } else result = session.context().remoteClass().decompile(options.engine);
                 text = result.source();
                 for (String diagnostic : result.diagnostics()) session.error().println("decompiler: " + diagnostic);
             } else if ("method".equals(mode)) {
-                RemoteClass type;
                 String name;
                 String descriptor;
                 if (options.positionals.size() == 2) {
-                    type = session.context().remoteClass();
                     name = options.positionals.get(0);
                     descriptor = options.positionals.get(1);
+                    text = session.context().remoteClass().decompileMethod(
+                            name, descriptor, options.engine);
                 } else if (options.positionals.size() == 3) {
-                    type = session.findClass(options.positionals.get(0));
+                    String className = options.positionals.get(0);
                     name = options.positionals.get(1);
                     descriptor = options.positionals.get(2);
+                    try {
+                        text = session.findClass(className).decompileMethod(
+                                name, descriptor, options.engine);
+                    } catch (RuntimeException failure) {
+                        JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
+                                session, className, failure);
+                        text = new ClassDecompiler().decompileMethod(
+                                unloaded.name(), unloaded.bytes(), name, descriptor, options.engine);
+                        session.error().println("decompiler: using unloaded class-path bytes; target class remains unloaded");
+                    }
                 } else return InteractiveCli.usage(session, this);
-                text = type.decompileMethod(name, descriptor, options.engine);
             } else return InteractiveCli.usage(session, this);
             outputAnalysis(session, text, options.output);
             return true;
@@ -1597,21 +1676,31 @@ public class InteractiveCli {
                 }
             }
             ParsedAnalysisOptions options = ParsedAnalysisOptions.parse(arguments);
-            RemoteClass type;
             String name;
             String descriptor;
+            String ownerName;
+            ClassFileMethod method;
             if (options.positionals.size() == 2) {
-                type = session.context().remoteClass();
+                RemoteClass type = session.context().remoteClass();
+                ownerName = type.className();
                 name = options.positionals.get(0);
                 descriptor = options.positionals.get(1);
+                method = type.bytecode(name, descriptor);
             } else if (options.positionals.size() == 3) {
-                type = session.findClass(options.positionals.get(0));
+                ownerName = options.positionals.get(0);
                 name = options.positionals.get(1);
                 descriptor = options.positionals.get(2);
+                try {
+                    method = session.findClass(ownerName).bytecode(name, descriptor);
+                } catch (RuntimeException failure) {
+                    JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
+                            session, ownerName, failure);
+                    method = new JvmClassFileParser().parse(unloaded.bytes()).method(name, descriptor);
+                    session.error().println("bytecode: using unloaded class-path bytes; target class remains unloaded");
+                }
             } else return InteractiveCli.usage(session, this);
-            ClassFileMethod method = type.bytecode(name, descriptor);
             String text = String.format("%s.%s%s  maxStack=%d maxLocals=%d%n%s",
-                    type.className(), method.name(), method.descriptor(),
+                    ownerName, method.name(), method.descriptor(),
                     method.maxStack(), method.maxLocals(), method.disassembly());
             outputAnalysis(session, text, options.output);
             return true;
@@ -2418,6 +2507,24 @@ public class InteractiveCli {
         session.output().printf("Wrote %,d character(s) to %s%n", text.length(), absolute);
     }
 
+    private static JvmClassPathCatalog.ClassEntry unloadedCatalogEntry(
+            TargetSession session, String className, RuntimeException original) throws IOException {
+        boolean notLoaded = false;
+        for (Throwable current = original; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message != null && (message.contains("Class is not loaded")
+                    || message.contains("Class not loaded")
+                    || message.contains("not a loaded class"))) {
+                notLoaded = true;
+                break;
+            }
+        }
+        if (!notLoaded) throw original;
+        JvmClassPathCatalog.ClassEntry entry = session.refreshClassPathCatalog().find(className);
+        if (entry == null) throw original;
+        return entry;
+    }
+
     private static class ForwardCommand extends ShellCommand<TargetSession> {
         private final boolean acceptsArguments;
 
@@ -2508,6 +2615,7 @@ public class InteractiveCli {
                 session.output().println("  find interface *Listener | find extends java.util.Abstract* *Map*");
                 session.output().println("  find field *cache* --class com.example.* --type java.util.Map --static");
                 session.output().println("  find method get* --class com.example.* --returns byte[] --params \"java.lang.String,*\"");
+                session.output().println("  find unloaded class com.example.* | find unloaded method run --class com.example.*");
                 session.output().println("  class fields virtual *name* | context list methods get*");
                 session.output().println("Packages and class files:");
                 session.output().println("  package                 # root packages plus classes in the default package");
