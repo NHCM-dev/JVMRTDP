@@ -60,4 +60,10 @@ final class TuiFooter {
         }
         return Collections.unmodifiableList(result);
     }
+
+    /** Returns every wrapped shortcut row. The normal TUI footer uses this so discoverability
+     * is never replaced by an ambiguous trailing ellipsis on terminals with usable height. */
+    static List<String> allRows(List<String> tokens, int width) {
+        return paginate(tokens, width);
+    }
 }

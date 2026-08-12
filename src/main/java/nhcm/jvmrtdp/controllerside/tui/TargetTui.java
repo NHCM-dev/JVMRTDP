@@ -101,6 +101,12 @@ public final class TargetTui implements AutoCloseable {
     private boolean browseUnloaded;
     private String unloadedMemberOwner = "";
     private JvmClassPathCatalog classPathCatalog;
+    /** Offline class-file context. It mirrors a live CLASS context without loading the class. */
+    private JvmClassPathCatalog.ClassEntry unloadedContextClass;
+    private final List<JvmClassPathCatalog.Member> unloadedFields =
+            new ArrayList<JvmClassPathCatalog.Member>();
+    private final List<JvmClassPathCatalog.Member> unloadedMethods =
+            new ArrayList<JvmClassPathCatalog.Member>();
     private boolean showSpecialMethods;
     /** Unoverridden java.lang.Object methods are noise in most application classes. */
     private boolean hideInheritedObjectMethods = true;
@@ -421,6 +427,7 @@ public final class TargetTui implements AutoCloseable {
         if (browseUnloaded) {
             requestUnloadedPackage(packageName, true);
         } else {
+            clearUnloadedContext();
             classPathCatalog = null;
             requestPackage(packageName);
             status = "Loaded-class browser enabled; U opens the separate unloaded catalog.";
@@ -474,7 +481,7 @@ public final class TargetTui implements AutoCloseable {
                     if (entry == null || classPathCatalog.isLoaded(target)) {
                         status = "No unloaded class named " + target
                                 + " is present in the discoverable target class path.";
-                    } else requestUnloadedMembers(entry);
+                    } else requestUnloadedContext(entry);
                 } catch (RuntimeException failure) { status = "ERROR: " + rootMessage(failure); }
                 return;
             }
@@ -556,41 +563,89 @@ public final class TargetTui implements AutoCloseable {
         }
         if (entry.unloaded()) {
             if (entry.kind() == TuiBrowserEntry.Kind.CLASS) {
-                requestUnloadedMembers(entry.unloadedClass());
-            } else if (entry.kind() == TuiBrowserEntry.Kind.METHOD) {
-                requestUnloadedBytecode(entry, Tab.BYTECODE);
+                pendingMemberResult = null;
+                requestUnloadedContext(entry.unloadedClass());
             } else {
-                status = "Unloaded field selected: U sets a read watch, W sets a write watch; "
-                        + "the watch installs automatically at ClassPrepare.";
+                pendingMemberResult = entry;
+                requestUnloadedContext(entry.unloadedClass());
             }
             return;
         }
         String owner = entry.ownerName();
         pendingMemberResult = entry.kind() == TuiBrowserEntry.Kind.FIELD
                 || entry.kind() == TuiBrowserEntry.Kind.METHOD ? entry : null;
+        clearUnloadedContext();
         session.context().select(session.findClass(owner));
         tab = Tab.CONTEXT;
         status = "Context <- class " + owner + "; loading members...";
         requestContextRefresh();
     }
 
-    private void requestUnloadedMembers(final JvmClassPathCatalog.ClassEntry owner) {
+    private void requestUnloadedContext(final JvmClassPathCatalog.ClassEntry owner) {
         if (owner == null) return;
-        submit("Reading unloaded class metadata " + owner.name() + "...",
-                new Callable<List<TuiBrowserEntry>>() {
-                    @Override public List<TuiBrowserEntry> call() throws IOException {
-                        return TuiBrowserModel.unloadedMemberEntries(owner);
+        submit("Opening unloaded class context " + owner.name() + "...",
+                new Callable<JvmClassPathCatalog.ClassMetadata>() {
+                    @Override public JvmClassPathCatalog.ClassMetadata call() throws IOException {
+                        return owner.metadata();
                     }
-                }, new Consumer<List<TuiBrowserEntry>>() {
-                    @Override public void accept(List<TuiBrowserEntry> entries) {
-                        unloadedMemberOwner = owner.name();
-                        searchMode = false;
-                        browserTitle = "unloaded-class:" + owner.name();
-                        replaceBrowserEntries(entries);
-                        status = entries.size() + " member(s) in unloaded " + owner.name()
-                                + "; Enter/B opens method bytecode, U/W watches fields, F9 breaks entry";
+                }, new Consumer<JvmClassPathCatalog.ClassMetadata>() {
+                    @Override public void accept(JvmClassPathCatalog.ClassMetadata metadata) {
+                        unloadedContextClass = owner;
+                        unloadedFields.clear();
+                        unloadedFields.addAll(metadata.fields());
+                        unloadedMethods.clear();
+                        unloadedMethods.addAll(metadata.methods());
+                        memberFilter = "";
+                        listSearch = "";
+                        selections[Tab.CONTEXT.ordinal()] = 0;
+                        selections[Tab.FIELDS.ordinal()] = 0;
+                        selections[Tab.METHODS.ordinal()] = 0;
+                        contextLines.clear();
+                        contextLines.add("Offline context: " + owner.name());
+                        contextLines.add("mode          UNLOADED CLASS (class-file metadata)");
+                        contextLines.add("origin        " + owner.origin());
+                        contextLines.add("super         " + (metadata.superName().isEmpty()
+                                ? "<none>" : metadata.superName()));
+                        contextLines.add("interfaces    " + metadata.interfaces());
+                        contextLines.add("fields        " + metadata.fields().size());
+                        contextLines.add("methods       " + metadata.methods().size());
+                        contextLines.add("");
+                        contextLines.add("Fields, Methods, Decompile and Bytecode work without loading this class.");
+                        contextLines.add("Pending breakpoints/watchpoints install automatically at ClassPrepare.");
+                        if (pendingMemberResult != null
+                                && pendingMemberResult.unloaded()
+                                && owner.name().equals(pendingMemberResult.ownerName())
+                                && pendingMemberResult.unloadedMember() != null) {
+                            JvmClassPathCatalog.Member wanted = pendingMemberResult.unloadedMember();
+                            if (wanted.kind() == JvmClassPathCatalog.MemberKind.FIELD) {
+                                selections[Tab.FIELDS.ordinal()] = indexOfUnloadedMember(
+                                        visibleUnloadedFields(), wanted);
+                                tab = Tab.FIELDS;
+                            } else {
+                                selections[Tab.METHODS.ordinal()] = indexOfUnloadedMember(
+                                        visibleUnloadedMethods(), wanted);
+                                tab = Tab.METHODS;
+                            }
+                            pendingMemberResult = null;
+                            status = "UNLOADED CLASS context: " + owner.name()
+                                    + " | selected catalog member in " + displayTabName(tab);
+                        } else {
+                            tab = Tab.CONTEXT;
+                            status = "UNLOADED CLASS context: " + owner.name()
+                                    + " | Tab/Shift+Tab opens Fields and Methods | Backspace returns to its package";
+                        }
                     }
                 });
+    }
+
+    private static int indexOfUnloadedMember(List<JvmClassPathCatalog.Member> values,
+            JvmClassPathCatalog.Member wanted) {
+        for (int index = 0; index < values.size(); index++) {
+            JvmClassPathCatalog.Member value = values.get(index);
+            if (value.kind() == wanted.kind() && value.name().equals(wanted.name())
+                    && value.descriptor().equals(wanted.descriptor())) return index;
+        }
+        return 0;
     }
 
     private void requestContextRefresh() {
@@ -650,6 +705,7 @@ public final class TargetTui implements AutoCloseable {
                             return;
                         }
                         synchronizedContextRevision = requestedRevision;
+                        clearUnloadedContext();
                         contextClass = value.type;
                         classContext = value.classContext;
                         fields.clear();
@@ -867,6 +923,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void selectContextStackItem() {
+        if (unloadedContextClass != null) {
+            status = "This offline class context is already selected; Tab opens Fields, then Methods.";
+            return;
+        }
         if (!session.context().isSet()) return;
         int index = clamp(selection(), 0, Math.max(0, session.context().depth() - 1));
         if (index == 0) return;
@@ -876,6 +936,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void duplicateSelectedContext() {
+        if (unloadedContextClass != null) {
+            status = "Offline class context is a single class-file view and has no object handle to duplicate.";
+            return;
+        }
         if (!session.context().isSet()) return;
         int index = clamp(selections[Tab.CONTEXT.ordinal()], 0, session.context().depth() - 1);
         session.context().pick(index);
@@ -885,6 +949,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void removeSelectedContext() {
+        if (unloadedContextClass != null) {
+            navigateBack();
+            return;
+        }
         if (!session.context().isSet()) return;
         int index = clamp(selections[Tab.CONTEXT.ordinal()], 0, session.context().depth() - 1);
         session.context().remove(index);
@@ -898,6 +966,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void swapContextTop() {
+        if (unloadedContextClass != null) {
+            status = "Offline class context has one item; Backspace returns to its package.";
+            return;
+        }
         if (!session.context().isSet() || session.context().depth() < 2) {
             status = "Context stack has no second item to swap";
             return;
@@ -1134,6 +1206,13 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void readSelectedField() {
+        if (unloadedContextClass != null) {
+            JvmClassPathCatalog.Member field = selectedUnloadedField();
+            if (field != null) status = "UNLOADED field metadata: " + unloadedContextClass.name()
+                    + "." + field.name() + " " + field.descriptor()
+                    + "; U/W registers pending read/write watches; L loads the class when desired.";
+            return;
+        }
         final List<RemoteField> visible = visibleFields();
         if (visible.isEmpty()) return;
         final RemoteField field = visible.get(selection());
@@ -1167,6 +1246,11 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void setSelectedField() throws IOException {
+        if (unloadedContextClass != null) {
+            status = "An unloaded class has no runtime field storage. Use U/W for pending watches, "
+                    + "or L (Class.forName) before reading/writing values.";
+            return;
+        }
         final List<RemoteField> visible = visibleFields();
         if (visible.isEmpty()) { status = "No field is selected."; return; }
         final RemoteField field = visible.get(selection());
@@ -1196,6 +1280,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void setCurrentContext() throws IOException {
+        if (unloadedContextClass != null) {
+            status = "Offline class context is metadata-only; L loads it before runtime value writes.";
+            return;
+        }
         if (!session.context().isSet() || !session.context().canAssign()) {
             status = "Current context is a read-only snapshot; select a field, array element, or paused local first.";
             return;
@@ -1257,6 +1345,11 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void invokeSelectedMethod(final boolean exactDispatch) throws IOException {
+        if (unloadedContextClass != null) {
+            status = "The selected class is still unloaded. Use B/S/F9 for offline debugging, "
+                    + "or L to load it before invoking a method.";
+            return;
+        }
         final List<RemoteMethod> visible = visibleMethods();
         if (visible.isEmpty()) { status = "No method is selected."; return; }
         final RemoteMethod method = visible.get(selection());
@@ -1321,6 +1414,14 @@ public final class TargetTui implements AutoCloseable {
         if ((tab == Tab.BYTECODE || tab == Tab.DEBUG) && bytecodeCatalogClass != null) {
             startDecompileBytes(bytecodeCatalogClass, wholeClass ? "" : bytecodeMethod,
                     wholeClass ? "" : bytecodeDescriptor);
+            return;
+        }
+        if (unloadedContextClass != null
+                && (tab == Tab.CONTEXT || tab == Tab.FIELDS || tab == Tab.METHODS)) {
+            JvmClassPathCatalog.Member member = tab == Tab.METHODS ? selectedUnloadedMethod() : null;
+            startDecompileBytes(unloadedContextClass,
+                    wholeClass || member == null ? "" : member.name(),
+                    wholeClass || member == null ? "" : member.descriptor());
             return;
         }
         final RemoteClass type;
@@ -1531,6 +1632,12 @@ public final class TargetTui implements AutoCloseable {
                 requestUnloadedBytecode(entry, destination);
                 return;
             }
+        }
+        if (unloadedContextClass != null && tab == Tab.METHODS) {
+            JvmClassPathCatalog.Member member = selectedUnloadedMethod();
+            if (member == null) { status = "Select an unloaded method first."; return; }
+            requestUnloadedBytecode(TuiBrowserEntry.unloadedMember(unloadedContextClass, member), destination);
+            return;
         }
         if (!requireContext()) return;
         RemoteMethod method = selectedMethodForAction();
@@ -2275,7 +2382,14 @@ public final class TargetTui implements AutoCloseable {
         final String name;
         final String descriptor;
         final boolean abstractMethod;
-        if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
+        if (unloadedContextClass != null && tab == Tab.METHODS) {
+            JvmClassPathCatalog.Member selected = selectedUnloadedMethod();
+            if (selected == null) { status = "Select an unloaded method first."; return; }
+            owner = unloadedContextClass.name();
+            name = selected.name();
+            descriptor = selected.descriptor();
+            abstractMethod = selected.isAbstract();
+        } else if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
             TuiBrowserEntry selected = visibleBrowserEntries.get(selection());
             if (!selected.unloaded() || selected.kind() != TuiBrowserEntry.Kind.METHOD
                     || selected.unloadedMember() == null) {
@@ -2664,6 +2778,19 @@ public final class TargetTui implements AutoCloseable {
             return;
         }
         if (tab == Tab.METHODS) {
+            if (unloadedContextClass != null) {
+                JvmClassPathCatalog.Member member = selectedUnloadedMethod();
+                if (member == null) { status = "Select an unloaded method first."; return; }
+                if (receiverOnly) {
+                    status = "An unloaded class has no receiver object; F9 creates an all-instance pending breakpoint.";
+                } else if (member.isNative() || member.isAbstract()) {
+                    toggleMethodEventBreakpoint(true);
+                } else {
+                    toggleBreakpointSpec(new BreakpointSpec(unloadedContextClass.name(), member.name(),
+                            member.descriptor(), 0L, -1), " at unloaded method entry", false);
+                }
+                return;
+            }
             toggleMethodEntryBreakpoint(receiverOnly);
             return;
         }
@@ -2775,6 +2902,12 @@ public final class TargetTui implements AutoCloseable {
                 toggleUnloadedFieldWatch(entry, modification);
                 return;
             }
+        }
+        if (tab == Tab.FIELDS && unloadedContextClass != null) {
+            JvmClassPathCatalog.Member member = selectedUnloadedField();
+            if (member != null) toggleUnloadedFieldWatch(
+                    TuiBrowserEntry.unloadedMember(unloadedContextClass, member), modification);
+            return;
         }
         if (tab != Tab.FIELDS) {
             status = "U/W set field-read/field-write watchpoints from the Fields view.";
@@ -2959,6 +3092,23 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void dumpContextClass() {
+        if (unloadedContextClass != null) {
+            final JvmClassPathCatalog.ClassEntry type = unloadedContextClass;
+            final Path output = Paths.get("dumps", type.name().replace('.', '/') + ".class")
+                    .toAbsolutePath().normalize();
+            submit("Dumping unloaded " + type.name() + "...", new Callable<Long>() {
+                @Override public Long call() throws IOException {
+                    Files.createDirectories(output.getParent());
+                    Files.write(output, type.bytes());
+                    return Files.size(output);
+                }
+            }, new Consumer<Long>() {
+                @Override public void accept(Long size) {
+                    status = "Dumped " + size + " unloaded class byte(s) to " + output;
+                }
+            });
+            return;
+        }
         if (!requireContext()) return;
         final RemoteClass type = contextClass;
         final Path output = Paths.get("dumps", type.className().replace('.', '/') + ".class")
@@ -3016,37 +3166,63 @@ public final class TargetTui implements AutoCloseable {
             for (TuiBrowserEntry entry : visibleBrowserEntries) lines.add(entry.displayName());
             baseName = browserTitle;
         } else if (tab == Tab.CONTEXT) {
-            if (!session.context().isSet()) return null;
-            lines.add("CONTEXT STACK");
-            List<String> stack = session.context().stack(1024);
-            for (int index = 0; index < stack.size(); index++) lines.add("#" + index + " " + stack.get(index));
-            lines.add("");
-            lines.add("CONTEXT VALUE");
-            lines.addAll(contextLines);
-            baseName = session.context().description();
+            if (unloadedContextClass != null) {
+                lines.add("UNLOADED CLASS CONTEXT");
+                lines.addAll(contextLines);
+                baseName = unloadedContextClass.name() + "-context";
+            } else {
+                if (!session.context().isSet()) return null;
+                lines.add("CONTEXT STACK");
+                List<String> stack = session.context().stack(1024);
+                for (int index = 0; index < stack.size(); index++) lines.add("#" + index + " " + stack.get(index));
+                lines.add("");
+                lines.add("CONTEXT VALUE");
+                lines.addAll(contextLines);
+                baseName = session.context().description();
+            }
         } else if (tab == Tab.FIELDS) {
-            if (contextClass == null) return null;
-            lines.add("Fields of " + contextClass.className());
-            lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
-            lines.add("");
-            for (RemoteField field : visibleFields()) {
-                lines.add(String.format("%s %s %s  descriptor=%s  declaredBy=%s",
-                        field.isStatic() ? "static" : "instance", field.typeName(), field.name(),
-                        field.descriptor(), field.declaringClass()));
+            if (unloadedContextClass != null) {
+                lines.add("Fields of unloaded " + unloadedContextClass.name());
+                for (JvmClassPathCatalog.Member field : visibleUnloadedFields()) {
+                    lines.add(String.format("%s %s %s  descriptor=%s",
+                            field.isStatic() ? "static" : "instance", field.typeSummary(),
+                            field.name(), field.descriptor()));
+                }
+                baseName = unloadedContextClass.name() + "-unloaded-fields";
+            } else {
+                if (contextClass == null) return null;
+                lines.add("Fields of " + contextClass.className());
+                lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
+                lines.add("");
+                for (RemoteField field : visibleFields()) {
+                    lines.add(String.format("%s %s %s  descriptor=%s  declaredBy=%s",
+                            field.isStatic() ? "static" : "instance", field.typeName(), field.name(),
+                            field.descriptor(), field.declaringClass()));
+                }
+                baseName = contextClass.className() + "-fields";
             }
-            baseName = contextClass.className() + "-fields";
         } else if (tab == Tab.METHODS) {
-            if (contextClass == null) return null;
-            lines.add("Methods of " + contextClass.className());
-            lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
-            lines.add("");
-            for (RemoteMethod method : visibleMethods()) {
-                lines.add(String.format("%s %s %s%s  declaredBy=%s",
-                        method.isStatic() ? "static" : "instance", method.returnTypeName(), method.name(),
-                        method.parameterTypeNames(), method.declaringClass()));
-                lines.add("  descriptor=" + method.descriptor());
+            if (unloadedContextClass != null) {
+                lines.add("Methods of unloaded " + unloadedContextClass.name());
+                for (JvmClassPathCatalog.Member method : visibleUnloadedMethods()) {
+                    lines.add(String.format("%s %s %s  descriptor=%s",
+                            method.isStatic() ? "static" : "instance", method.typeSummary(),
+                            method.name(), method.descriptor()));
+                }
+                baseName = unloadedContextClass.name() + "-unloaded-methods";
+            } else {
+                if (contextClass == null) return null;
+                lines.add("Methods of " + contextClass.className());
+                lines.add("mode=" + (classContext ? "class metadata (static + virtual)" : "instance"));
+                lines.add("");
+                for (RemoteMethod method : visibleMethods()) {
+                    lines.add(String.format("%s %s %s%s  declaredBy=%s",
+                            method.isStatic() ? "static" : "instance", method.returnTypeName(), method.name(),
+                            method.parameterTypeNames(), method.declaringClass()));
+                    lines.add("  descriptor=" + method.descriptor());
+                }
+                baseName = contextClass.className() + "-methods";
             }
-            baseName = contextClass.className() + "-methods";
         } else if (tab == Tab.SOURCE) {
             if (sourceLines.isEmpty()) return null;
             lines.addAll(sourceLines);
@@ -3177,6 +3353,14 @@ public final class TargetTui implements AutoCloseable {
             else if (!packageName.isEmpty()) requestPackage(TuiBrowserModel.parentPackage(packageName));
             return;
         }
+        if (unloadedContextClass != null) {
+            tab = Tab.BROWSE;
+            packageName = TuiBrowserModel.parentPackage(unloadedContextClass.name());
+            requestUnloadedPackage(packageName, false);
+            status = "Returned to unloaded package "
+                    + (packageName.isEmpty() ? "<root>" : packageName);
+            return;
+        }
         if (session.context().isSet() && session.context().depth() > 1) {
             session.context().back();
             tab = Tab.CONTEXT;
@@ -3187,6 +3371,7 @@ public final class TargetTui implements AutoCloseable {
     private void clearContext() {
         if (tasks.userOperationBusy()) { status = busyMessage(); return; }
         session.context().clear();
+        clearUnloadedContext();
         selectedMethod = null;
         clearContextView();
         tab = Tab.BROWSE;
@@ -3194,6 +3379,7 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void clearContextView() {
+        if (unloadedContextClass != null) return;
         contextClass = null;
         fields.clear();
         methods.clear();
@@ -3243,7 +3429,12 @@ public final class TargetTui implements AutoCloseable {
         status = showSpecialMethods
                 ? "JVM lifecycle methods enabled: loading <init> and <clinit> from class bytes"
                 : "JVM lifecycle methods hidden";
-        if (session.context().isSet() && !tasks.userOperationBusy()) requestContextRefresh();
+        if (unloadedContextClass != null) {
+            clampMemberSelections();
+            status = showSpecialMethods
+                    ? "JVM lifecycle methods visible in unloaded class context"
+                    : "JVM lifecycle methods hidden";
+        } else if (session.context().isSet() && !tasks.userOperationBusy()) requestContextRefresh();
         else if (!session.context().isSet()) tab = Tab.BROWSE;
     }
 
@@ -3265,8 +3456,10 @@ public final class TargetTui implements AutoCloseable {
         showStaticMembers = !showStaticMembers;
         clampMemberSelections();
         if (tab == Tab.METHODS) {
-            List<RemoteMethod> visible = visibleMethods();
-            selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+            if (unloadedContextClass == null) {
+                List<RemoteMethod> visible = visibleMethods();
+                selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+            }
         }
         status = showStaticMembers
                 ? "Static members are visible (@ toggles); virtual members are "
@@ -3278,8 +3471,10 @@ public final class TargetTui implements AutoCloseable {
         showVirtualMembers = !showVirtualMembers;
         clampMemberSelections();
         if (tab == Tab.METHODS) {
-            List<RemoteMethod> visible = visibleMethods();
-            selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+            if (unloadedContextClass == null) {
+                List<RemoteMethod> visible = visibleMethods();
+                selectedMethod = visible.isEmpty() ? null : visible.get(selections[Tab.METHODS.ordinal()]);
+            }
         }
         status = showVirtualMembers
                 ? "Instance fields and virtual methods are visible (# toggles)"
@@ -3327,15 +3522,25 @@ public final class TargetTui implements AutoCloseable {
             if (tab == Tab.BROWSE) {
                 for (TuiBrowserEntry entry : visibleBrowserEntries) rows.add(entry.displayName());
             } else if (tab == Tab.FIELDS) {
-                for (RemoteField field : visibleFields()) rows.add(fieldLabel(field));
+                if (unloadedContextClass != null) {
+                    for (JvmClassPathCatalog.Member field : visibleUnloadedFields()) {
+                        rows.add(unloadedFieldLabel(field));
+                    }
+                } else for (RemoteField field : visibleFields()) rows.add(fieldLabel(field));
             } else {
-                for (RemoteMethod method : visibleMethods()) rows.add(methodLabel(method));
+                if (unloadedContextClass != null) {
+                    for (JvmClassPathCatalog.Member method : visibleUnloadedMethods()) {
+                        rows.add(unloadedMethodLabel(method));
+                    }
+                } else for (RemoteMethod method : visibleMethods()) rows.add(methodLabel(method));
             }
             int match = nextTextMatch(rows, selections[tab.ordinal()], listSearch, direction);
             if (match < 0) status = "No current-list match for: " + listSearch;
             else {
                 selections[tab.ordinal()] = match;
-                if (tab == Tab.METHODS) selectedMethod = visibleMethods().get(match);
+                if (tab == Tab.METHODS && unloadedContextClass == null) {
+                    selectedMethod = visibleMethods().get(match);
+                }
                 status = "Current-list match " + (match + 1) + "/" + rows.size()
                         + " (N previous, n next)";
             }
@@ -3451,7 +3656,8 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void forceLoadClass() throws IOException {
-        final String value = editText("Class.forName in target JVM", "");
+        final String value = editText("Class.forName in target JVM",
+                unloadedContextClass == null ? "" : unloadedContextClass.name());
         if (value == null) return;
         final String className = value.trim();
         if (className.isEmpty()) {
@@ -3504,16 +3710,20 @@ public final class TargetTui implements AutoCloseable {
         selections[tab.ordinal()] = clamp(selections[tab.ordinal()] + delta,
                 0, Math.max(0, count - 1));
         if (tab == Tab.METHODS) {
-            List<RemoteMethod> visible = visibleMethods();
-            if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+            if (unloadedContextClass == null) {
+                List<RemoteMethod> visible = visibleMethods();
+                if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+            }
         }
     }
 
     private void moveToBoundary(boolean end) {
         selections[tab.ordinal()] = end ? Math.max(0, itemCount(tab) - 1) : 0;
         if (tab == Tab.METHODS) {
-            List<RemoteMethod> visible = visibleMethods();
-            if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+            if (unloadedContextClass == null) {
+                List<RemoteMethod> visible = visibleMethods();
+                if (!visible.isEmpty()) selectedMethod = visible.get(selection());
+            }
         }
     }
 
@@ -3528,9 +3738,12 @@ public final class TargetTui implements AutoCloseable {
 
     private int itemCount(Tab value) {
         if (value == Tab.BROWSE) return visibleBrowserEntries.size();
-        if (value == Tab.CONTEXT) return session.context().isSet() ? session.context().depth() : 0;
-        if (value == Tab.FIELDS) return visibleFields().size();
-        if (value == Tab.METHODS) return visibleMethods().size();
+        if (value == Tab.CONTEXT) return unloadedContextClass != null ? 1
+                : session.context().isSet() ? session.context().depth() : 0;
+        if (value == Tab.FIELDS) return unloadedContextClass != null
+                ? visibleUnloadedFields().size() : visibleFields().size();
+        if (value == Tab.METHODS) return unloadedContextClass != null
+                ? visibleUnloadedMethods().size() : visibleMethods().size();
         if (value == Tab.FRAMES) return debuggerFrames.size();
         if (value == Tab.LOCALS) return debuggerLocals.size();
         if (value == Tab.BREAKPOINTS) return breakpoints.size();
@@ -3576,11 +3789,58 @@ public final class TargetTui implements AutoCloseable {
         return result;
     }
 
+    private List<JvmClassPathCatalog.Member> visibleUnloadedFields() {
+        return visibleUnloadedMembers(unloadedFields, JvmClassPathCatalog.MemberKind.FIELD);
+    }
+
+    private List<JvmClassPathCatalog.Member> visibleUnloadedMethods() {
+        return visibleUnloadedMembers(unloadedMethods, JvmClassPathCatalog.MemberKind.METHOD);
+    }
+
+    private List<JvmClassPathCatalog.Member> visibleUnloadedMembers(
+            List<JvmClassPathCatalog.Member> source, JvmClassPathCatalog.MemberKind kind) {
+        List<JvmClassPathCatalog.Member> result = new ArrayList<JvmClassPathCatalog.Member>();
+        String needle = memberFilter.toLowerCase(Locale.ROOT);
+        for (JvmClassPathCatalog.Member member : source) {
+            if (member.kind() != kind) continue;
+            if (!showStaticMembers && member.isStatic()) continue;
+            if (!showVirtualMembers && !member.isStatic()) continue;
+            if (kind == JvmClassPathCatalog.MemberKind.METHOD && !showSpecialMethods
+                    && ("<init>".equals(member.name()) || "<clinit>".equals(member.name()))) continue;
+            if (needle.isEmpty() || member.name().toLowerCase(Locale.ROOT).contains(needle)
+                    || member.typeSummary().toLowerCase(Locale.ROOT).contains(needle)
+                    || member.descriptor().toLowerCase(Locale.ROOT).contains(needle)) result.add(member);
+        }
+        return result;
+    }
+
+    private JvmClassPathCatalog.Member selectedUnloadedField() {
+        List<JvmClassPathCatalog.Member> visible = visibleUnloadedFields();
+        return visible.isEmpty() ? null : visible.get(clamp(
+                selections[Tab.FIELDS.ordinal()], 0, visible.size() - 1));
+    }
+
+    private JvmClassPathCatalog.Member selectedUnloadedMethod() {
+        List<JvmClassPathCatalog.Member> visible = visibleUnloadedMethods();
+        return visible.isEmpty() ? null : visible.get(clamp(
+                selections[Tab.METHODS.ordinal()], 0, visible.size() - 1));
+    }
+
+    private void clearUnloadedContext() {
+        unloadedContextClass = null;
+        unloadedFields.clear();
+        unloadedMethods.clear();
+    }
+
     private void clampMemberSelections() {
+        int fieldCount = unloadedContextClass != null
+                ? visibleUnloadedFields().size() : visibleFields().size();
+        int methodCount = unloadedContextClass != null
+                ? visibleUnloadedMethods().size() : visibleMethods().size();
         selections[Tab.FIELDS.ordinal()] = clamp(selections[Tab.FIELDS.ordinal()],
-                0, Math.max(0, visibleFields().size() - 1));
+                0, Math.max(0, fieldCount - 1));
         selections[Tab.METHODS.ordinal()] = clamp(selections[Tab.METHODS.ordinal()],
-                0, Math.max(0, visibleMethods().size() - 1));
+                0, Math.max(0, methodCount - 1));
     }
 
     private boolean requireContext() {
@@ -3622,9 +3882,8 @@ public final class TargetTui implements AutoCloseable {
         boolean tabsVisible = height >= 5;
         boolean statusVisible = height >= 3;
         boolean helpVisible = height >= 6;
-        int maximumHelpRows = height >= 12 ? 3 : height >= 8 ? 2 : 1;
         List<String> shortcuts = helpVisible
-                ? TuiFooter.rows(helpTokens(), width, maximumHelpRows)
+                ? TuiFooter.allRows(helpTokens(), width)
                 : Collections.<String>emptyList();
         if (tabsVisible) output.add(tabsLine(width));
         int reservedFooterRows = (statusVisible ? 1 : 0) + shortcuts.size();
@@ -3653,7 +3912,8 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private String title(int width) {
-        String context = session.context().isSet() ? session.context().description() : "<no context>";
+        String context = unloadedContextClass != null ? "unloaded class " + unloadedContextClass.name()
+                : session.context().isSet() ? session.context().description() : "<no context>";
         if (width < 90) {
             return " JVMRTDP " + session.server().process().pid() + " | "
                     + tab.name().toLowerCase(Locale.ROOT) + " | " + context;
@@ -3768,14 +4028,24 @@ public final class TargetTui implements AutoCloseable {
         if (tab == Tab.BROWSE) {
             for (TuiBrowserEntry entry : visibleBrowserEntries) result.add(entry.displayName());
         } else if (tab == Tab.CONTEXT || tab == Tab.SOURCE) {
-            if (session.context().isSet()) {
+            if (unloadedContextClass != null && tab == Tab.CONTEXT) {
+                result.add("#0 [U:C] " + unloadedContextClass.name());
+            } else if (session.context().isSet()) {
                 List<String> stack = session.context().stack(128);
                 for (int index = 0; index < stack.size(); index++) result.add("#" + index + " " + stack.get(index));
             }
         } else if (tab == Tab.FIELDS) {
-            for (RemoteField field : visibleFields()) result.add(fieldLabel(field));
+            if (unloadedContextClass != null) {
+                for (JvmClassPathCatalog.Member field : visibleUnloadedFields()) {
+                    result.add(unloadedFieldLabel(field));
+                }
+            } else for (RemoteField field : visibleFields()) result.add(fieldLabel(field));
         } else if (tab == Tab.METHODS) {
-            for (RemoteMethod method : visibleMethods()) result.add(methodLabel(method));
+            if (unloadedContextClass != null) {
+                for (JvmClassPathCatalog.Member method : visibleUnloadedMethods()) {
+                    result.add(unloadedMethodLabel(method));
+                }
+            } else for (RemoteMethod method : visibleMethods()) result.add(methodLabel(method));
         } else if (tab == Tab.FRAMES) {
             for (JvmStackFrame frame : debuggerFrames) {
                 result.add((frame.depth() == debuggerFrameDepth ? ">" : " ")
@@ -3796,6 +4066,15 @@ public final class TargetTui implements AutoCloseable {
     private List<String> rightLines() {
         if (tab == Tab.CONTEXT) {
             List<String> result = new ArrayList<String>(contextLines);
+            if (unloadedContextClass != null) {
+                result.add("");
+                result.add("OFFLINE CONTEXT NAVIGATION");
+                addKeyHelp(result, "Tab / Shift+Tab", "Browse Fields and Methods like a loaded class");
+                addKeyHelp(result, "A", "Decompile this class without loading it");
+                addKeyHelp(result, "L", "Load/initialize this class with Class.forName");
+                addKeyHelp(result, "Backspace", "Return to the unloaded package browser");
+                return result;
+            }
             result.add("");
             result.add("WRITE SOURCE");
             result.add(session.context().canAssign()
@@ -3895,6 +4174,7 @@ public final class TargetTui implements AutoCloseable {
             addKeyHelp(result, "[ / ]", "Scroll clipped text horizontally");
             addKeyHelp(result, "0", "Reset horizontal position");
         } else if (tab == Tab.FIELDS) {
+            if (unloadedContextClass != null) return unloadedFieldInfo();
             List<RemoteField> visible = visibleFields();
             result.add("Static fields: " + (showStaticMembers ? "visible" : "hidden")
                     + "  (@ toggles)");
@@ -3931,6 +4211,7 @@ public final class TargetTui implements AutoCloseable {
                 addKeyHelp(result, "0", "Reset horizontal position");
             }
         } else if (tab == Tab.METHODS) {
+            if (unloadedContextClass != null) return unloadedMethodInfo();
             List<RemoteMethod> visible = visibleMethods();
             result.add("Static methods: " + (showStaticMembers ? "visible" : "hidden")
                     + "  (@ toggles)");
@@ -4102,6 +4383,69 @@ public final class TargetTui implements AutoCloseable {
                 addKeyHelp(result, "0", "Reset horizontal position");
             }
         }
+        return result;
+    }
+
+    private List<String> unloadedFieldInfo() {
+        List<String> result = new ArrayList<String>();
+        List<JvmClassPathCatalog.Member> visible = visibleUnloadedFields();
+        result.add("UNLOADED CLASS: " + unloadedContextClass.name());
+        result.add("Static fields: " + (showStaticMembers ? "visible" : "hidden") + "  (@ toggles)");
+        result.add("Instance fields: " + (showVirtualMembers ? "visible" : "hidden") + "  (# toggles)");
+        result.add("");
+        if (visible.isEmpty()) {
+            result.add(unloadedFields.isEmpty() ? "<no fields in class file>" : "No field matches active filters.");
+            return result;
+        }
+        JvmClassPathCatalog.Member field = selectedUnloadedField();
+        result.add((field.isStatic() ? "STATIC " : "INSTANCE ")
+                + Modifier.toString(field.access()) + " " + field.typeSummary() + " " + field.name());
+        result.add("Declared by: " + unloadedContextClass.name());
+        result.add("Descriptor:  " + field.descriptor());
+        result.add("State:       UNLOADED; metadata read from " + unloadedContextClass.origin());
+        result.add("");
+        result.add("Runtime values exist after class preparation; current offline actions are watches/decompile.");
+        result.add("");
+        result.add("SHORTCUTS");
+        addKeyHelp(result, "U / W", "Toggle pending field-read / field-write watch");
+        addKeyHelp(result, "@ / #", "Show/hide static / instance fields");
+        addKeyHelp(result, "f / F", "Find in list / search unloaded catalog");
+        addKeyHelp(result, "A", "Decompile owning class without loading it");
+        addKeyHelp(result, "L", "Load/initialize owning class with Class.forName");
+        addKeyHelp(result, "Backspace", "Return to unloaded package browser");
+        return result;
+    }
+
+    private List<String> unloadedMethodInfo() {
+        List<String> result = new ArrayList<String>();
+        List<JvmClassPathCatalog.Member> visible = visibleUnloadedMethods();
+        result.add("UNLOADED CLASS: " + unloadedContextClass.name());
+        result.add("Static methods: " + (showStaticMembers ? "visible" : "hidden") + "  (@ toggles)");
+        result.add("Virtual methods: " + (showVirtualMembers ? "visible" : "hidden") + "  (# toggles)");
+        result.add("");
+        if (visible.isEmpty()) {
+            result.add(unloadedMethods.isEmpty() ? "<no methods in class file>" : "No method matches active filters.");
+            return result;
+        }
+        JvmClassPathCatalog.Member method = selectedUnloadedMethod();
+        result.add((method.isStatic() ? "STATIC " : "INSTANCE ")
+                + Modifier.toString(method.access()) + " " + method.typeSummary() + " " + method.name());
+        result.add("Declared by:   " + unloadedContextClass.name());
+        result.add("Descriptor:    " + method.descriptor());
+        result.add("Implementation: " + (method.isNative() ? "NATIVE"
+                : method.isAbstract() ? "ABSTRACT" : "BYTECODE"));
+        result.add("State:         UNLOADED; bytecode is read offline");
+        result.add("");
+        result.add("SHORTCUTS");
+        addKeyHelp(result, "Enter / B", "Open bytecode without loading the class");
+        addKeyHelp(result, "S", "Decompile selected method without loading it");
+        addKeyHelp(result, "A", "Decompile owning class without loading it");
+        addKeyHelp(result, "F9", method.isNative() || method.isAbstract()
+                ? "Toggle pending method-entry event breakpoint" : "Toggle pending BCI 0 breakpoint");
+        addKeyHelp(result, "Ctrl+E / Ctrl+X", "Toggle method-entry / method-exit event breakpoint");
+        addKeyHelp(result, "@ / #", "Show/hide static / virtual methods");
+        addKeyHelp(result, "K", "Show/hide <init> and <clinit>");
+        addKeyHelp(result, "Backspace", "Return to unloaded package browser");
         return result;
     }
 
@@ -4467,6 +4811,16 @@ public final class TargetTui implements AutoCloseable {
     private String fieldLabel(RemoteField field) {
         String inherited = contextClass != null && !field.declaringClass().equals(contextClass.className()) ? "^" : " ";
         return (field.isStatic() ? "S" : "V") + inherited + " " + field.typeName() + " " + field.name();
+    }
+
+    private static String unloadedFieldLabel(JvmClassPathCatalog.Member field) {
+        return "U" + (field.isStatic() ? "S" : "V") + " " + field.typeSummary() + " " + field.name();
+    }
+
+    private static String unloadedMethodLabel(JvmClassPathCatalog.Member method) {
+        String implementation = method.isNative() ? "N" : method.isAbstract() ? "A" : " ";
+        return "U" + (method.isStatic() ? "S" : "V") + implementation + " "
+                + method.typeSummary() + " " + method.name();
     }
 
     private String methodLabel(RemoteMethod method) {
