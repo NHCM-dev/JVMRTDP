@@ -8,6 +8,8 @@ final class TuiKey {
     static final int LEFT = 0x1003;
     static final int RIGHT = 0x1004;
     static final int SHIFT_TAB = 0x1005;
+    static final int CTRL_LEFT = 0x1006;
+    static final int CTRL_RIGHT = 0x1007;
     static final int F2 = 0x1012;
     static final int F4 = 0x1014;
     static final int F5 = 0x1015;

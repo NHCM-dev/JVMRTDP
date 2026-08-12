@@ -137,6 +137,7 @@ TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据�
 | `a` | 在 Browse 中显示或隐藏数组类型 |
 | `A` | 反编译选中或当前类 |
 | `K` | 显示或隐藏 `<init>` / `<clinit>` |
+| `+` / `-` / `~` | 插入、删除或替换高亮字节码指令 |
 | `F2` | 切换到 CLI |
 | `Q` | 返回或退出 |
 
@@ -158,9 +159,13 @@ TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据�
 decompile class com.example.Application --engine cfr
 decompile method com.example.Application main "([Ljava/lang/String;)V" --engine procyon
 bytecode com.example.Application main "([Ljava/lang/String;)V"
+bytecode insert-before com.example.Application run "()I" 4 "LDC \"return=\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V"
+bytecode replace com.example.Application run "()I" 4 "ICONST_5 ;; IRETURN"
 ```
 
 反编译和字节码视图支持搜索、水平滚动、定位行号或 BCI、设置断点和导出。原生方法与抽象方法没有 JVM `Code` 属性，因此不会显示 Java 字节码。
+
+实时编辑使用 ASM 事务化改写并重新计算 frame/max。在 Bytecode 或 Debug TUI 中，`+` 在高亮 BCI 前插入（输入以 `after:` 开头则插到后面），`-` 删除，`~` 替换。CLI 补丁文件可把多个编辑合并为一次类重定义；受管断点会重定位到新 BCI。已经执行中的 frame 可能继续运行旧方法体，新调用使用新字节码。
 
 ## 调试
 

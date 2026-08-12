@@ -252,10 +252,30 @@ public class RemoteJVMTIEnv extends RemoteHandle {
     }
 
     public void redefineClass(String className, byte[] classBytes) {
+        redefineClass(className, classBytes,
+                Collections.<String, Map<Long, Long>>emptyMap());
+    }
+
+    /**
+     * Redefines a class and relocates managed breakpoints to the emitted bytecode indexes.
+     * Relocation keys are {@code methodName + '\0' + descriptor}; absent methods retain their BCI.
+     */
+    public void redefineClass(String className, byte[] classBytes,
+            Map<String, Map<Long, Long>> relocations) {
         requireClassBytes(classBytes);
-        executeForOutput(CommandLine.of("jvmti", "redefine", className,
-                Base64.getUrlEncoder().withoutPadding().encodeToString(classBytes)));
-        restoreBreakpointsAfterClassBytes(className);
+        final String normalized = normalizeClassName(className);
+        final List<BreakpointRegistration> breakpoints = breakpointsForClass(normalized);
+        detachBreakpoints(breakpoints);
+        try {
+            executeForOutput(CommandLine.of("jvmti", "redefine", className,
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(classBytes)));
+        } catch (RuntimeException failure) {
+            try { restoreBreakpointRegistrations(breakpoints, Collections.<String, Map<Long, Long>>emptyMap()); }
+            catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            throw failure;
+        }
+        restoreBreakpointRegistrations(breakpoints, relocations == null
+                ? Collections.<String, Map<Long, Long>>emptyMap() : relocations);
     }
 
     public void setBreakpoint(String className, String methodName, String descriptor,
@@ -313,6 +333,79 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         synchronized (managedBreakpoints) { managedBreakpoints.remove(breakpoint.id()); }
     }
 
+    private List<BreakpointRegistration> breakpointsForClass(String normalizedClassName) {
+        List<BreakpointRegistration> result = new ArrayList<BreakpointRegistration>();
+        synchronized (managedBreakpoints) {
+            for (BreakpointRegistration registration : managedBreakpoints.values()) {
+                if (registration.className.equals(normalizedClassName)) result.add(registration);
+            }
+        }
+        return result;
+    }
+
+    private void detachBreakpoints(List<BreakpointRegistration> registrations) {
+        List<BreakpointRegistration> detached = new ArrayList<BreakpointRegistration>();
+        try {
+            for (BreakpointRegistration registration : registrations) {
+                try {
+                    executeForOutput(CommandLine.of("jvmti", "breakpoint", "clear",
+                            registration.className, registration.methodName,
+                            registration.descriptor, Long.toString(registration.location),
+                            registration.id(), "0", "-", "-", "-"));
+                } catch (RuntimeException failure) {
+                    // A stop may already have invalidated an old agent's native breakpoint.
+                    if (!isBreakpointNotFound(failure)) throw failure;
+                }
+                detached.add(registration);
+                synchronized (managedBreakpoints) {
+                    managedBreakpoints.remove(registration.id());
+                }
+            }
+        } catch (RuntimeException failure) {
+            try { restoreBreakpointRegistrations(detached,
+                    Collections.<String, Map<Long, Long>>emptyMap()); }
+            catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            throw failure;
+        }
+    }
+
+    private void restoreBreakpointRegistrations(List<BreakpointRegistration> registrations,
+            Map<String, Map<Long, Long>> relocations) {
+        RuntimeException firstFailure = null;
+        for (BreakpointRegistration previous : registrations) {
+            Map<Long, Long> methodRelocations = relocations.get(
+                    previous.methodName + '\u0000' + previous.descriptor);
+            Long relocated = methodRelocations == null ? null
+                    : methodRelocations.get(Long.valueOf(previous.location));
+            long location = relocated == null ? previous.location : relocated.longValue();
+            BreakpointRegistration registration = new BreakpointRegistration(
+                    previous.className, previous.methodName, previous.descriptor,
+                    location, previous.condition);
+            try {
+                installBreakpointRegistration(registration);
+            } catch (RuntimeException failure) {
+                if (firstFailure == null) firstFailure = failure;
+                else firstFailure.addSuppressed(failure);
+            }
+        }
+        if (firstFailure != null) throw new IllegalStateException(
+                "Class was redefined, but one or more managed breakpoints could not be restored",
+                firstFailure);
+    }
+
+    private void installBreakpointRegistration(BreakpointRegistration registration) {
+        JvmBreakpointCondition condition = registration.condition;
+        executeForOutput(CommandLine.of("jvmti", "breakpoint", "set",
+                registration.className, registration.methodName, registration.descriptor,
+                Long.toString(registration.location), registration.id(),
+                condition.receiver() == null ? "0" : objectId(condition.receiver()),
+                optional(condition.callerClass()), optional(condition.callerMethod()),
+                optional(condition.callerDescriptor())));
+        synchronized (managedBreakpoints) {
+            managedBreakpoints.put(registration.id(), registration);
+        }
+    }
+
     private void restoreBreakpointsAfterClassBytes(String className) {
         String normalizedClassName = normalizeClassName(className);
         List<BreakpointRegistration> snapshot = new ArrayList<BreakpointRegistration>();
@@ -342,6 +435,15 @@ public class RemoteJVMTIEnv extends RemoteHandle {
             String message = current.getMessage();
             if (message != null && message.contains("SetBreakpoint")
                     && message.contains("JVMTI_ERROR_DUPLICATE")) return true;
+        }
+        return false;
+    }
+
+    private static boolean isBreakpointNotFound(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message != null && message.contains("ClearBreakpoint")
+                    && message.contains("JVMTI_ERROR_NOT_FOUND")) return true;
         }
         return false;
     }

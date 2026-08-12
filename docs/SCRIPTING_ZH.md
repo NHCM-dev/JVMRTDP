@@ -166,6 +166,14 @@ export context output/current.txt
 command debugger snapshot output/debugger.json json
 ```
 
+脚本也能通过同一 CLI 命令安装包含多个操作的原子字节码补丁：
+
+```text
+command bytecode patch-file com.example.Service patches/service.patch
+```
+
+补丁文件自身是一个类事务；外层脚本不是事务。后续脚本操作失败时，可显式执行 `bytecode undo com.example.Service`。
+
 ## 9. 分支
 
 ```text

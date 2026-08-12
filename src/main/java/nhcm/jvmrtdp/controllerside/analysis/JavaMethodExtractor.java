@@ -17,6 +17,7 @@ final class JavaMethodExtractor {
             String source, String simpleClassName, String methodName, String descriptor) {
         List<String> parameterTypes = descriptorParameterTypes(descriptor);
         if (parameterTypes == null) return null;
+        if ("<clinit>".equals(methodName)) return extractStaticInitializer(source);
         String sourceName = "<init>".equals(methodName) ? simpleClassName : methodName;
         int search = 0;
         while (search < source.length()) {
@@ -49,6 +50,66 @@ final class JavaMethodExtractor {
             return end < 0 ? null : extraction(source, start, end + 1);
         }
         return null;
+    }
+
+    /** Extracts the class-level Java representation of the JVM {@code <clinit>} method. */
+    private static Extraction extractStaticInitializer(String source) {
+        ScanState state = new ScanState();
+        int depth = 0;
+        boolean classBody = false;
+        Extraction initializedField = null;
+        for (int index = 0; index < source.length(); index++) {
+            int consumed = state.accept(source, index);
+            if (!state.inIgnoredText()) {
+                char value = source.charAt(index);
+                if ((!classBody || depth == 1) && source.startsWith("static", index)
+                        && (index == 0 || !Character.isJavaIdentifierPart(source.charAt(index - 1)))
+                        && (index + 6 == source.length()
+                        || !Character.isJavaIdentifierPart(source.charAt(index + 6)))) {
+                    int body = skipWhitespace(source, index + 6);
+                    if (body < source.length() && source.charAt(body) == '{') {
+                        int end = matching(source, body, '{', '}');
+                        return end < 0 ? null : extraction(
+                                source, declarationStart(source, index), end + 1);
+                    }
+                    if (classBody && depth == 1 && initializedField == null) {
+                        int end = classMemberTerminator(source, body, depth);
+                        int start = declarationStart(source, index);
+                        if (end >= 0 && source.substring(start, end).indexOf('=') >= 0) {
+                            initializedField = extraction(source, start, end + 1);
+                        }
+                    }
+                }
+                if (value == '{') {
+                    if (!classBody) {
+                        classBody = true;
+                        depth = 1;
+                    } else depth++;
+                } else if (value == '}' && classBody) {
+                    depth--;
+                }
+            }
+            index = consumed;
+        }
+        return initializedField;
+    }
+
+    private static int classMemberTerminator(String source, int start, int initialDepth) {
+        ScanState state = new ScanState();
+        int depth = initialDepth;
+        for (int index = start; index < source.length(); index++) {
+            int consumed = state.accept(source, index);
+            if (!state.inIgnoredText()) {
+                char value = source.charAt(index);
+                if (value == '{') depth++;
+                else if (value == '}') {
+                    depth--;
+                    if (depth < initialDepth) return -1;
+                } else if (value == ';' && depth == initialDepth) return index;
+            }
+            index = consumed;
+        }
+        return -1;
     }
 
     /**

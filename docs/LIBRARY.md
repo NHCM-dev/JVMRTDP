@@ -34,7 +34,7 @@ Maven:
 </dependency>
 ```
 
-For a local file dependency, use `build/libs/jvmrtdp-2.1.0-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies JLine as a runtime dependency; file-based consumers that use terminal controller classes must add JLine themselves. The standalone `build/libs/JVMRTDP-2.1.0.jar` remains a self-contained executable.
+For a local file dependency, use `build/libs/jvmrtdp-2.1.0-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies ASM and JLine; file-based consumers must add `asm-tree` and `asm-util` when using bytecode APIs and JLine when using terminal controller classes. The standalone `build/libs/JVMRTDP-2.1.0.jar` remains a self-contained executable.
 
 Published artifacts include the library JAR, sources, Javadocs, and Maven POM. The automatic module name is `nhcm.jvmrtdp`.
 
@@ -226,14 +226,67 @@ try (RemoteCodeDeployment deployment = instrumentation.deploySource(
 
 instrumentation.redefine("com.example.Service", java.nio.file.Paths.get("Service.class"));
 
-// A controller-side bytecode editor can also replace the current class in one operation.
-byte[] installed = instrumentation.transformAndRedefine(
-        "com.example.Service", bytes -> bytecodeEditor.transform(bytes));
+// Anchors are BCIs from the class snapshot captured at transaction start.
+JvmBytecodePatch patch = JvmBytecodePatch.builder("com.example.Service")
+        .insertBefore("value", "()I", 0,
+                "LDC \"entered\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V")
+        .replace("value", "()I", 8, "BIPUSH 42 ;; IRETURN")
+        .build();
+
+JvmBytecodePatchResult preview = instrumentation.bytecode().preview(patch);
+JvmBytecodePatchResult installed = instrumentation.bytecode().apply(patch);
+Long relocated = installed.relocatedBci("value", "()I", 8);
+
+instrumentation.bytecode().undo("com.example.Service");
+instrumentation.bytecode().redo("com.example.Service");
 ```
 
 Use synchronous delivery only when the hook must affect the callback result, such as a class-file
 transformer. Asynchronous delivery avoids blocking the application thread for observational hooks.
 HotSpot redefine/retransform schema limits still apply; transformers must return a valid class file.
+
+### Transactional ASM bytecode editing
+
+`JvmBytecodeEditor` is shared by the CLI, TUI, and library session, so its undo/redo history and managed-breakpoint relocation remain consistent across interfaces. One `JvmBytecodePatch` can insert, delete, or replace multiple instruction ranges and return sites in one class redefinition. `applyBatch` validates all class patches first and performs best-effort rollback if a later class fails:
+
+```java
+JvmBytecodeEditor editor = session.instrumentation().bytecode();
+
+List<JvmBytecodePatchResult> results = editor.applyBatch(Arrays.asList(
+        JvmBytecodePatch.builder("com.example.A")
+                .delete("obsoleteCheck", "()V", 4, 11).build(),
+        JvmBytecodePatch.builder("com.example.B")
+                .insertBeforeReturns("compute", "(J)J",
+                        "DUP2 ;; INVOKESTATIC example/Trace onLong (J)V").build()));
+```
+
+The text assembler accepts standard JVM mnemonics. Separate statements with `;;` or newlines. It supports labels, branches, switches, field/method/type instructions, constants, and local-variable operations. `INVOKEDYNAMIC` bootstrap construction is intentionally available through the advanced ASM API instead of the text format:
+
+```java
+editor.editMethod("com.example.Service", "value", "()I", method -> {
+    method.instructions.insert(new org.objectweb.asm.tree.InsnNode(
+            org.objectweb.asm.Opcodes.NOP));
+});
+```
+
+To inspect or replace return values, route each normal return through a static hook. A method returning `T` requires hook descriptor `(T)T`; a `void` method requires `()V`:
+
+```java
+String source = "package example; public final class ReturnHooks {"
+        + " public static int onInt(int value) {"
+        + "   System.out.println(\"return=\" + value); return 42;"
+        + " }}";
+
+try (RemoteCodeDeployment hooks = instrumentation.deploySource(
+        "return-hooks", "example.ReturnHooks", source,
+        Collections.<Path>emptyList(), Collections.<String>emptyList(),
+        "com.example.Service", RemoteJVMTIEnv.DefinitionMode.SAME_LOADER)) {
+    editor.interceptReturns("com.example.Service", "value", "()I",
+            "example.ReturnHooks", "onInt");
+}
+```
+
+ASM recomputes frames and maximums using the target JVM's loaded type hierarchy. The editor then redefines the complete class and relocates managed breakpoints. HotSpot does not permit ordinary redefine to add or remove fields/methods or change inheritance. Existing active frames may finish the obsolete method version; new invocations use the replacement. An invalid patch is rejected before installation or by JVMTI verification.
 
 Capabilities depend on the JVM phase. Use `-agentpath` at target startup when an `OnLoad`-only capability is required. Dynamic attach cannot force capabilities that HotSpot no longer reports as potential.
 

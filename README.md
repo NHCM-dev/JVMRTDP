@@ -133,6 +133,8 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `PgUp` / `PgDn` | Move by page |
 | `Home` / `End` | Move to the first or last item |
 | `Tab` | Switch views |
+| `Shift+Tab` / `Ctrl+Left` | Switch to the previous view |
+| `Ctrl+Right` | Switch to the next view |
 | `Enter` | Open the selected item |
 | `Backspace` | Return to the parent context or package |
 | `Left` / `Right` | Scroll horizontally |
@@ -149,6 +151,7 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `a` | Show or hide array types in Browse |
 | `A` | Decompile the selected or current class |
 | `K` | Show or hide `<init>` / `<clinit>` |
+| `+` / `-` / `~` | Insert, delete, or replace the highlighted bytecode instruction |
 | `F2` | Switch to the CLI |
 | `Q` | Go back or exit |
 
@@ -170,9 +173,13 @@ Main views:
 decompile class com.example.Application --engine cfr
 decompile method com.example.Application main "([Ljava/lang/String;)V" --engine procyon
 bytecode com.example.Application main "([Ljava/lang/String;)V"
+bytecode insert-before com.example.Application run "()I" 4 "LDC \"return=\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V"
+bytecode replace com.example.Application run "()I" 4 "ICONST_5 ;; IRETURN"
 ```
 
 Decompile and bytecode views support search, horizontal scrolling, line or BCI navigation, breakpoints, and export. Native and abstract methods have no JVM `Code` attribute and therefore expose no Java bytecode.
+
+Live bytecode edits use transactional ASM rewrites with frame/max recomputation. In the Bytecode or Debug TUI, `+` inserts at the highlighted BCI (`after:` selects insertion after it), `-` deletes it, and `~` replaces it. CLI patch files combine multiple edits into one class redefinition; managed breakpoints are relocated to the emitted BCIs. Existing active frames may finish their obsolete method body, while new invocations use the replacement.
 
 ## Debugging
 
@@ -199,6 +206,12 @@ debugger step <paused-index>
 debugger step-out <paused-index>
 debugger continue <paused-index>
 ```
+
+The TUI `frames` view exposes every captured call-stack frame with its method descriptor
+and BCI. `Enter` opens that frame in Debug, `B` opens Bytecode, and `S` decompiles the
+frame. The selected frame's execution point is marked with a yellow `>` in Bytecode and
+Decompile; press `G` in Frames, Bytecode, Debug, or Decompile to select and centre it.
+Native frames report BCI `-1` and have no Java bytecode, so select a Java caller instead.
 
 Method events also cover methods without Java bytecode:
 
@@ -291,7 +304,7 @@ try (JvmRtdpClient client = JvmRtdpClient.open();
 }
 ```
 
-The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, direct JNI/JVMTI access, and `session.instrumentation()` for source/JAR deployment, hooks, transformers, retransformation, and redefinition. See the [Java Library Guide](docs/LIBRARY.md).
+The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, direct JNI/JVMTI access, and `session.instrumentation()` for source/JAR deployment, hooks, transformers, transactional ASM bytecode patches, retransformation, and redefinition. See the [Java Library Guide](docs/LIBRARY.md).
 
 ## Safety and Behavior
 

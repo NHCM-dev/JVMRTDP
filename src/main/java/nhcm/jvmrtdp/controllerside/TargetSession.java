@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.controllerside;
 
+import nhcm.jvmrtdp.api.JvmInstrumentation;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
@@ -14,6 +15,7 @@ public class TargetSession implements AutoCloseable {
     private final ServerHandle server;
     private final RemoteJNIEnv jni;
     private final RemoteJVMTIEnv jvmti;
+    private final JvmInstrumentation instrumentation;
     private final PrintStream baseOutput;
     private PrintStream output;
     private PrintStream error;
@@ -28,6 +30,7 @@ public class TargetSession implements AutoCloseable {
         this.server = Objects.requireNonNull(server, "server");
         this.jni = server.javaVM().jniEnv();
         this.jvmti = server.javaVM().jvmtiEnv();
+        this.instrumentation = new JvmInstrumentation(jvmti);
         this.baseOutput = Objects.requireNonNull(output, "output");
         this.output = this.baseOutput;
         this.error = Objects.requireNonNull(error, "error");
@@ -48,6 +51,9 @@ public class TargetSession implements AutoCloseable {
     public RemoteJVMTIEnv jvmti() {
         return jvmti;
     }
+
+    /** Shared instrumentation state used by CLI, TUI, and the Java Library facade. */
+    public JvmInstrumentation instrumentation() { return instrumentation; }
 
     public RemoteClass findClass(String className) {
         return jni.findClass(className);

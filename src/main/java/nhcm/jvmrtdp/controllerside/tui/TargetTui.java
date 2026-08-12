@@ -8,6 +8,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
+import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatch;
+import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.controllerside.RemoteArgumentList;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
@@ -257,7 +259,9 @@ public final class TargetTui implements AutoCloseable {
             return TuiResult.BACK;
         }
         if (handleInspectorNavigation(key)) return null;
-        if (key == TuiKey.LEFT && horizontallyScrollable()) moveHorizontal(-8);
+        if (key == TuiKey.CTRL_LEFT) changeTab(-1);
+        else if (key == TuiKey.CTRL_RIGHT) changeTab(1);
+        else if (key == TuiKey.LEFT && horizontallyScrollable()) moveHorizontal(-8);
         else if (key == TuiKey.RIGHT && horizontallyScrollable()) moveHorizontal(8);
         else if (key == TuiKey.LEFT) changeTab(-1);
         else if (key == TuiKey.RIGHT || key == TuiKey.TAB) changeTab(1);
@@ -299,6 +303,9 @@ public final class TargetTui implements AutoCloseable {
             else if (tab == Tab.BROWSE) requestBrowserClassSource();
             else requestSource(true);
         }
+        else if ((key == 'b' || key == 'B') && tab == Tab.FRAMES) {
+            openSelectedDebuggerFrame(Tab.BYTECODE);
+        }
         else if (key == 'b' || key == 'B') requestSelectedBytecode(Tab.BYTECODE);
         else if (key == 'v' || key == 'V') tab = Tab.CONTEXT;
         else if (key == 'd' || key == 'D') dumpContextClass();
@@ -328,6 +335,9 @@ public final class TargetTui implements AutoCloseable {
         else if (key == TuiKey.CTRL_E && tab == Tab.METHODS) toggleMethodEventBreakpoint(true);
         else if (key == TuiKey.CTRL_X && tab == Tab.METHODS) toggleMethodEventBreakpoint(false);
         else if (key == TuiKey.CTRL_X && tab == Tab.DEBUG) toggleExceptionBreakpoint();
+        else if (key == '+' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) insertBytecode();
+        else if (key == '-' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) deleteBytecode();
+        else if (key == '~' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) replaceBytecode();
         return null;
     }
 
@@ -724,7 +734,7 @@ public final class TargetTui implements AutoCloseable {
         else if (tab == Tab.FIELDS) readSelectedField();
         else if (tab == Tab.METHODS) requestSelectedBytecode(Tab.BYTECODE);
         else if (tab == Tab.SOURCE) jumpSourceLineToBytecode();
-        else if (tab == Tab.FRAMES) openSelectedDebuggerFrame();
+        else if (tab == Tab.FRAMES) openSelectedDebuggerFrame(Tab.DEBUG);
         else if (tab == Tab.LOCALS) selectLocalAsContext();
         else if (tab == Tab.BREAKPOINTS) openSelectedBreakpoint();
         else if (tab == Tab.THREADS) selectOrPauseThread();
@@ -811,15 +821,15 @@ public final class TargetTui implements AutoCloseable {
         if (!liveSampleAvailable && !tasks.busy()) requestDebuggerRefresh();
     }
 
-    private void openSelectedDebuggerFrame() {
+    private void openSelectedDebuggerFrame(Tab destination) {
         boolean paused = debuggerState != null && debuggerState.paused();
         if ((!paused && !liveSampleAvailable) || debuggerFrames.isEmpty()) {
             status = "Pause a Java thread or enable live follow, then select a stack frame.";
             return;
         }
-        debuggerFrameDepth = clamp(selections[Tab.FRAMES.ordinal()], 0,
-                debuggerFrames.size() - 1);
-        final JvmStackFrame selected = debuggerFrames.get(debuggerFrameDepth);
+        final JvmStackFrame selected = debuggerFrames.get(clamp(
+                selections[Tab.FRAMES.ordinal()], 0, debuggerFrames.size() - 1));
+        selectDebuggerFrame(selected);
         if (!selected.hasJavaLocation()) {
             status = "Frame #" + selected.depth()
                     + " is native and has no Java bytecode/BCI; select a Java caller below it.";
@@ -829,7 +839,7 @@ public final class TargetTui implements AutoCloseable {
             liveFollowFrameDepth = selected.depth();
             pendingBytecodeLocation = (int) selected.location();
             requestBytecode(selected.className(), selected.methodName(),
-                    selected.descriptor(), Tab.DEBUG);
+                    selected.descriptor(), destination);
             status = "Following frame #" + selected.depth()
                     + "; its bytecode and locals refresh on the next live sample";
             return;
@@ -847,14 +857,37 @@ public final class TargetTui implements AutoCloseable {
                         }
                         pendingBytecodeLocation = (int) current.location();
                         requestBytecode(current.className(), current.methodName(),
-                                current.descriptor(), Tab.DEBUG);
+                                current.descriptor(), destination);
                     }
                 });
     }
 
     private JvmStackFrame viewedDebuggerFrame() {
         if (debuggerFrames.isEmpty()) return null;
+        for (JvmStackFrame frame : debuggerFrames) {
+            if (frame.depth() == debuggerFrameDepth) return frame;
+        }
         return debuggerFrames.get(clamp(debuggerFrameDepth, 0, debuggerFrames.size() - 1));
+    }
+
+    private JvmStackFrame viewedOrSelectedDebuggerFrame() {
+        if (debuggerFrames.isEmpty()) return null;
+        if (tab == Tab.FRAMES) {
+            return debuggerFrames.get(clamp(selections[Tab.FRAMES.ordinal()],
+                    0, debuggerFrames.size() - 1));
+        }
+        return viewedDebuggerFrame();
+    }
+
+    private void selectDebuggerFrame(JvmStackFrame frame) {
+        if (frame == null) return;
+        debuggerFrameDepth = frame.depth();
+        for (int index = 0; index < debuggerFrames.size(); index++) {
+            if (debuggerFrames.get(index).depth() == frame.depth()) {
+                selections[Tab.FRAMES.ordinal()] = index;
+                return;
+            }
+        }
     }
 
     private void selectLocalAsContext() {
@@ -1140,6 +1173,16 @@ public final class TargetTui implements AutoCloseable {
             }
             methodName = "";
             descriptor = "";
+        } else if ((tab == Tab.FRAMES || tab == Tab.LOCALS) && viewedOrSelectedDebuggerFrame() != null) {
+            JvmStackFrame frame = viewedOrSelectedDebuggerFrame();
+            if (frame == null || !frame.hasJavaLocation()) {
+                status = "The selected native frame has no Java bytecode to decompile.";
+                return;
+            }
+            selectDebuggerFrame(frame);
+            type = session.findClass(frame.className());
+            methodName = frame.methodName();
+            descriptor = frame.descriptor();
         } else if (((tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty())
                 || (tab == Tab.SOURCE && !sourceMethod.isEmpty())) {
             boolean sourceSelection = tab == Tab.SOURCE;
@@ -1214,16 +1257,58 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void alignSourceWithDebugger() {
-        if (debuggerState == null || !debuggerState.paused()
-                || !sourceClass.equals(debuggerState.className())
-                || !sourceMethod.equals(debuggerState.methodName())
-                || !sourceDescriptor.equals(debuggerState.descriptor())) return;
-        Map.Entry<Integer, Integer> mapping = sourceBciToLine.floorEntry((int) debuggerState.location());
-        if (mapping == null) mapping = sourceBciToLine.ceilingEntry((int) debuggerState.location());
-        if (mapping != null) {
-            selections[Tab.SOURCE.ordinal()] = clamp(mapping.getValue() - 1,
-                    0, Math.max(0, sourceLines.size() - 1));
+        int line = sourceExecutionLine();
+        if (line < 0) return;
+        selections[Tab.SOURCE.ordinal()] = clamp(line,
+                0, Math.max(0, sourceLines.size() - 1));
+        scrolls[Tab.SOURCE.ordinal()] = Math.max(0,
+                line - Math.max(1, screen.height() / 3));
+    }
+
+    /** Returns the 0-based decompiled source row for the currently viewed stack frame. */
+    private int sourceExecutionLine() {
+        long location = executionLocationForMethod(
+                sourceClass, sourceMethod, sourceDescriptor);
+        if (location == Long.MIN_VALUE || location < 0 || sourceBciToLine.isEmpty()) return -1;
+        Map.Entry<Integer, Integer> mapping = sourceBciToLine.floorEntry((int) location);
+        if (mapping == null) mapping = sourceBciToLine.ceilingEntry((int) location);
+        return mapping == null ? -1 : mapping.getValue() - 1;
+    }
+
+    private long executionLocationForMethod(
+            String className, String methodName, String descriptor) {
+        if (className == null || methodName == null || descriptor == null
+                || methodName.isEmpty()) return Long.MIN_VALUE;
+        JvmStackFrame frame = executionFrameForMethod(className, methodName, descriptor);
+        if (frame != null) return frame.location();
+        if (debuggerState != null && debuggerState.paused()
+                && className.equals(debuggerState.className())
+                && methodName.equals(debuggerState.methodName())
+                && descriptor.equals(debuggerState.descriptor())) {
+            return debuggerState.location();
         }
+        return Long.MIN_VALUE;
+    }
+
+    private JvmStackFrame executionFrameForMethod(
+            String className, String methodName, String descriptor) {
+        boolean readable = debuggerState != null && debuggerState.paused() || liveSampleAvailable;
+        if (!readable) return null;
+        JvmStackFrame viewed = viewedDebuggerFrame();
+        if (matchesFrameMethod(viewed, className, methodName, descriptor)) return viewed;
+        // A method can appear more than once through recursion. Prefer the explicitly
+        // selected frame above; otherwise use the first (youngest) matching frame.
+        for (JvmStackFrame frame : debuggerFrames) {
+            if (matchesFrameMethod(frame, className, methodName, descriptor)) return frame;
+        }
+        return null;
+    }
+
+    private static boolean matchesFrameMethod(JvmStackFrame frame,
+            String className, String methodName, String descriptor) {
+        return frame != null && className.equals(frame.className())
+                && methodName.equals(frame.methodName())
+                && descriptor.equals(frame.descriptor());
     }
 
     private void requestSelectedBytecode(Tab destination) {
@@ -1282,18 +1367,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void alignDebuggerLocation(Tab destination) {
-        if (debuggerState == null || !debuggerState.paused() || bytecode == null
-                || !bytecodeClass.equals(debuggerState.className())
-                || !bytecodeMethod.equals(debuggerState.methodName())
-                || !bytecodeDescriptor.equals(debuggerState.descriptor())) return;
-        List<BytecodeInstruction> instructions = bytecode.instructions();
-        for (int index = 0; index < instructions.size(); index++) {
-            if (instructions.get(index).offset() == debuggerState.location()) {
-                selections[destination.ordinal()] = index;
-                scrolls[destination.ordinal()] = Math.max(0, index - Math.max(1, screen.height() / 3));
-                return;
-            }
-        }
+        if (bytecode == null) return;
+        long location = executionLocationForMethod(
+                bytecodeClass, bytecodeMethod, bytecodeDescriptor);
+        if (location >= 0) alignBytecodeLocation(destination, location);
     }
 
     private void alignBytecodeLocation(Tab destination, long location) {
@@ -2163,41 +2240,82 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void jumpToCurrentExecution() {
-        if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
+        final Tab origin = tab;
+        if (origin == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
         if ((debuggerState == null || !debuggerState.paused()) && !liveSampleAvailable) {
             status = "No current BCI is available. Pause a thread, or enable F4 live follow.";
             requestDebuggerRefresh();
             return;
         }
-        tab = Tab.DEBUG;
         final boolean sampled = debuggerState == null || !debuggerState.paused();
-        final JvmStackFrame sampledTop = sampled ? actualExecutionFrame() : null;
-        if (sampled && sampledTop == null) {
+        final JvmStackFrame frame = executionFrameForJump(origin);
+        if (frame == null) {
             requestDebuggerRefresh();
-            status = "Loading the live thread's current frame...";
+            status = "Loading the selected thread's current stack frames...";
             return;
         }
-        final String className = sampled && sampledTop != null
-                ? sampledTop.className() : debuggerState.className();
-        final String methodName = sampled && sampledTop != null
-                ? sampledTop.methodName() : debuggerState.methodName();
-        final String descriptor = sampled && sampledTop != null
-                ? sampledTop.descriptor() : debuggerState.descriptor();
-        final long location = sampled && sampledTop != null
-                ? sampledTop.location() : debuggerState.location();
+        selectDebuggerFrame(frame);
+        final String className = frame.className();
+        final String methodName = frame.methodName();
+        final String descriptor = frame.descriptor();
+        final long location = frame.location();
         if (location < 0) {
             tab = Tab.FRAMES;
-            status = "The actual top frame is native (BCI -1); no current Java BCI exists.";
-        } else if (bytecode != null && bytecodeClass.equals(className)
+            status = "Frame #" + frame.depth()
+                    + " is native (BCI -1); select a Java caller and press G, B, S, or Enter.";
+            return;
+        }
+        if (origin == Tab.SOURCE) {
+            if (sourceClass.equals(className) && sourceMethod.equals(methodName)
+                    && sourceDescriptor.equals(descriptor)) {
+                int line = sourceExecutionLine();
+                if (line < 0) {
+                    status = "Current frame BCI " + location
+                            + " has no decompiled-line mapping; use B/Enter for exact bytecode.";
+                } else {
+                    alignSourceWithDebugger();
+                    status = (sampled ? "Sampled" : "Current") + " frame #" + frame.depth()
+                            + " BCI " + location + " is highlighted at decompiled line " + (line + 1);
+                }
+                return;
+            }
+            startDecompile(session.findClass(className), methodName, descriptor);
+            status = "Decompiling frame #" + frame.depth() + " at BCI " + location + "...";
+            return;
+        }
+        Tab destination = origin == Tab.BYTECODE ? Tab.BYTECODE : Tab.DEBUG;
+        tab = destination;
+        if (bytecode != null && bytecodeClass.equals(className)
                 && bytecodeMethod.equals(methodName)
                 && bytecodeDescriptor.equals(descriptor)) {
-            alignBytecodeLocation(Tab.DEBUG, location);
+            alignBytecodeLocation(destination, location);
             status = (sampled ? "Last live sample" : "Current execution")
-                    + " BCI " + location + " is selected and highlighted";
+                    + " frame #" + frame.depth() + " BCI " + location
+                    + " is selected and highlighted";
         } else {
             pendingBytecodeLocation = (int) location;
-            requestBytecode(className, methodName, descriptor, Tab.DEBUG);
+            requestBytecode(className, methodName, descriptor, destination);
         }
+    }
+
+    private JvmStackFrame executionFrameForJump(Tab origin) {
+        if (debuggerFrames.isEmpty()) return null;
+        if (origin == Tab.FRAMES) {
+            return debuggerFrames.get(clamp(selections[Tab.FRAMES.ordinal()],
+                    0, debuggerFrames.size() - 1));
+        }
+        if (origin == Tab.SOURCE && !sourceMethod.isEmpty()) {
+            JvmStackFrame sourceFrame = executionFrameForMethod(
+                    sourceClass, sourceMethod, sourceDescriptor);
+            if (sourceFrame != null) return sourceFrame;
+        }
+        if ((origin == Tab.BYTECODE || origin == Tab.DEBUG) && !bytecodeMethod.isEmpty()) {
+            JvmStackFrame bytecodeFrame = executionFrameForMethod(
+                    bytecodeClass, bytecodeMethod, bytecodeDescriptor);
+            if (bytecodeFrame != null) return bytecodeFrame;
+        }
+        JvmStackFrame viewed = viewedDebuggerFrame();
+        return viewed == null ? actualExecutionFrame() : viewed;
     }
 
     private JvmStackFrame actualExecutionFrame() {
@@ -2208,19 +2326,8 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private long currentExecutionLocationForBytecode() {
-        if (debuggerState != null && debuggerState.paused()
-                && bytecodeClass.equals(debuggerState.className())
-                && bytecodeMethod.equals(debuggerState.methodName())
-                && bytecodeDescriptor.equals(debuggerState.descriptor())) {
-            return debuggerState.location();
-        }
-        if (liveSampleAvailable) {
-            JvmStackFrame frame = actualExecutionFrame();
-            if (frame != null && bytecodeClass.equals(frame.className())
-                    && bytecodeMethod.equals(frame.methodName())
-                    && bytecodeDescriptor.equals(frame.descriptor())) return frame.location();
-        }
-        return Long.MIN_VALUE;
+        return executionLocationForMethod(
+                bytecodeClass, bytecodeMethod, bytecodeDescriptor);
     }
 
     private void closeDebuggerStates() {
@@ -2258,6 +2365,80 @@ public final class TargetTui implements AutoCloseable {
                 bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset(), instruction.sourceLine());
         toggleBreakpointSpec(spec, instruction.mnemonic().startsWith("invoke") ? " before invoke" : "",
                 receiverOnly);
+    }
+
+    private void insertBytecode() throws IOException {
+        final BytecodeInstruction instruction = selectedBytecodeForEdit();
+        if (instruction == null) return;
+        String entered = editText("Insert ASM before BCI " + instruction.offset()
+                + " ('after: ' prefix inserts after; separate instructions with ;;)", "");
+        if (entered == null || entered.trim().isEmpty()) return;
+        final boolean after = entered.trim().toLowerCase(Locale.ROOT).startsWith("after:");
+        final String assembly = after ? entered.trim().substring("after:".length()).trim() : entered.trim();
+        if (assembly.isEmpty()) { status = "Assembly must not be empty."; return; }
+        JvmBytecodePatch.Builder builder = JvmBytecodePatch.builder(bytecodeClass);
+        if (after) builder.insertAfter(bytecodeMethod, bytecodeDescriptor,
+                instruction.offset(), assembly);
+        else builder.insertBefore(bytecodeMethod, bytecodeDescriptor,
+                instruction.offset(), assembly);
+        applyBytecodeEdit(after ? "Inserting bytecode after BCI " : "Inserting bytecode before BCI ",
+                instruction.offset(), builder.build());
+    }
+
+    private void replaceBytecode() throws IOException {
+        final BytecodeInstruction instruction = selectedBytecodeForEdit();
+        if (instruction == null) return;
+        final String assembly = editText("Replace BCI " + instruction.offset()
+                + " with ASM (separate instructions with ;;)", "");
+        if (assembly == null || assembly.trim().isEmpty()) return;
+        JvmBytecodePatch patch = JvmBytecodePatch.builder(bytecodeClass)
+                .replace(bytecodeMethod, bytecodeDescriptor,
+                        instruction.offset(), assembly.trim()).build();
+        applyBytecodeEdit("Replacing bytecode at BCI ", instruction.offset(), patch);
+    }
+
+    private void deleteBytecode() throws IOException {
+        final BytecodeInstruction instruction = selectedBytecodeForEdit();
+        if (instruction == null) return;
+        String confirmation = editText("Delete BCI " + instruction.offset() + " "
+                + instruction.mnemonic() + "? Type yes", "");
+        if (!"yes".equalsIgnoreCase(confirmation == null ? "" : confirmation.trim())) {
+            status = "Bytecode deletion cancelled.";
+            return;
+        }
+        JvmBytecodePatch patch = JvmBytecodePatch.builder(bytecodeClass)
+                .delete(bytecodeMethod, bytecodeDescriptor, instruction.offset()).build();
+        applyBytecodeEdit("Deleting bytecode at BCI ", instruction.offset(), patch);
+    }
+
+    private BytecodeInstruction selectedBytecodeForEdit() {
+        if (bytecode == null || bytecode.instructions().isEmpty()
+                || bytecodeClass.isEmpty() || bytecodeMethod.isEmpty()) {
+            status = "Load a Java bytecode method before editing it.";
+            return null;
+        }
+        return bytecode.instructions().get(bytecodeCursor());
+    }
+
+    private void applyBytecodeEdit(String activity, final int oldBci,
+            final JvmBytecodePatch patch) {
+        final String className = bytecodeClass;
+        final String methodName = bytecodeMethod;
+        final String descriptor = bytecodeDescriptor;
+        final Tab destination = tab;
+        submit(activity + oldBci + "...", new Callable<JvmBytecodePatchResult>() {
+            @Override public JvmBytecodePatchResult call() {
+                return session.instrumentation().bytecode().apply(patch);
+            }
+        }, new Consumer<JvmBytecodePatchResult>() {
+            @Override public void accept(JvmBytecodePatchResult result) {
+                Long relocated = result.relocatedBci(methodName, descriptor, oldBci);
+                pendingBytecodeLocation = relocated == null ? oldBci : relocated.intValue();
+                synchronizeManagedControls();
+                status = result + "; reloading live bytecode...";
+                requestBytecode(className, methodName, descriptor, destination);
+            }
+        });
     }
 
     private void toggleMethodEntryBreakpoint(boolean receiverOnly) {
@@ -3182,6 +3363,7 @@ public final class TargetTui implements AutoCloseable {
 
     private void renderSource(List<String> output, int width, int bodyRows) {
         int cursor = clamp(selections[Tab.SOURCE.ordinal()], 0, Math.max(0, sourceLines.size() - 1));
+        int executionLine = sourceExecutionLine();
         int vertical = clamp(scrolls[Tab.SOURCE.ordinal()], 0, Math.max(0, sourceLines.size() - 1));
         if (cursor < vertical) vertical = cursor;
         if (cursor >= vertical + bodyRows) vertical = cursor - bodyRows + 1;
@@ -3192,13 +3374,17 @@ public final class TargetTui implements AutoCloseable {
         int horizontal = horizontalOffsets[Tab.SOURCE.ordinal()];
         for (int row = 0; row < bodyRows; row++) {
             int index = vertical + row;
-            String gutter = index < sourceLines.size() ? String.format("%" + digits + "d ", index + 1) : "";
+            boolean executing = index == executionLine && index < sourceLines.size();
+            String gutter = index < sourceLines.size()
+                    ? String.format("%s%" + digits + "d ", executing ? ">" : " ", index + 1) : "";
             String source = index < sourceLines.size()
                     ? TuiViewport.horizontal(sourceLines.get(index), horizontal, contentWidth) : "";
             String line = TerminalScreen.DIM + TerminalScreen.pad(gutter, gutterWidth) + TerminalScreen.RESET;
             if (contentWidth > 0) line += " " + TerminalScreen.pad(source, contentWidth);
-            if (index == cursor && index < sourceLines.size()) {
-                line = TerminalScreen.REVERSE + line + TerminalScreen.RESET;
+            if (index < sourceLines.size() && (executing || index == cursor)) {
+                String style = (executing ? TerminalScreen.BOLD + TerminalScreen.YELLOW : "")
+                        + (index == cursor ? TerminalScreen.REVERSE : "");
+                line = style + line + TerminalScreen.RESET;
             }
             output.add(line);
         }
@@ -3225,7 +3411,8 @@ public final class TargetTui implements AutoCloseable {
             for (RemoteMethod method : visibleMethods()) result.add(methodLabel(method));
         } else if (tab == Tab.FRAMES) {
             for (JvmStackFrame frame : debuggerFrames) {
-                result.add((frame.depth() == debuggerFrameDepth ? "> " : "  ") + frame.display());
+                result.add((frame.depth() == debuggerFrameDepth ? ">" : " ")
+                        + (frame.depth() == 0 ? "@ " : "  ") + frame.display());
             }
         } else if (tab == Tab.LOCALS) {
             for (JvmDebuggerLocal local : debuggerLocals) result.add(localLabel(local));
@@ -3398,6 +3585,7 @@ public final class TargetTui implements AutoCloseable {
             }
         } else if (tab == Tab.FRAMES) {
             result.add("STACK FRAMES (" + debuggerFrames.size() + ")");
+            result.add("@ = actual suspension/sample point; > = selected inspection frame");
             if ((debuggerState == null || !debuggerState.paused()) && !liveSampleAvailable) {
                 result.add("No paused thread or live-follow sample is available.");
             } else if (debuggerFrames.isEmpty()) {
@@ -3426,6 +3614,9 @@ public final class TargetTui implements AutoCloseable {
                 result.add("");
                 result.add("SHORTCUTS");
                 addKeyHelp(result, "Enter", "Open this frame's bytecode and BCI");
+                addKeyHelp(result, "B", "Open this frame in Bytecode at its BCI");
+                addKeyHelp(result, "S", "Decompile this frame and highlight its BCI line");
+                addKeyHelp(result, "G", "Jump to this frame's current execution point");
                 addKeyHelp(result, "M", "Read locals for this paused/live-sampled frame");
                 addKeyHelp(result, "F9", "Set a persistent breakpoint after opening bytecode");
                 addKeyHelp(result, "T", "Return to all JVM threads");
@@ -3625,6 +3816,10 @@ public final class TargetTui implements AutoCloseable {
                 + " maxLocals=" + bytecode.maxLocals());
         if (bytecode != null) result.add("implementation=" + bytecode.implementationKind()
                 + (bytecode.isNative() || bytecode.isAbstract() ? " (no Code attribute)" : ""));
+        if (bytecode != null && !bytecode.instructions().isEmpty()) {
+            result.add("EDIT: + insert, - delete, ~ replace highlighted BCI");
+            result.add("Insert accepts 'after: ASM'; separate instructions with ;;");
+        }
         result.add("");
         result.add("DEBUGGER");
         result.add("ANALYSIS FREEZE: " + (session.debugger().active()
@@ -3843,16 +4038,19 @@ public final class TargetTui implements AutoCloseable {
                 "F9 Break", "Shift+F9 Object Break", "Ctrl+E Entry Event", "Ctrl+X Exit Event",
                 "S Method Decompile", "A Class Decompile");
         else if (tab == Tab.SOURCE) Collections.addAll(result,
-                "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break", "Shift+F9 Object Break",
+                "G Current Frame", "Enter Bytecode", "/ Search", "n/N Match", "g Line", "F9 Break", "Shift+F9 Object Break",
                 "A Class Decompile", "O Export");
         else if (tab == Tab.BYTECODE) Collections.addAll(result,
-                "/ Search", "n/N Match", "g BCI/Line", "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
+                "G Current Frame", "/ Search", "n/N Match", "g BCI/Line", "+ Insert ASM", "- Delete ASM", "~ Replace ASM",
+                "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
                 "A Class Decompile", "I Info");
         else if (tab == Tab.DEBUG) Collections.addAll(result,
-                "T Threads", "G Current", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
+                "T Threads", "G Current", "+ Insert ASM", "- Delete ASM", "~ Replace ASM",
+                "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
                 "/ Search", "S Method Decompile", "A Class Decompile", "I Info");
         else if (tab == Tab.FRAMES) Collections.addAll(result,
-                "Enter Open Frame", "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
+                "Enter Debug Frame", "B Frame Bytecode", "S Frame Decompile", "G Frame BCI",
+                "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
         else if (tab == Tab.LOCALS) Collections.addAll(result,
                 "Enter To Context", "= Set Paused Local", "G Current BCI", "T Threads", "F4 Live Follow", "F5 Refresh");
         else if (tab == Tab.BREAKPOINTS) Collections.addAll(result,
@@ -3863,7 +4061,7 @@ public final class TargetTui implements AutoCloseable {
         else Collections.addAll(result, "= Set Source", "A Class Decompile", "Backspace Context", "D Dump", "O Export");
         Collections.addAll(result, "Up/Down Move", "PgUp/PgDn Page", "Home/End Edge",
                 horizontallyScrollable() ? "Left/Right Scroll" : "Left/Right Tab",
-                "Tab View", "Enter Open", "F2 CLI", "Q Back");
+                "Tab/Shift+Tab View", "Ctrl+Left/Right Tab", "Enter Open", "F2 CLI", "Q Back");
         return result;
     }
 

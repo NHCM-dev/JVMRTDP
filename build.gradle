@@ -26,6 +26,8 @@ repositories {
 dependencies {
     implementation 'org.jline:jline:3.30.0'
     runtimeOnly 'org.jline:jline-terminal-jni:3.30.0'
+    api 'org.ow2.asm:asm-tree:9.9.1'
+    implementation 'org.ow2.asm:asm-util:9.9.1'
     testImplementation platform('org.junit:junit-bom:5.12.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
@@ -315,13 +317,15 @@ publishing {
             }
             pom.withXml {
                 def dependenciesNode = asNode().appendNode('dependencies')
-                [['org.jline', 'jline', '3.30.0'],
-                 ['org.jline', 'jline-terminal-jni', '3.30.0']].each { coordinates ->
+                [['org.jline', 'jline', '3.30.0', 'runtime'],
+                 ['org.jline', 'jline-terminal-jni', '3.30.0', 'runtime'],
+                 ['org.ow2.asm', 'asm-tree', '9.9.1', 'compile'],
+                 ['org.ow2.asm', 'asm-util', '9.9.1', 'runtime']].each { coordinates ->
                     def dependencyNode = dependenciesNode.appendNode('dependency')
                     dependencyNode.appendNode('groupId', coordinates[0])
                     dependencyNode.appendNode('artifactId', coordinates[1])
                     dependencyNode.appendNode('version', coordinates[2])
-                    dependencyNode.appendNode('scope', 'runtime')
+                    dependencyNode.appendNode('scope', coordinates[3])
                 }
             }
         }

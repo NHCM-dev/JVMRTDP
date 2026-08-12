@@ -44,6 +44,8 @@ import nhcm.jvmrtdp.api.jvmti.JvmBreakpointCondition;
 import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
+import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatch;
+import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -1521,13 +1523,79 @@ public class InteractiveCli {
 
     private static class BytecodeCommand extends ShellCommand<TargetSession> {
         private BytecodeCommand() {
-            super("bytecode", "bytecode [class] <method> <descriptor> [--out file]",
-                    "Disassembles a method with BCI, source lines and resolved constant-pool operands.",
+            super("bytecode", "bytecode [class] <method> <descriptor> [--out file] | "
+                            + "bytecode <insert-before|insert-after|replace> <class> <method> <descriptor> <bci> <assembly> | "
+                            + "bytecode delete <class> <method> <descriptor> <from-bci> [to-bci] | "
+                            + "bytecode <returns-insert|returns-replace> <class> <method> <descriptor> <assembly> | "
+                            + "bytecode intercept-return <class> <method> <descriptor> <hook-class> <hook-method> | "
+                            + "bytecode patch-file <class> <file> [--preview] [--out class-file] | "
+                            + "bytecode <undo|redo> <class>",
+                    "Disassembles or transactionally edits live bytecode with ASM; use ';;' between instructions.",
                     "disasm", "bc");
         }
 
         @Override
         public boolean execute(TargetSession session, List<String> arguments) throws IOException {
+            if (!arguments.isEmpty()) {
+                String action = arguments.get(0).toLowerCase(Locale.ROOT);
+                if ("insert-before".equals(action) || "insert-after".equals(action)
+                        || "replace".equals(action)) {
+                    if (arguments.size() == 6) {
+                        JvmBytecodePatch.Builder patch = JvmBytecodePatch.builder(arguments.get(1));
+                        int bci = integer(arguments.get(4), "BCI");
+                        if ("insert-before".equals(action)) patch.insertBefore(
+                                arguments.get(2), arguments.get(3), bci, arguments.get(5));
+                        else if ("insert-after".equals(action)) patch.insertAfter(
+                                arguments.get(2), arguments.get(3), bci, arguments.get(5));
+                        else patch.replace(arguments.get(2), arguments.get(3), bci, arguments.get(5));
+                        printPatchResult(session, session.instrumentation().bytecode().apply(patch.build()));
+                        return true;
+                    }
+                    if (arguments.size() > 3) return InteractiveCli.usage(session, this);
+                }
+                if ("delete".equals(action)) {
+                    if (arguments.size() == 5 || arguments.size() == 6) {
+                        int from = integer(arguments.get(4), "from BCI");
+                        int to = arguments.size() == 6 ? integer(arguments.get(5), "to BCI") : from;
+                        JvmBytecodePatch patch = JvmBytecodePatch.builder(arguments.get(1))
+                                .delete(arguments.get(2), arguments.get(3), from, to).build();
+                        printPatchResult(session, session.instrumentation().bytecode().apply(patch));
+                        return true;
+                    }
+                    if (arguments.size() > 3) return InteractiveCli.usage(session, this);
+                }
+                if ("returns-insert".equals(action) || "returns-replace".equals(action)) {
+                    if (arguments.size() == 5) {
+                        JvmBytecodePatch.Builder patch = JvmBytecodePatch.builder(arguments.get(1));
+                        if ("returns-insert".equals(action)) patch.insertBeforeReturns(
+                                arguments.get(2), arguments.get(3), arguments.get(4));
+                        else patch.replaceReturns(arguments.get(2), arguments.get(3), arguments.get(4));
+                        printPatchResult(session, session.instrumentation().bytecode().apply(patch.build()));
+                        return true;
+                    }
+                    if (arguments.size() > 3) return InteractiveCli.usage(session, this);
+                }
+                if ("intercept-return".equals(action)) {
+                    if (arguments.size() == 6) {
+                        printPatchResult(session, session.instrumentation().bytecode().interceptReturns(
+                                arguments.get(1), arguments.get(2), arguments.get(3),
+                                arguments.get(4), arguments.get(5)));
+                        return true;
+                    }
+                    if (arguments.size() > 3) return InteractiveCli.usage(session, this);
+                }
+                if ("undo".equals(action) || "redo".equals(action)) {
+                    if (arguments.size() == 2 && !arguments.get(1).startsWith("(")) {
+                        if ("undo".equals(action)) session.instrumentation().bytecode().undo(arguments.get(1));
+                        else session.instrumentation().bytecode().redo(arguments.get(1));
+                        session.output().println(action + " installed for " + arguments.get(1));
+                        return true;
+                    }
+                }
+                if ("patch-file".equals(action) && arguments.size() >= 3) {
+                    return applyPatchFile(session, arguments);
+                }
+            }
             ParsedAnalysisOptions options = ParsedAnalysisOptions.parse(arguments);
             RemoteClass type;
             String name;
@@ -1547,6 +1615,89 @@ public class InteractiveCli {
                     method.maxStack(), method.maxLocals(), method.disassembly());
             outputAnalysis(session, text, options.output);
             return true;
+        }
+
+        private boolean applyPatchFile(TargetSession session, List<String> arguments)
+                throws IOException {
+            if (arguments.size() < 3) return InteractiveCli.usage(session, this);
+            boolean preview = false;
+            Path output = null;
+            for (int index = 3; index < arguments.size(); index++) {
+                String value = arguments.get(index);
+                if ("--preview".equalsIgnoreCase(value)) preview = true;
+                else if ("--out".equalsIgnoreCase(value) && index + 1 < arguments.size()) {
+                    output = Paths.get(arguments.get(++index));
+                } else return InteractiveCli.usage(session, this);
+            }
+            String className = arguments.get(1);
+            JvmBytecodePatch.Builder builder = JvmBytecodePatch.builder(className);
+            List<String> lines = Files.readAllLines(Paths.get(arguments.get(2)), StandardCharsets.UTF_8);
+            for (int lineNumber = 1; lineNumber <= lines.size(); lineNumber++) {
+                String line = lines.get(lineNumber - 1).trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] fields = splitPatchLine(line);
+                try { addPatchFileOperation(builder, fields); }
+                catch (RuntimeException failure) {
+                    throw new IllegalArgumentException("Patch file line " + lineNumber + ": "
+                            + failure.getMessage(), failure);
+                }
+            }
+            JvmBytecodePatch patch = builder.build();
+            JvmBytecodePatchResult result = preview
+                    ? session.instrumentation().bytecode().preview(patch)
+                    : session.instrumentation().bytecode().apply(patch);
+            if (output != null) {
+                Path absolute = output.toAbsolutePath().normalize();
+                Path parent = absolute.getParent();
+                if (parent != null) Files.createDirectories(parent);
+                Files.write(absolute, result.patchedBytes());
+                session.output().println("patched class bytes -> " + absolute);
+            }
+            printPatchResult(session, result);
+            return true;
+        }
+
+        private static String[] splitPatchLine(String line) {
+            int separator = line.indexOf('|');
+            String action = separator < 0 ? line
+                    : line.substring(0, separator).trim().toLowerCase(Locale.ROOT);
+            int limit = "returns-insert".equals(action) || "returns-replace".equals(action)
+                    ? 4 : 5;
+            return line.split("\\|", limit);
+        }
+
+        private static void addPatchFileOperation(JvmBytecodePatch.Builder builder, String[] fields) {
+            if (fields.length < 3) throw new IllegalArgumentException(
+                    "expected operation|method|descriptor|...");
+            String action = fields[0].trim().toLowerCase(Locale.ROOT);
+            String method = fields[1].trim();
+            String descriptor = fields[2].trim();
+            if ("insert-before".equals(action) || "insert-after".equals(action)
+                    || "replace".equals(action)) {
+                if (fields.length != 5) throw new IllegalArgumentException(
+                        action + " expects operation|method|descriptor|bci|assembly");
+                int bci = integer(fields[3].trim(), "BCI");
+                if ("insert-before".equals(action)) builder.insertBefore(method, descriptor, bci, fields[4]);
+                else if ("insert-after".equals(action)) builder.insertAfter(method, descriptor, bci, fields[4]);
+                else builder.replace(method, descriptor, bci, fields[4]);
+            } else if ("delete".equals(action)) {
+                if (fields.length != 4 && fields.length != 5) throw new IllegalArgumentException(
+                        "delete expects operation|method|descriptor|from-bci[|to-bci]");
+                int from = integer(fields[3].trim(), "from BCI");
+                builder.delete(method, descriptor, from,
+                        fields.length == 5 ? integer(fields[4].trim(), "to BCI") : from);
+            } else if ("returns-insert".equals(action) || "returns-replace".equals(action)) {
+                if (fields.length != 4) throw new IllegalArgumentException(
+                        action + " expects operation|method|descriptor|assembly");
+                if ("returns-insert".equals(action)) builder.insertBeforeReturns(method, descriptor, fields[3]);
+                else builder.replaceReturns(method, descriptor, fields[3]);
+            } else throw new IllegalArgumentException("unknown operation " + action);
+        }
+
+        private static void printPatchResult(TargetSession session, JvmBytecodePatchResult result) {
+            session.output().println(result);
+            if (result.installed()) session.output().println(
+                    "New invocations use the new bytecode; frames already executing may finish obsolete code.");
         }
     }
 

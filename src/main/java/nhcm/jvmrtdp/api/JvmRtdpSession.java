@@ -51,7 +51,7 @@ public final class JvmRtdpSession implements AutoCloseable {
         });
         this.target = new TargetSession(server, discard, discard);
         this.commands = new InteractiveCli(new ByteArrayInputStream(new byte[0]), discard, discard);
-        this.instrumentation = new JvmInstrumentation(target.jvmti());
+        this.instrumentation = target.instrumentation();
     }
 
     void setCloseListener(Runnable listener) {

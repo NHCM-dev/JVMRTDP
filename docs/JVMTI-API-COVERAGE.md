@@ -95,7 +95,7 @@ These interfaces require additional lifecycle, callback, and concurrency guarant
 
 ## Java Library API
 
-An attached `JvmRtdpSession` exposes typed low-level control through `session.jvmti()` and a high-level deployment/instrumentation facade through `session.instrumentation()`. Library code can query capabilities, inspect threads and locals, set bytecode/event breakpoints, force early returns, deploy handlers or transformers, and retransform/redefine classes without parsing CLI output.
+An attached `JvmRtdpSession` exposes typed low-level control through `session.jvmti()` and a high-level deployment/instrumentation facade through `session.instrumentation()`. Library code can query capabilities, inspect threads and locals, set bytecode/event breakpoints, force early returns, deploy handlers or transformers, transactionally edit bytecode with ASM, and retransform/redefine classes without parsing CLI output. Bytecode patches recompute frames/max and relocate managed breakpoints before the class resumes.
 
 ```java
 try (JvmRtdpClient client = JvmRtdpClient.open();

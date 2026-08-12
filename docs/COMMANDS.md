@@ -54,6 +54,8 @@ The footer lists actions available in the current view. CLI and TUI are two inte
 | `PgUp` / `PgDn` | Move by page |
 | `Home` / `End` | First or last item |
 | `Tab` | Switch views |
+| `Shift+Tab` / `Ctrl+Left` | Switch to the previous view, including horizontally scrollable views |
+| `Ctrl+Right` | Switch to the next view |
 | `Enter` | Open or run the default action |
 | `Backspace` | Return to the parent context or package |
 | `Left` / `Right` | Scroll horizontally |
@@ -92,13 +94,14 @@ Debugger keys:
 | `F6` | Pause the selected thread |
 | `F4` | Toggle live following while the target runs |
 | `T` | Open the thread list |
-| `G` | Select and centre the current execution BCI |
+| `G` | Select and centre the current stack frame's execution BCI or decompiled line |
 | `M` | Open locals |
 | `Z` | Open breakpoints |
 | `*` | Freeze or restore the analysis thread set |
 
-The paused or live-followed execution BCI is always marked with `>` and highlighted in yellow.
-Moving the list cursor does not remove this execution marker; press `G` to return the cursor to it.
+The paused or live-followed execution point is always marked with `>` and highlighted in yellow
+in Bytecode, Debug, and method-level Decompile views. Moving the cursor does not remove this
+marker; press `G` to return to the selected stack frame's BCI or mapped decompiled line.
 
 ## 4. Context and Stack
 
@@ -247,11 +250,43 @@ dumpclass package <name|.> <directory> [--recursive|--no-recursive] [--match glo
 decompile class [class] [--engine cfr|procyon] [--out <file>]
 decompile method [class] <method> <descriptor> [--engine cfr|procyon] [--out <file>]
 bytecode [class] <method> <descriptor> [--out <file>]
+bytecode <insert-before|insert-after|replace> <class> <method> <descriptor> <bci> <assembly>
+bytecode delete <class> <method> <descriptor> <from-bci> [to-bci]
+bytecode <returns-insert|returns-replace> <class> <method> <descriptor> <assembly>
+bytecode intercept-return <class> <method> <descriptor> <hook-class> <hook-method>
+bytecode patch-file <class> <file> [--preview] [--out <class-file>]
+bytecode <undo|redo> <class>
 ```
 
 Method decompilation identifies a method by name and full descriptor. Views support search, line/BCI navigation, breakpoints, and export.
 
 Native and abstract methods have no `Code` attribute. The method information panel reports `NATIVE`, `ABSTRACT`, or `BYTECODE` explicitly.
+
+Text assembly uses JVM mnemonic names and separates instructions with `;;` or a newline. Owners may use dotted or internal names. Jump targets use a locally declared `LABEL name` or an existing `@BCI` marker. Examples:
+
+```text
+bytecode insert-before com.example.Service value "()I" 0 "LDC \"entered\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V"
+bytecode replace com.example.Service value "()I" 8 "BIPUSH 42 ;; IRETURN"
+bytecode delete com.example.Service value "()I" 2 7
+bytecode returns-insert com.example.Service value "()I" "DUP ;; INVOKESTATIC example/Trace onInt (I)V"
+bytecode intercept-return com.example.Service value "()I" example.ReturnHooks onInt
+```
+
+`intercept-return` calls a visible static hook immediately before every normal return. A return type `T` requires hook descriptor `(T)T`; `void` requires `()V`. The returned hook value replaces the method result. Deploy the hook into a loader visible to the edited class, normally `SAME_LOADER`.
+
+For `returns-insert`, a non-void result is already on the operand stack and the snippet must leave an equivalent result there for the original return. `returns-replace` removes only the return opcode: the old result is still on the stack, so the replacement must consume it and execute a compatible return or throw. For example, replacing every `int` result with 42 uses `POP ;; BIPUSH 42 ;; IRETURN`.
+
+A patch file applies all rows as one class transaction:
+
+```text
+# operation|method|descriptor|arguments
+insert-before|value|()I|0|LDC "entered" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V
+replace|value|()I|8|BIPUSH 42 ;; IRETURN
+delete|other|()V|4|9
+returns-insert|compute|(J)J|DUP2 ;; INVOKESTATIC example/Trace onLong (J)V
+```
+
+`--preview` validates and emits bytes without installing them. `--out` saves those bytes. The rewrite recomputes stack-map frames and maximums, then performs one JVMTI class redefinition. A failure before redefine leaves the class unchanged. Managed breakpoints are cleared and reinstalled at relocated BCIs. HotSpot schema limits still apply, and active frames may finish obsolete bytecodes; invoke the method again to observe the replacement reliably.
 
 ## 9. Debugger
 
@@ -325,6 +360,12 @@ debugger sample <all-thread-index> [depth] [radius]
 ```
 
 `all-thread-index` comes from the complete `debugger threads` list; `paused-index` comes from the paused-thread list. `local-context` stores a local value as a writable current context; `set context` or `local-set` writes through to the paused frame.
+
+The TUI `frames` view lists every captured frame with its exact method descriptor and BCI.
+`@` marks the actual suspension/sample point and `>` marks the selected inspection frame.
+Use `Enter` for Debug, `B` for Bytecode, `S` for method Decompile, and `G` to centre that
+frame's execution point. Method-level Decompile uses the BCI mapping to highlight the
+corresponding decompiled line. Native frames have BCI `-1`; select a Java caller for bytecode.
 
 Without a `LocalVariableTable`, JVMRTDP attempts to read slots up to `maxLocals`. Dead slots, continuation slots for two-slot values, and values with unknown types are reported with a reason.
 

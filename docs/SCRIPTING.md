@@ -254,6 +254,14 @@ For machine-readable debugger data, use a command instruction or the Java API:
 command debugger snapshot output/debugger.json json
 ```
 
+Scripts can install an atomic multi-operation bytecode patch through the same CLI command:
+
+```text
+command bytecode patch-file com.example.Service patches/service.patch
+```
+
+The patch file itself is one class transaction. The surrounding script is not transactional; use `bytecode undo com.example.Service` explicitly if a later script action fails.
+
 See the [Java Library Guide](LIBRARY.md) for session ownership and thread-safety rules.
 
 ## 14. Error Semantics

@@ -238,11 +238,43 @@ dumpclass package <name|.> <directory> [--recursive|--no-recursive] [--match glo
 decompile class [class] [--engine cfr|procyon] [--out <file>]
 decompile method [class] <method> <descriptor> [--engine cfr|procyon] [--out <file>]
 bytecode [class] <method> <descriptor> [--out <file>]
+bytecode <insert-before|insert-after|replace> <class> <method> <descriptor> <bci> <assembly>
+bytecode delete <class> <method> <descriptor> <from-bci> [to-bci]
+bytecode <returns-insert|returns-replace> <class> <method> <descriptor> <assembly>
+bytecode intercept-return <class> <method> <descriptor> <hook-class> <hook-method>
+bytecode patch-file <class> <file> [--preview] [--out <class-file>]
+bytecode <undo|redo> <class>
 ```
 
 单方法反编译按名称和完整描述符定位方法。视图支持搜索、行号/BCI 跳转、断点和导出。
 
 原生方法与抽象方法没有 `Code` 属性。方法信息栏会明确显示 `NATIVE`、`ABSTRACT` 或 `BYTECODE`。
+
+文本汇编使用 JVM 指令名，多条指令以 `;;` 或换行分隔。owner 可写点号名或 internal name；跳转目标使用本地 `LABEL name`，也可引用已有的 `@BCI`。例如：
+
+```text
+bytecode insert-before com.example.Service value "()I" 0 "LDC \"entered\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V"
+bytecode replace com.example.Service value "()I" 8 "BIPUSH 42 ;; IRETURN"
+bytecode delete com.example.Service value "()I" 2 7
+bytecode returns-insert com.example.Service value "()I" "DUP ;; INVOKESTATIC example/Trace onInt (I)V"
+bytecode intercept-return com.example.Service value "()I" example.ReturnHooks onInt
+```
+
+`intercept-return` 会在每个正常 return 前调用可见的静态 hook。返回类型为 `T` 时 hook 描述符必须是 `(T)T`，`void` 则是 `()V`；hook 返回值会替换原结果。通常应以 `SAME_LOADER` 把 hook 部署到被编辑类可见的类加载器。
+
+使用 `returns-insert` 时，非 `void` 返回值已经位于操作数栈顶，片段必须为原 return 留下等价结果。`returns-replace` 只删除 return 指令，旧结果仍在栈上，因此替换片段必须消费旧值并执行兼容的 return 或 throw。例如把所有 `int` 结果改为 42：`POP ;; BIPUSH 42 ;; IRETURN`。
+
+补丁文件把所有行作为一个类事务执行：
+
+```text
+# operation|method|descriptor|arguments
+insert-before|value|()I|0|LDC "entered" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V
+replace|value|()I|8|BIPUSH 42 ;; IRETURN
+delete|other|()V|4|9
+returns-insert|compute|(J)J|DUP2 ;; INVOKESTATIC example/Trace onLong (J)V
+```
+
+`--preview` 只验证并生成字节，不安装；`--out` 保存生成的 class。改写会重新计算 stack-map frame 和 max，再执行一次 JVMTI 类重定义。重定义前失败不会修改目标类；受管断点会清除并按新 BCI 恢复。HotSpot 的类结构限制仍然适用，已经执行中的 frame 可能继续运行旧字节码，应再次调用方法来稳定观察新结果。
 
 ## 9. 调试器
 

@@ -92,7 +92,7 @@ JVMRTDP 通过原生代理和 Java 桥接层提供常用 JVMTI 诊断与调试�
 
 ## Java 库 API
 
-已连接的 `JvmRtdpSession` 通过 `session.jvmti()` 提供类型化 `RemoteJVMTIEnv`。库代码无需解析 CLI 输出，即可查询 capability、枚举线程、检查栈与 local、配置断点和监视点、管理 tag、转换类并部署回调。
+已连接的 `JvmRtdpSession` 通过 `session.jvmti()` 提供类型化低层控制，并通过 `session.instrumentation()` 提供高层插桩。库代码无需解析 CLI 输出，即可查询 capability、检查线程与 local、配置字节码/事件断点、提前返回、部署 handler/transformer、使用 ASM 事务化编辑字节码并 retransform/redefine。字节码补丁会重算 frame/max，并迁移受管断点。
 
 ```java
 try (JvmRtdpClient client = JvmRtdpClient.open();

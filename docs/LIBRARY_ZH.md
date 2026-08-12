@@ -34,7 +34,7 @@ Maven：
 </dependency>
 ```
 
-本地文件依赖使用 `build/libs/jvmrtdp-2.1.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 JLine 运行时依赖；使用文件依赖并调用终端控制类时，需要自行添加 JLine。`build/libs/JVMRTDP-2.1.0.jar` 仍是自包含可执行程序。
+本地文件依赖使用 `build/libs/jvmrtdp-2.1.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 ASM 与 JLine；使用文件依赖时，字节码 API 需自行添加 `asm-tree` 与 `asm-util`，终端控制类需添加 JLine。`build/libs/JVMRTDP-2.1.0.jar` 仍是自包含可执行程序。
 
 发布产物包括库 JAR、源码包、Javadoc 和 Maven POM。自动模块名为 `nhcm.jvmrtdp`。
 
@@ -198,10 +198,36 @@ Capability 取决于 JVM 阶段。需要仅限 `OnLoad` 的能力时，应在目
 - `forceEarlyReturn(...)` / `forceEarlyReturnVoid(...)`：提前返回并替换结果。
 - `session.instrumentation()`：统一管理源码/JAR 部署、hook、class-file transformer、
   retransform 和 redefine。
+- `session.instrumentation().bytecode()`：ASM 事务化字节码插入、删除、替换、批处理、
+  return hook、预览以及 undo/redo。
 
 abstract/interface 方法使用 `JvmEventBreakpointSpec.includingSubtypes()` 断到实现方法。
 部署的事件处理器实现 `JvmtiEventHandler`；字节码转换器实现 `JvmtiClassFileTransformer`。
 观察类 hook 优先用异步投递；需要同步修改 class bytes 的 transformer 使用同步投递。
 所有 session、远程对象、deployment 和 callback handle 都应确定性关闭。
+
+### ASM 字节码编辑
+
+CLI、TUI 与 library 共用同一个 `JvmBytecodeEditor`，因此历史记录和断点 BCI 重定位保持一致：
+
+```java
+JvmBytecodeEditor editor = session.instrumentation().bytecode();
+JvmBytecodePatch patch = JvmBytecodePatch.builder("com.example.Service")
+        .insertBefore("value", "()I", 0,
+                "LDC \"entered\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V")
+        .replace("value", "()I", 8, "BIPUSH 42 ;; IRETURN")
+        .build();
+
+JvmBytecodePatchResult preview = editor.preview(patch);
+JvmBytecodePatchResult installed = editor.apply(patch);
+editor.undo("com.example.Service");
+editor.redo("com.example.Service");
+```
+
+文本汇编以 `;;` 或换行分隔 JVM 指令。`applyBatch` 可先验证多个类补丁，再逐类安装，并在后续失败时尽力回滚。需要构造 `INVOKEDYNAMIC` 等高级节点时，可用 `editMethod(..., Consumer<MethodNode>)` 直接操作 ASM Tree。
+
+`interceptReturns(class, method, descriptor, hookClass, hookMethod)` 会让正常 return 经过静态 hook。返回类型 `T` 对应 `(T)T`，`void` 对应 `()V`；hook 可记录或替换返回值，并且必须对被编辑类的类加载器可见，通常通过 `SAME_LOADER` 部署。
+
+编辑器会使用目标 JVM 的类型层级重新计算 frame/max，重定义完整类，并迁移受管断点。HotSpot 仍不允许普通 redefine 改变字段、方法或继承结构。已经执行中的 frame 可能继续运行旧版本，新调用使用新字节码。
 
 <!-- English LIBRARY.md is canonical. -->

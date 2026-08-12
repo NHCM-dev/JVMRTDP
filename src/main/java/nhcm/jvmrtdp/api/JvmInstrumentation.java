@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.api;
 
+import nhcm.jvmrtdp.api.bytecode.JvmBytecodeEditor;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
 import nhcm.jvmrtdp.handles.jvm.RemoteCodeDeployment;
 import nhcm.jvmrtdp.handles.jvm.RemoteJVMTIEnv;
@@ -16,8 +17,16 @@ import java.util.function.UnaryOperator;
 /** High-level library facade for target-side code deployment, hooks and class instrumentation. */
 public final class JvmInstrumentation {
     private final RemoteJVMTIEnv jvmti;
+    private final JvmBytecodeEditor bytecode;
 
-    JvmInstrumentation(RemoteJVMTIEnv jvmti) { this.jvmti = jvmti; }
+    public JvmInstrumentation(RemoteJVMTIEnv jvmti) {
+        if (jvmti == null) throw new IllegalArgumentException("jvmti must not be null");
+        this.jvmti = jvmti;
+        this.bytecode = new JvmBytecodeEditor(jvmti);
+    }
+
+    /** ASM-backed transactional bytecode editing, batching, return interception and history. */
+    public JvmBytecodeEditor bytecode() { return bytecode; }
 
     public byte[] classBytes(String className) { return jvmti.getClassBytes(className); }
 
