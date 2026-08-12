@@ -92,10 +92,13 @@ Debugger keys:
 | `F6` | Pause the selected thread |
 | `F4` | Toggle live following while the target runs |
 | `T` | Open the thread list |
-| `G` | Go to the current execution location |
+| `G` | Select and centre the current execution BCI |
 | `M` | Open locals |
 | `Z` | Open breakpoints |
 | `*` | Freeze or restore the analysis thread set |
+
+The paused or live-followed execution BCI is always marked with `>` and highlighted in yellow.
+Moving the list cursor does not remove this execution marker; press `G` to return the cursor to it.
 
 ## 4. Context and Stack
 

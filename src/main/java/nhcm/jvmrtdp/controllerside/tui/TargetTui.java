@@ -1504,9 +1504,9 @@ public final class TargetTui implements AutoCloseable {
             constantPool.clear();
             constantPool.addAll(value.stopBytecodeView.constants());
             alignBytecodeLocation(Tab.DEBUG, value.stopBytecodeLocation);
-        } else if (methodMatches && viewed.hasJavaLocation()) {
-            alignBytecodeLocation(Tab.DEBUG, viewed.location());
-        } else if (viewed != null && viewed.hasJavaLocation()) {
+        // In the same method the live execution marker moves independently. Keep
+        // the user's cursor stable until G explicitly recentres the current BCI.
+        } else if (!methodMatches && viewed != null && viewed.hasJavaLocation()) {
             pendingBytecodeLocation = (int) viewed.location();
             requestBytecode(viewed.className(), viewed.methodName(), viewed.descriptor(), Tab.DEBUG);
         }
@@ -2164,30 +2164,63 @@ public final class TargetTui implements AutoCloseable {
 
     private void jumpToCurrentExecution() {
         if (tab == Tab.THREADS) selectPausedStateForThread(selectedDebuggerThread());
-        if (debuggerState == null || !debuggerState.paused()) {
-            status = "No selected debugger thread is paused.";
+        if ((debuggerState == null || !debuggerState.paused()) && !liveSampleAvailable) {
+            status = "No current BCI is available. Pause a thread, or enable F4 live follow.";
             requestDebuggerRefresh();
             return;
         }
         tab = Tab.DEBUG;
-        JvmStackFrame viewed = viewedDebuggerFrame();
-        if (viewed == null) {
+        final boolean sampled = debuggerState == null || !debuggerState.paused();
+        final JvmStackFrame sampledTop = sampled ? actualExecutionFrame() : null;
+        if (sampled && sampledTop == null) {
             requestDebuggerRefresh();
-            status = "Loading current thread stack frames...";
-        } else if (!viewed.hasJavaLocation()) {
-            tab = Tab.FRAMES;
-            status = "The top frame is native (BCI -1). Select a Java caller frame and press Enter.";
-        } else if (bytecode != null && bytecodeClass.equals(viewed.className())
-                && bytecodeMethod.equals(viewed.methodName())
-                && bytecodeDescriptor.equals(viewed.descriptor())) {
-            alignBytecodeLocation(Tab.DEBUG, viewed.location());
-            status = "Current execution view: frame #" + viewed.depth()
-                    + " BCI " + viewed.location();
-        } else {
-            pendingBytecodeLocation = (int) viewed.location();
-            requestBytecode(viewed.className(), viewed.methodName(),
-                    viewed.descriptor(), Tab.DEBUG);
+            status = "Loading the live thread's current frame...";
+            return;
         }
+        final String className = sampled && sampledTop != null
+                ? sampledTop.className() : debuggerState.className();
+        final String methodName = sampled && sampledTop != null
+                ? sampledTop.methodName() : debuggerState.methodName();
+        final String descriptor = sampled && sampledTop != null
+                ? sampledTop.descriptor() : debuggerState.descriptor();
+        final long location = sampled && sampledTop != null
+                ? sampledTop.location() : debuggerState.location();
+        if (location < 0) {
+            tab = Tab.FRAMES;
+            status = "The actual top frame is native (BCI -1); no current Java BCI exists.";
+        } else if (bytecode != null && bytecodeClass.equals(className)
+                && bytecodeMethod.equals(methodName)
+                && bytecodeDescriptor.equals(descriptor)) {
+            alignBytecodeLocation(Tab.DEBUG, location);
+            status = (sampled ? "Last live sample" : "Current execution")
+                    + " BCI " + location + " is selected and highlighted";
+        } else {
+            pendingBytecodeLocation = (int) location;
+            requestBytecode(className, methodName, descriptor, Tab.DEBUG);
+        }
+    }
+
+    private JvmStackFrame actualExecutionFrame() {
+        for (JvmStackFrame frame : debuggerFrames) {
+            if (frame.depth() == 0) return frame;
+        }
+        return debuggerFrames.isEmpty() ? null : debuggerFrames.get(0);
+    }
+
+    private long currentExecutionLocationForBytecode() {
+        if (debuggerState != null && debuggerState.paused()
+                && bytecodeClass.equals(debuggerState.className())
+                && bytecodeMethod.equals(debuggerState.methodName())
+                && bytecodeDescriptor.equals(debuggerState.descriptor())) {
+            return debuggerState.location();
+        }
+        if (liveSampleAvailable) {
+            JvmStackFrame frame = actualExecutionFrame();
+            if (frame != null && bytecodeClass.equals(frame.className())
+                    && bytecodeMethod.equals(frame.methodName())
+                    && bytecodeDescriptor.equals(frame.descriptor())) return frame.location();
+        }
+        return Long.MIN_VALUE;
     }
 
     private void closeDebuggerStates() {
@@ -3499,6 +3532,7 @@ public final class TargetTui implements AutoCloseable {
         int centerWidth = Math.max(0, width - gutterWidth - sideWidth - separators);
         List<BytecodeInstruction> instructions = bytecode == null
                 ? Collections.<BytecodeInstruction>emptyList() : bytecode.instructions();
+        long executionLocation = currentExecutionLocationForBytecode();
         int cursor = bytecodeCursor();
         int scroll = scrolls[tab.ordinal()];
         if (cursor < scroll) scroll = cursor;
@@ -3513,11 +3547,8 @@ public final class TargetTui implements AutoCloseable {
             String instructionText = "";
             if (index < instructions.size()) {
                 BytecodeInstruction instruction = instructions.get(index);
-                boolean stopped = debuggerState != null && debuggerState.paused()
-                        && bytecodeClass.equals(debuggerState.className())
-                        && bytecodeMethod.equals(debuggerState.methodName())
-                        && bytecodeDescriptor.equals(debuggerState.descriptor())
-                        && instruction.offset() == debuggerState.location();
+                boolean stopped = executionLocation != Long.MIN_VALUE
+                        && instruction.offset() == executionLocation;
                 boolean breakpoint = hasBreakpointAt(
                         bytecodeClass, bytecodeMethod, bytecodeDescriptor, instruction.offset());
                 String sourceLine = instruction.sourceLine() < 0 ? "-" : Integer.toString(instruction.sourceLine());
@@ -3539,9 +3570,13 @@ public final class TargetTui implements AutoCloseable {
             String visibleInstruction = TuiViewport.horizontal(
                     instructionText, horizontalOffsets[tab.ordinal()], centerWidth);
             String centerCell = TerminalScreen.pad(visibleInstruction, centerWidth);
-            if (index == cursor && index < instructions.size()) {
-                gutterCell = TerminalScreen.REVERSE + gutterCell + TerminalScreen.RESET;
-                centerCell = TerminalScreen.REVERSE + centerCell + TerminalScreen.RESET;
+            if (index < instructions.size() && (index == cursor
+                    || instructions.get(index).offset() == executionLocation)) {
+                boolean executing = instructions.get(index).offset() == executionLocation;
+                String style = (executing ? TerminalScreen.BOLD + TerminalScreen.YELLOW : "")
+                        + (index == cursor ? TerminalScreen.REVERSE : "");
+                gutterCell = style + gutterCell + TerminalScreen.RESET;
+                centerCell = style + centerCell + TerminalScreen.RESET;
             }
             String line = gutterCell;
             if (centerWidth > 0) line += " | " + centerCell;
@@ -3607,6 +3642,9 @@ public final class TargetTui implements AutoCloseable {
                             : "TOP LOCATION: native (BCI -1)"
                     : "TOP LOCATION: BCI " + debuggerState.location()
                             + "  line " + debuggerState.sourceLine());
+            if (debuggerState.location() >= 0) {
+                result.add("CURRENT BCI: yellow > marker; G selects and centres it");
+            }
             if (!debuggerState.returnState().isEmpty()) {
                 result.add("RETURN: " + (debuggerState.returnValue() == null
                         ? debuggerState.returnState() : debuggerState.returnValue().displayValue()));
@@ -3633,6 +3671,7 @@ public final class TargetTui implements AutoCloseable {
                         System.currentTimeMillis() - liveSampleCapturedAt) + "ms");
                 result.add("ACTUAL: " + liveSampleActual);
                 result.add("VIEW:   " + liveSampleView);
+                result.add("CURRENT SAMPLE BCI: yellow > marker; G centres it");
                 result.add("The thread was resumed immediately after this sample.");
             } else if (!liveSampleError.isEmpty()) {
                 result.add("LIVE SAMPLE: " + liveSampleError);
