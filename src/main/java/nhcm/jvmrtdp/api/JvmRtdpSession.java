@@ -160,6 +160,11 @@ public final class JvmRtdpSession implements AutoCloseable {
         return target.forceLoadClass(className);
     }
 
+    public RemoteClass loadClassWithoutInitialization(String className) {
+        ensureOpen();
+        return target.loadClassWithoutInitialization(className);
+    }
+
     public RemoteJNIEnv jni() {
         ensureOpen();
         return target.jni();

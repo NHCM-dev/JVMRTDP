@@ -303,7 +303,8 @@ public final class TargetTui implements AutoCloseable {
         else if (key == 'F') findGlobal();
         else if (key == ':') openExact();
         else if (key == 'p' || key == 'P') goPackage();
-        else if (key == 'l' || key == 'L') forceLoadClass();
+        else if (key == 'l') forceLoadClass(true);
+        else if (key == 'L') forceLoadClass(false);
         else if (key == 'U' && tab == Tab.BROWSE) toggleUnloadedBrowser();
         else if (key == 'j' || key == 'J') toggleRuntime();
         else if (key == 'k' || key == 'K') toggleSpecialMethods();
@@ -1248,7 +1249,7 @@ public final class TargetTui implements AutoCloseable {
     private void setSelectedField() throws IOException {
         if (unloadedContextClass != null) {
             status = "An unloaded class has no runtime field storage. Use U/W for pending watches, "
-                    + "or L (Class.forName) before reading/writing values.";
+                    + "or l (initialize) / L (load without <clinit>) before reading/writing values.";
             return;
         }
         final List<RemoteField> visible = visibleFields();
@@ -3655,23 +3656,34 @@ public final class TargetTui implements AutoCloseable {
         if (value != null) requestPackage(value);
     }
 
-    private void forceLoadClass() throws IOException {
-        final String value = editText("Class.forName in target JVM",
+    private void forceLoadClass(final boolean initialize) throws IOException {
+        final String value = editText(initialize
+                        ? "Class.forName in target JVM"
+                        : "Load/link without <clinit> in target JVM",
                 unloadedContextClass == null ? "" : unloadedContextClass.name());
         if (value == null) return;
         final String className = value.trim();
         if (className.isEmpty()) {
-            status = "Class.forName cancelled: class name is empty.";
+            status = "Class load cancelled: class name is empty.";
             return;
         }
-        submit("Loading " + className + " for Class.forName initialization...", new Callable<RemoteClass>() {
-            @Override public RemoteClass call() { return session.startForceLoadClass(className); }
+        submit(initialize
+                        ? "Loading " + className + " for Class.forName initialization..."
+                        : "Loading/linking " + className + " without <clinit>...",
+                new Callable<RemoteClass>() {
+            @Override public RemoteClass call() {
+                return initialize
+                        ? session.startForceLoadClass(className)
+                        : session.loadClassWithoutInitialization(className);
+            }
         }, new Consumer<RemoteClass>() {
             @Override public void accept(RemoteClass type) {
                 session.context().select(type);
                 tab = Tab.CONTEXT;
-                status = "Class.forName initialization started for " + type.className()
-                        + "; <clinit> breakpoints can stop its loader thread";
+                status = initialize
+                        ? "Class.forName initialization started for " + type.className()
+                                + "; <clinit> breakpoints can stop its loader thread"
+                        : "Loaded and linked without <clinit>: " + type.className();
                 requestContextRefresh();
             }
         });
@@ -4071,7 +4083,8 @@ public final class TargetTui implements AutoCloseable {
                 result.add("OFFLINE CONTEXT NAVIGATION");
                 addKeyHelp(result, "Tab / Shift+Tab", "Browse Fields and Methods like a loaded class");
                 addKeyHelp(result, "A", "Decompile this class without loading it");
-                addKeyHelp(result, "L", "Load/initialize this class with Class.forName");
+                addKeyHelp(result, "l", "Load/initialize this class with Class.forName");
+                addKeyHelp(result, "L", "Load/link this class without running <clinit>");
                 addKeyHelp(result, "Backspace", "Return to the unloaded package browser");
                 return result;
             }
@@ -4158,7 +4171,8 @@ public final class TargetTui implements AutoCloseable {
                     ? "Search unloaded class-path classes/members"
                     : "Search all loaded classes/members/packages");
             addKeyHelp(result, ":", "Open an exact class/package/member target");
-            addKeyHelp(result, "L", "Class.forName and initialize a target class");
+            addKeyHelp(result, "l", "Class.forName and initialize a target class");
+            addKeyHelp(result, "L", "Load/link a target class without running <clinit>");
             addKeyHelp(result, "U", browseUnloaded
                     ? "Return to loaded classes"
                     : "Open separate unloaded class-path catalog");
@@ -4411,7 +4425,8 @@ public final class TargetTui implements AutoCloseable {
         addKeyHelp(result, "@ / #", "Show/hide static / instance fields");
         addKeyHelp(result, "f / F", "Find in list / search unloaded catalog");
         addKeyHelp(result, "A", "Decompile owning class without loading it");
-        addKeyHelp(result, "L", "Load/initialize owning class with Class.forName");
+        addKeyHelp(result, "l", "Load/initialize owning class with Class.forName");
+        addKeyHelp(result, "L", "Load/link owning class without running <clinit>");
         addKeyHelp(result, "Backspace", "Return to unloaded package browser");
         return result;
     }
@@ -4765,7 +4780,7 @@ public final class TargetTui implements AutoCloseable {
                     "F7 Step", "F8 Run", "F2 CLI", "Q Back");
             return result;
         }
-        Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "L Class.forName",
+        Collections.addAll(result, "[ / ] Horizontal", "0 Reset", "l Initialize", "L Load No-Init",
                 "M Locals", "Z Breakpoints");
         if (tab == Tab.BROWSE) Collections.addAll(result,
                 "/ Filter", "f Find List", "F Global Find", ": Exact", "P Package", "J JDK",

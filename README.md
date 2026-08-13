@@ -147,6 +147,7 @@ The TUI browses by package and hides common JDK implementation types by default.
 | `=` | Set a selected field, paused local, or writable context source |
 | `x` / `X` | Invoke the selected method virtually / invoke its declaring implementation |
 | `P` | Enter a package name |
+| `l` / `L` | Load and initialize a class / load and link it without running `<clinit>` |
 | `J` | Show or hide JDK types |
 | `U` (Browse) | Switch between loaded classes and the separate unloaded class-path catalog |
 | `a` | Show or hide array types in Browse |
@@ -173,6 +174,8 @@ unloaded target-class-path/JDK archive catalog; rows are marked `[U:C]`, `[U:M]`
 Opening bytecode or decompilation in this mode reads the class file on the controller and
 does not define or initialize it. `F9` registers a symbolic pending breakpoint, `u`/`W`
 register field read/write watches, and `Ctrl+E`/`Ctrl+X` register method entry/exit stops.
+Press lowercase `l` to load and initialize the selected class, or uppercase `L` to load and
+link it without running `<clinit>` so its bytecode can be redefined first.
 The agent resolves these registrations during `ClassPrepare`, before ordinary class use.
 
 ## Decompilation and Bytecode

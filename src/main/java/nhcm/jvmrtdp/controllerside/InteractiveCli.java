@@ -644,7 +644,7 @@ public class InteractiveCli {
 
     private static class ClassCommand extends ShellCommand<TargetSession> {
         private ClassCommand() {
-            super("class", "class <load <name>|info|fields [all|static|virtual] [glob]|methods [all|static|virtual] [glob]|constructors>",
+            super("class", "class <load <name> [--no-init]|info|fields [all|static|virtual] [glob]|methods [all|static|virtual] [glob]|constructors>",
                     "Lists metadata for the class represented by the current context.");
         }
 
@@ -652,10 +652,17 @@ public class InteractiveCli {
         public boolean execute(TargetSession session, List<String> arguments) {
             if (arguments.isEmpty()) arguments = Collections.singletonList("info");
             String operation = lower(arguments.get(0));
-            if ("load".equals(operation) && arguments.size() == 2) {
-                RemoteClass loaded = session.forceLoadClass(arguments.get(1));
+            if ("load".equals(operation) && (arguments.size() == 2 || arguments.size() == 3)) {
+                boolean noInitialization = arguments.size() == 3
+                        && "--no-init".equals(lower(arguments.get(2)));
+                if (arguments.size() == 3 && !noInitialization) return false;
+                RemoteClass loaded = noInitialization
+                        ? session.loadClassWithoutInitialization(arguments.get(1))
+                        : session.forceLoadClass(arguments.get(1));
                 session.context().select(loaded);
-                session.output().println("Class.forName loaded and initialized " + loaded.className());
+                session.output().println(noInitialization
+                        ? "Loaded and linked without class initialization " + loaded.className()
+                        : "Class.forName loaded and initialized " + loaded.className());
                 printContext(session);
                 return true;
             }

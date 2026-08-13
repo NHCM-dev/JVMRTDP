@@ -218,7 +218,7 @@ array list [limit]
 
 ```text
 class
-class load <class>
+class load <class> [--no-init]
 class info
 class fields [all|static|virtual] [glob]
 class methods [all|static|virtual] [glob]
@@ -233,7 +233,9 @@ find method [name-glob] [--class glob] [--returns glob] [--params glob] [--stati
 find unloaded [class|field|method] [glob] [--class owner-glob] [--limit n]
 ```
 
-`class load` performs an operation equivalent to `Class.forName` in the target JVM and may initialize the class.
+`class load` performs an operation equivalent to `Class.forName` in the target JVM and initializes the class.
+Add `--no-init` to load and link the class without running `<clinit>`; this is useful when its
+initializer must be redefined before first execution.
 
 `find unloaded` scans the target's class path and available `rt.jar`/`jmods` from the controller without
 loading classes. Its results are marked `unloaded` and remain separate from loaded search

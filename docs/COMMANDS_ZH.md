@@ -206,7 +206,7 @@ array list [limit]
 
 ```text
 class
-class load <class>
+class load <class> [--no-init]
 class info
 class fields [all|static|virtual] [glob]
 class methods [all|static|virtual] [glob]
@@ -223,7 +223,8 @@ find unloaded [class|field|method] [glob] [--class owner-glob] [--limit n]
 
 `find unloaded` 从控制端扫描目标 classpath 以及可用的 `rt.jar`/`jmods`，不触发类加载或初始化。结果与已加载类分开显示；指定未加载类时，`decompile` 和只读 `bytecode` 会直接使用 class bytes。
 
-`class load` 在目标 JVM 中执行等价于 `Class.forName` 的加载操作，可能触发类初始化。
+`class load` 在目标 JVM 中执行等价于 `Class.forName` 的加载操作并初始化类。添加
+`--no-init` 后只加载和链接类，不运行 `<clinit>`；可先重定义初始化器或其他字节码，再恢复执行。
 
 导出与转储：
 

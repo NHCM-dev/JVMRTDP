@@ -73,6 +73,11 @@ public class TargetObjectService implements AutoCloseable {
         return resolveClassForName(className, true);
     }
 
+    /** Loads and links a class in the target JVM without running its class initializer. */
+    public Class<?> loadClassWithoutInitialization(String className) {
+        return resolveClassForName(className, false);
+    }
+
     /**
      * Loads/links first, then initializes on a non-service thread so a &lt;clinit&gt;
      * breakpoint may pause without blocking the command channel needed to resume it.

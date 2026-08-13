@@ -116,6 +116,9 @@ java -agentpath:<path-to-jvmrtdp-agent.dll>=break-main=com.example.Application,b
 
 ## TUI 导航
 
+在未加载类目录中，小写 `l` 会加载并初始化类；大写 `L` 只加载和链接类而不运行
+`<clinit>`，可先用字节码编辑命令重定义类，再恢复执行。
+
 TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据当前视图显示可用操作。CLI 与 TUI 使用同一会话上下文；切换界面会保留反编译内容、字节码视图、调试状态和托管断点。
 
 | 按键 | 操作 |

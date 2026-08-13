@@ -68,6 +68,10 @@ public class TargetSession implements AutoCloseable {
         return jni.forceLoadClass(className);
     }
 
+    public RemoteClass loadClassWithoutInitialization(String className) {
+        return jni.loadClassWithoutInitialization(className);
+    }
+
     public RemoteClass startForceLoadClass(String className) {
         return jni.startForceLoadClass(className);
     }

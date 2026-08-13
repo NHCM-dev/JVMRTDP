@@ -42,6 +42,16 @@ public class RemoteJNIEnv extends RemoteHandle {
         return findClass(loadedName);
     }
 
+    /** Loads and links a class in the target JVM without running its class initializer. */
+    public RemoteClass loadClassWithoutInitialization(String className) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("Class name must not be empty");
+        }
+        String loadedName = executeForOutput(CommandLine.of(
+                "object", "class.load.no-init", className.trim()));
+        return findClass(loadedName);
+    }
+
     /** Starts initialization on a debugger-visible target thread and returns after linking. */
     public RemoteClass startForceLoadClass(String className) {
         if (className == null || className.trim().isEmpty()) {
