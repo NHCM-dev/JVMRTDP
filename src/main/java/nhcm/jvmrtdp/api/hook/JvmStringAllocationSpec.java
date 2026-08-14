@@ -5,7 +5,8 @@ package nhcm.jvmrtdp.api.hook;
  * {@code *} and {@code ?}. Creator patterns are matched against any Java frame in the allocating
  * thread, and all three components must match one frame. Fast mode uses a constructor-return
  * probe with bootstrap content prefiltering; complete mode adds the JVM-wide allocation event.
- * Use {@code *text*} for contains.
+ * {@link Builder#includeLdc(boolean)} additionally observes executions of matching String
+ * constants loaded by {@code ldc}/{@code ldc_w}. Use {@code *text*} for contains.
  */
 public final class JvmStringAllocationSpec {
     private final String contentPattern;
@@ -14,6 +15,7 @@ public final class JvmStringAllocationSpec {
     private final String creatorDescriptorPattern;
     private final boolean caseSensitive;
     private final JvmStringAllocationMode mode;
+    private final boolean includeLdc;
     private final long maximumHits;
     private final int sampleEvery;
 
@@ -24,6 +26,7 @@ public final class JvmStringAllocationSpec {
         this.creatorDescriptorPattern = pattern(builder.creatorDescriptorPattern);
         this.caseSensitive = builder.caseSensitive;
         this.mode = builder.mode == null ? JvmStringAllocationMode.FAST : builder.mode;
+        this.includeLdc = builder.includeLdc;
         if (builder.maximumHits < 0L) {
             throw new IllegalArgumentException("maximumHits must not be negative");
         }
@@ -51,6 +54,8 @@ public final class JvmStringAllocationSpec {
     public String creatorDescriptorPattern() { return creatorDescriptorPattern; }
     public boolean caseSensitive() { return caseSensitive; }
     public JvmStringAllocationMode mode() { return mode; }
+    /** Whether matching String constants loaded by ldc/ldc_w are observed at their use site. */
+    public boolean includeLdc() { return includeLdc; }
     /** Zero means unlimited. */
     public long maximumHits() { return maximumHits; }
     /** Emits one debugger stop for every Nth matching String. */
@@ -60,6 +65,7 @@ public final class JvmStringAllocationSpec {
         return "content=" + contentPattern + ", creator=" + creatorClassPattern + '#'
                 + creatorMethodPattern + ' ' + creatorDescriptorPattern
                 + ", mode=" + mode.name().toLowerCase(java.util.Locale.ROOT)
+                + (includeLdc ? ", ldc" : "")
                 + (caseSensitive ? "" : ", ignore-case")
                 + (maximumHits == 0L ? "" : ", max-hits=" + maximumHits)
                 + (sampleEvery == 1 ? "" : ", sample-every=" + sampleEvery);
@@ -80,6 +86,7 @@ public final class JvmStringAllocationSpec {
         private String creatorDescriptorPattern = "*";
         private boolean caseSensitive = true;
         private JvmStringAllocationMode mode = JvmStringAllocationMode.FAST;
+        private boolean includeLdc;
         private long maximumHits;
         private int sampleEvery = 1;
 
@@ -104,6 +111,15 @@ public final class JvmStringAllocationSpec {
         public Builder mode(JvmStringAllocationMode value) {
             if (value == null) throw new IllegalArgumentException("mode must not be null");
             this.mode = value;
+            return this;
+        }
+
+        /**
+         * Observes execution of matching String constants at {@code ldc}/{@code ldc_w} sites.
+         * This is opt-in because a literal can be reused many times without allocating a new object.
+         */
+        public Builder includeLdc(boolean value) {
+            this.includeLdc = value;
             return this;
         }
 

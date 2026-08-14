@@ -17,6 +17,7 @@ public final class StringAllocationSpecParser {
         }
         boolean caseSensitive = true;
         JvmStringAllocationMode mode = JvmStringAllocationMode.FAST;
+        boolean includeLdc = false;
         long maximumHits = 0L;
         int sampleEvery = 1;
         List<String> creator = new ArrayList<String>(3);
@@ -25,6 +26,8 @@ public final class StringAllocationSpecParser {
             String option = value.toLowerCase(Locale.ROOT);
             if ("ignore-case".equals(option)) caseSensitive = false;
             else if ("case-sensitive".equals(option)) caseSensitive = true;
+            else if ("ldc".equals(option) || "include-ldc".equals(option)) includeLdc = true;
+            else if ("no-ldc".equals(option)) includeLdc = false;
             else if ("fast".equals(option) || "mode=fast".equals(option)) {
                 mode = JvmStringAllocationMode.FAST;
             } else if ("complete".equals(option) || "mode=complete".equals(option)) {
@@ -48,6 +51,7 @@ public final class StringAllocationSpecParser {
                         creator.size() > 2 ? creator.get(2) : "*")
                 .caseSensitive(caseSensitive)
                 .mode(mode)
+                .includeLdc(includeLdc)
                 .maximumHits(maximumHits)
                 .sampleEvery(sampleEvery)
                 .build();

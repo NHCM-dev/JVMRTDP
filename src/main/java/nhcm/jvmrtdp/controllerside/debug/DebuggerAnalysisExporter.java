@@ -385,8 +385,13 @@ public final class DebuggerAnalysisExporter {
             field(out, "creatorClass", value.allocationSpec().creatorClassPattern(), false, 0);
             field(out, "creatorMethod", value.allocationSpec().creatorMethodPattern(), false, 0);
             field(out, "creatorDescriptor", value.allocationSpec().creatorDescriptorPattern(), false, 0);
-            out.append(",\"caseSensitive\":")
-                    .append(value.allocationSpec().caseSensitive()).append('}');
+            field(out, "mode", value.allocationSpec().mode().name().toLowerCase(Locale.ROOT),
+                    false, 0);
+            out.append(",\"caseSensitive\":").append(value.allocationSpec().caseSensitive())
+                    .append(",\"includeLdc\":").append(value.allocationSpec().includeLdc())
+                    .append(",\"maximumHits\":").append(value.allocationSpec().maximumHits())
+                    .append(",\"sampleEvery\":").append(value.allocationSpec().sampleEvery())
+                    .append('}');
         }
         out.append('}');
     }

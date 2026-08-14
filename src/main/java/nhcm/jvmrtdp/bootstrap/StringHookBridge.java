@@ -12,15 +12,26 @@ public final class StringHookBridge {
     private StringHookBridge() { }
 
     public static void observed(String value) {
+        observe(value, false, -1);
+    }
+
+    /** Invoked after a matching String constant is loaded by {@code ldc}/{@code ldc_w}. */
+    public static void observedLiteral(String value, int bci) {
+        observe(value, true, bci);
+    }
+
+    private static void observe(String value, boolean literal, int bci) {
         if (!active) return;
         Thread thread = Thread.currentThread();
         String name = thread == null ? null : thread.getName();
         if (name != null && name.startsWith("jvmrtdp")) return;
         if (!matchesAnyContent(value)) return;
-        observed0(value);
+        if (literal) observedLiteral0(value, bci);
+        else observed0(value);
     }
 
     private static native void observed0(String value);
+    private static native void observedLiteral0(String value, int bci);
 
     /** Internal control surface used reflectively by the target-side service. */
     public static void setActive(boolean enabled) {

@@ -154,7 +154,7 @@ TUI 的 `references` 页中，`Enter` 打开为 Context，`S`/`Shift+S` 强/弱�
 ```text
 strings list
 strings allocation <name> <content-glob> [creator-class creator-method descriptor]
-                   [fast|complete] [ignore-case|case-sensitive]
+                   [fast|complete] [ldc|no-ldc] [ignore-case|case-sensitive]
                    [once|max=N] [sample=N]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
@@ -175,6 +175,13 @@ Allocation Hook 默认使用 `fast`：临时在 `java.lang.String.<init>` 的构
 还原该探针。`complete` 额外开启 `VM_OBJECT_ALLOC`，用于捕获没有
 可见构造器退出的 VM/native 或已被 JIT intrinsic 化的 String；该模式会产生 JVM 全局分配事件开销。同一物理对象不会因
 两条路径重复命中。
+
+`ldc` 是默认关闭的字面量使用路径。它只观察常量值可能匹配内容条件的 String
+`ldc`/`ldc_w`，命中后以 `returnState=ldc` 暂停在实际执行该指令的方法和 BCI。
+这观察的是字面量“被使用”，不是创建新对象；同一个 intern String 被循环加载时可以重复命中，
+因此应配合 `once`、`max=N` 或 `sample=N`。已加载类通过常量池和方法字节码筛选后直接设置精确
+JVMTI 断点，不做重转换，因此启动时已暂停的活动栈帧也能命中；后续加载类使用过滤探针。
+删除最后一条 LDC 规则后会清理两条路径。为防止递归，代理自身和 `java.lang.String` 不参与处理。
 
 内容先在 Java bootstrap 桥中预过滤，未匹配时不会进入 native/JVMTI；之后再按需读取创建栈。
 三个 creator pattern 都是 `*` 时不会做完整栈遍历。

@@ -301,6 +301,7 @@ strings field display-write write com.example.Config displayName
 strings field user-name-write write com.example.User name object
 strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
 strings allocation token-created "*secret-token*" "com.example.*" "*" "*" fast ignore-case once
+strings allocation literal-use "*license accepted*" "pack.license.*" "*" "*" fast ldc once
 strings track display-write displayValue
 strings use display-write
 strings call display-write length ()I
@@ -315,6 +316,11 @@ Allocation hooks default to `fast`: JVMRTDP temporarily adds lightweight probes 
 `String.<init>` returns, so unrelated allocations and method exits do not enter a global JVMTI
 callback. Content is prefiltered in the bootstrap bridge before native/JVMTI work; an all-wildcard
 creator skips full stack capture.
+Add the opt-in `ldc` policy to observe execution of matching String constants. JVMRTDP scans
+already-loaded methods and places precise JVMTI breakpoints without making active frames obsolete;
+filtered probes cover future class loads. Hits report `returnState=ldc` and pause at the method/BCI
+that executed the `ldc`/`ldc_w`. This observes literal use rather than allocation, so use `once`,
+`max=N`, or `sample=N` for code paths that execute repeatedly.
 Use `complete` only when VM/native-created or already JIT-intrinsified String paths without an
 observable constructor return must also be covered, because it enables the JVM-wide
 `VM_OBJECT_ALLOC` event. `once`, `max=N`, and `sample=N`

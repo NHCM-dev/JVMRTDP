@@ -40,6 +40,10 @@ JavaVM* gJavaVm = nullptr;
 jvmtiEnv* gJvmti = nullptr;
 bool gCanRetransform = false;
 std::atomic<bool> gClassFileHookEnabled{false};
+// The -agentpath path keeps a minimal ClassFileLoadHook lease to cache the
+// original bytes. Reading class bytes can then avoid retransformation of an
+// active method, which would obsolete its frame and lose later breakpoints.
+std::atomic<bool> gClassBytesCacheHookEnabled{false};
 std::atomic<bool> gLoadedAsJvmtiAgent{false};
 std::atomic<bool> gCallbacksInstalled{false};
 std::atomic<bool> gCapabilitiesRequested{false};
@@ -50,6 +54,7 @@ thread_local std::vector<unsigned char>* tRequestedBytes = nullptr;
 thread_local bool tInJavaCallback = false;
 thread_local bool tCapturingMethodEvent = false;
 thread_local bool tMatchingStringAllocation = false;
+thread_local unsigned int tStringHookSuppressionDepth = 0;
 
 class ThreadFlagGuard {
 public:
@@ -61,6 +66,16 @@ public:
 private:
     bool& flag_;
 };
+
+class StringHookSuppressionGuard {
+public:
+    StringHookSuppressionGuard() { ++tStringHookSuppressionDepth; }
+    ~StringHookSuppressionGuard() {
+        if (tStringHookSuppressionDepth != 0) --tStringHookSuppressionDepth;
+    }
+    StringHookSuppressionGuard(const StringHookSuppressionGuard&) = delete;
+    StringHookSuppressionGuard& operator=(const StringHookSuppressionGuard&) = delete;
+};
 thread_local int tTemporaryClassFileHookDepth = 0;
 jclass gDispatcherClass = nullptr;
 jmethodID gDispatchMethod = nullptr;
@@ -70,6 +85,77 @@ jclass gStringClass = nullptr;
 jclass gStringHookBridgeClass = nullptr;
 jmethodID gStringHookSetActiveMethod = nullptr;
 jmethodID gStringHookConfigureMethod = nullptr;
+jobject gStringLdcTransformer = nullptr;
+jmethodID gStringLdcTransformMethod = nullptr;
+std::mutex gStringLdcTransformerMutex;
+std::mutex gClassBytesCacheMutex;
+std::unordered_map<std::string, std::vector<unsigned char>> gClassBytesCache;
+std::deque<std::string> gClassBytesCacheOrder;
+std::size_t gClassBytesCacheSize = 0;
+constexpr std::size_t kMaximumClassBytesCacheSize = 64u * 1024u * 1024u;
+constexpr std::size_t kMaximumClassBytesCacheEntries = 4096u;
+
+struct MethodLocationKey {
+    jmethodID method = nullptr;
+    jlocation location = -1;
+    bool operator==(const MethodLocationKey& other) const {
+        return method == other.method && location == other.location;
+    }
+};
+
+struct MethodLocationHash {
+    std::size_t operator()(const MethodLocationKey& value) const {
+        const std::size_t method = std::hash<std::uintptr_t>{}(
+            reinterpret_cast<std::uintptr_t>(value.method));
+        const std::size_t location = std::hash<jlong>{}(static_cast<jlong>(value.location));
+        return method ^ (location + 0x9e3779b9u + (method << 6) + (method >> 2));
+    }
+};
+
+std::mutex gAllocationOpcodeCacheMutex;
+std::unordered_map<MethodLocationKey, bool, MethodLocationHash> gAllocationOpcodeCache;
+std::deque<MethodLocationKey> gAllocationOpcodeCacheOrder;
+constexpr std::size_t kMaximumAllocationOpcodeCacheEntries = 8192u;
+
+void ClearAllocationOpcodeCache() {
+    std::lock_guard<std::mutex> guard(gAllocationOpcodeCacheMutex);
+    gAllocationOpcodeCache.clear();
+    gAllocationOpcodeCacheOrder.clear();
+}
+
+void CacheClassBytes(const std::string& className, const unsigned char* bytes, jint length) {
+    if (className.empty() || bytes == nullptr || length <= 0) return;
+    std::vector<unsigned char> replacement(bytes, bytes + length);
+    std::lock_guard<std::mutex> guard(gClassBytesCacheMutex);
+    auto found = gClassBytesCache.find(className);
+    if (found != gClassBytesCache.end()) {
+        gClassBytesCacheSize -= found->second.size();
+        found->second = std::move(replacement);
+        gClassBytesCacheSize += found->second.size();
+    } else {
+        gClassBytesCacheSize += replacement.size();
+        gClassBytesCache.emplace(className, std::move(replacement));
+        gClassBytesCacheOrder.push_back(className);
+    }
+    while ((!gClassBytesCacheOrder.empty())
+            && (gClassBytesCacheSize > kMaximumClassBytesCacheSize
+                || gClassBytesCache.size() > kMaximumClassBytesCacheEntries)) {
+        const std::string oldest = gClassBytesCacheOrder.front();
+        gClassBytesCacheOrder.pop_front();
+        auto entry = gClassBytesCache.find(oldest);
+        if (entry == gClassBytesCache.end()) continue;
+        gClassBytesCacheSize -= entry->second.size();
+        gClassBytesCache.erase(entry);
+    }
+}
+
+bool CachedClassBytes(const std::string& className, std::vector<unsigned char>& result) {
+    std::lock_guard<std::mutex> guard(gClassBytesCacheMutex);
+    const auto found = gClassBytesCache.find(className);
+    if (found == gClassBytesCache.end()) return false;
+    result = found->second;
+    return true;
+}
 
 struct BoxingType {
     const char* className;
@@ -120,6 +206,7 @@ std::atomic<bool> gJavaMethodExitDispatchEnabled{false};
 std::atomic<bool> gJavaExceptionDispatchEnabled{false};
 std::atomic<bool> gJavaBreakpointDispatchEnabled{false};
 std::atomic<bool> gJavaVmObjectAllocDispatchEnabled{false};
+std::atomic<bool> gJavaClassFileTransformDispatchEnabled{false};
 jmethodID gStartupMainMethod = nullptr;
 jlocation gStartupMainLocation = 0;
 jmethodID gStartupClinitMethod = nullptr;
@@ -131,6 +218,10 @@ std::string gStartupClinitClass;
 struct DebuggerStop {
     jobject thread = nullptr;
     jobject returnValue = nullptr;
+    // Keep the physical method version while the event thread is paused. A
+    // retransform can make this jmethodID obsolete even though its active
+    // frame is still executing and still needs its own breakpoint.
+    jmethodID method = nullptr;
     bool paused = true;
     // Breakpoint/single-step callbacks wait on gDebuggerChanged. A thread paused
     // from the debugger console is instead suspended with JVMTI SuspendThread.
@@ -174,6 +265,7 @@ struct StringAllocationHook {
     std::string creatorDescriptorPattern;
     bool caseSensitive = true;
     bool complete = false;
+    bool includeLdc = false;
     std::uint64_t maximumHits = 0;
     std::uint64_t sampleEvery = 1;
     std::uint64_t seenMatches = 0;
@@ -193,6 +285,22 @@ std::atomic<std::size_t> gArmedStringAllocationHookCount{0};
 std::atomic<std::size_t> gArmedCompleteStringAllocationHookCount{0};
 char gJvmrtdpServiceThreadMarker;
 char gJvmrtdpApplicationThreadMarker;
+
+struct StringLdcBreakpoint {
+    jobject klass = nullptr;
+    jmethodID method = nullptr;
+    std::string methodName;
+    std::string descriptor;
+    jlocation location = 0;
+    jobject literal = nullptr;
+    // Only the breakpoint for the current class version follows a
+    // retransform. Breakpoints installed on obsolete active frames must stay
+    // bound to that physical method version until those frames return.
+    bool refreshable = true;
+};
+
+std::mutex gStringLdcBreakpointMutex;
+std::vector<StringLdcBreakpoint> gStringLdcBreakpoints;
 
 // Step-out is completed at the first bytecode in the caller. A FramePop event
 // alone fires while the returning frame is still visible and is therefore too early.
@@ -236,6 +344,8 @@ std::mutex gFieldWatchMutex;
 std::vector<PersistentFieldWatch> gPersistentFieldWatches;
 
 std::string BinaryClassName(jclass klass);
+jmethodID ResolveMethod(JNIEnv* env, jclass klass, const std::string& expectedName,
+    const std::string& expectedDescriptor, bool throwIfMissing = true);
 
 bool SamePhysicalBreakpoint(JNIEnv* env, const PersistentBreakpoint& breakpoint,
         jclass klass, jmethodID method, jlocation location) {
@@ -246,6 +356,14 @@ bool SamePhysicalBreakpoint(JNIEnv* env, const PersistentBreakpoint& breakpoint,
 bool HasPersistentBreakpoint(JNIEnv* env, jmethodID method, jlocation location) {
     std::lock_guard<std::mutex> guard(gBreakpointMutex);
     for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+        if (breakpoint.method == method && breakpoint.location == location) return true;
+    }
+    return false;
+}
+
+bool HasStringLdcBreakpoint(jmethodID method, jlocation location) {
+    std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+    for (const StringLdcBreakpoint& breakpoint : gStringLdcBreakpoints) {
         if (breakpoint.method == method && breakpoint.location == location) return true;
     }
     return false;
@@ -308,7 +426,7 @@ bool ForgetPersistentBreakpoint(JNIEnv* env, const std::string& id,
     for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
         if (SamePhysicalBreakpoint(env, breakpoint, klass, method, location)) return true;
     }
-    return false;
+    return HasStringLdcBreakpoint(method, location);
 }
 
 bool SamePhysicalFieldWatch(JNIEnv* env, const PersistentFieldWatch& watch,
@@ -388,12 +506,70 @@ bool MatchesPersistentFieldWatch(JNIEnv* env, jclass klass, jfieldID field,
 
 jvmtiError ReapplyPersistentBreakpoints(JNIEnv* env, jclass klass) {
     std::lock_guard<std::mutex> guard(gBreakpointMutex);
-    for (const PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
+    for (PersistentBreakpoint& breakpoint : gPersistentBreakpoints) {
         if (breakpoint.klass == nullptr
                 || env->IsSameObject(breakpoint.klass, klass) != JNI_TRUE) continue;
-        const jvmtiError error = gJvmti->SetBreakpoint(breakpoint.method, breakpoint.location);
+        jmethodID current = ResolveMethod(env, klass,
+            breakpoint.methodName, breakpoint.descriptor);
+        if (current == nullptr) return JVMTI_ERROR_NOT_FOUND;
+        breakpoint.method = current;
+        const jvmtiError error = gJvmti->SetBreakpoint(current, breakpoint.location);
         if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) return error;
     }
+    return JVMTI_ERROR_NONE;
+}
+
+jvmtiError ReapplyStringLdcBreakpoints(JNIEnv* env, jclass klass) {
+    std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+    const std::size_t originalCount = gStringLdcBreakpoints.size();
+    std::vector<StringLdcBreakpoint> activeVersions;
+    for (std::size_t index = 0; index < originalCount; ++index) {
+        StringLdcBreakpoint& breakpoint = gStringLdcBreakpoints[index];
+        if (breakpoint.klass == nullptr
+                || env->IsSameObject(breakpoint.klass, klass) != JNI_TRUE) continue;
+        if (!breakpoint.refreshable) continue;
+        const jmethodID previous = breakpoint.method;
+        bool previousIsActive = false;
+        {
+            std::lock_guard<std::mutex> debuggerGuard(gDebuggerMutex);
+            for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+                if (stop != nullptr && stop->paused && stop->method == previous) {
+                    previousIsActive = true;
+                    break;
+                }
+            }
+        }
+        jmethodID current = ResolveMethod(env, klass,
+            breakpoint.methodName, breakpoint.descriptor);
+        if (current == nullptr) return JVMTI_ERROR_NOT_FOUND;
+        breakpoint.method = current;
+        const jvmtiError error = gJvmti->SetBreakpoint(current, breakpoint.location);
+        if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) return error;
+        if (!previousIsActive || previous == current) continue;
+
+        bool alreadyTracked = false;
+        for (const StringLdcBreakpoint& candidate : gStringLdcBreakpoints) {
+            if (candidate.method == previous
+                    && candidate.location == breakpoint.location) {
+                alreadyTracked = true;
+                break;
+            }
+        }
+        if (alreadyTracked) continue;
+        const jvmtiError activeError = gJvmti->SetBreakpoint(previous, breakpoint.location);
+        if (activeError != JVMTI_ERROR_NONE && activeError != JVMTI_ERROR_DUPLICATE) continue;
+        jobject classReference = env->NewGlobalRef(breakpoint.klass);
+        jobject literalReference = env->NewGlobalRef(breakpoint.literal);
+        if (classReference == nullptr || literalReference == nullptr) {
+            if (classReference != nullptr) env->DeleteGlobalRef(classReference);
+            if (literalReference != nullptr) env->DeleteGlobalRef(literalReference);
+            continue;
+        }
+        activeVersions.push_back({classReference, previous, breakpoint.methodName,
+            breakpoint.descriptor, breakpoint.location, literalReference, false});
+    }
+    gStringLdcBreakpoints.insert(gStringLdcBreakpoints.end(),
+        activeVersions.begin(), activeVersions.end());
     return JVMTI_ERROR_NONE;
 }
 
@@ -1043,6 +1219,7 @@ bool DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation locat
     std::shared_ptr<DebuggerStop> stop = std::make_shared<DebuggerStop>();
     stop->thread = threadReference;
     stop->returnValue = returnValue == nullptr ? nullptr : env->NewGlobalRef(returnValue);
+    stop->method = method;
     stop->reason = reason == nullptr ? "breakpoint" : reason;
     stop->className = details.className;
     stop->methodName = details.name;
@@ -1128,12 +1305,29 @@ void RememberMatchedStringAllocation(JNIEnv* env, jobject value) {
 
 bool AllocatedByNewInstruction(jmethodID method, jlocation location) {
     if (method == nullptr || location < 0 || gJvmti == nullptr) return false;
+    const MethodLocationKey key{method, location};
+    {
+        std::lock_guard<std::mutex> guard(gAllocationOpcodeCacheMutex);
+        const auto cached = gAllocationOpcodeCache.find(key);
+        if (cached != gAllocationOpcodeCache.end()) return cached->second;
+    }
     jint count = 0;
     unsigned char* bytecodes = nullptr;
     if (gJvmti->GetBytecodes(method, &count, &bytecodes) != JVMTI_ERROR_NONE
             || bytecodes == nullptr) return false;
     const bool result = location < count && bytecodes[location] == 0xbb; // JVM NEW
     gJvmti->Deallocate(bytecodes);
+    {
+        std::lock_guard<std::mutex> guard(gAllocationOpcodeCacheMutex);
+        if (gAllocationOpcodeCache.emplace(key, result).second) {
+            gAllocationOpcodeCacheOrder.push_back(key);
+        }
+        while (gAllocationOpcodeCache.size() > kMaximumAllocationOpcodeCacheEntries
+                && !gAllocationOpcodeCacheOrder.empty()) {
+            gAllocationOpcodeCache.erase(gAllocationOpcodeCacheOrder.front());
+            gAllocationOpcodeCacheOrder.pop_front();
+        }
+    }
     return result;
 }
 
@@ -1141,12 +1335,13 @@ bool AllocatedByNewInstruction(jmethodID method, jlocation location) {
 // and 1 when matchedIds should stop. Content-only fast hooks are resolved before the expensive
 // JVMTI current-thread and frame calls, which is the usual interactive String-search path.
 int MatchFastStringHooksWithoutStack(JNIEnv* env, jstring value,
-        std::vector<std::string>& matchedIds) {
-    if (gCompleteStringAllocationHookCount.load() != 0) return -1;
+        std::vector<std::string>& matchedIds, bool literalObservation = false) {
+    if (gArmedCompleteStringAllocationHookCount.load() != 0) return -1;
     bool needsContent = false;
     {
         std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
         for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (literalObservation && !hook.includeLdc) continue;
             if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
             if (hook.creatorClassPattern != "*" || hook.creatorMethodPattern != "*"
                     || hook.creatorDescriptorPattern != "*") return -1;
@@ -1169,11 +1364,13 @@ int MatchFastStringHooksWithoutStack(JNIEnv* env, jstring value,
         // A controller may replace a hook while the content is being read. Fall back rather
         // than evaluating a newly-added creator constraint without its stack.
         for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (literalObservation && !hook.includeLdc) continue;
             if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
             if (hook.creatorClassPattern != "*" || hook.creatorMethodPattern != "*"
                     || hook.creatorDescriptorPattern != "*") return -1;
         }
         for (StringAllocationHook& hook : gStringAllocationHooks) {
+            if (literalObservation && !hook.includeLdc) continue;
             if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
             if (hook.contentPattern != "*" && !StringAllocationPatternMatches(
                     hook.contentPattern, content, hook.caseSensitive)) continue;
@@ -1210,13 +1407,20 @@ void RollBackFastStringHookEmission(JNIEnv* env, const std::vector<std::string>&
 
 bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringValue,
         bool completeOnly = false, jmethodID currentMethod = nullptr,
-        jlocation currentLocation = 0, jint stackStartDepth = 0) {
+        jlocation currentLocation = 0, jint stackStartDepth = 0,
+        const char* observationState = "allocation", bool deduplicateObservation = true,
+        bool literalObservation = false) {
     if (env == nullptr || thread == nullptr || stringValue == nullptr
-            || gArmedStringAllocationHookCount.load() == 0 || tMatchingStringAllocation) return false;
+            || gArmedStringAllocationHookCount.load() == 0 || tMatchingStringAllocation
+            || tStringHookSuppressionDepth != 0 || tInJavaCallback) return false;
     if (IsJvmrtdpServiceThreadCached(env, thread)) return false;
-    const bool deduplicate = gCompleteStringAllocationHookCount.load() != 0;
-    if (deduplicate && WasMatchedStringAllocation(env, stringValue)) return false;
     ThreadFlagGuard matchingGuard(tMatchingStringAllocation);
+    // String constructors are heavily chained. Remember an object after the
+    // first matching constructor in both modes; otherwise FAST can stop two or
+    // three times for one `new String(...)`. Literal observations explicitly
+    // opt out because repeated LDC executions are distinct events.
+    const bool deduplicate = deduplicateObservation;
+    if (deduplicate && WasMatchedStringAllocation(env, stringValue)) return false;
     std::vector<StringAllocationHook> hooks;
     {
         std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
@@ -1224,6 +1428,7 @@ bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringVal
     }
     bool needsContent = false;
     for (const StringAllocationHook& hook : hooks) {
+        if (literalObservation && !hook.includeLdc) continue;
         if (completeOnly && !hook.complete) continue;
         if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
         if (hook.contentPattern != "*") { needsContent = true; break; }
@@ -1243,6 +1448,7 @@ bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringVal
     std::vector<StringAllocationHook> contentMatches;
     bool needsCreatorStack = false;
     for (const StringAllocationHook& hook : hooks) {
+        if (literalObservation && !hook.includeLdc) continue;
         if (completeOnly && !hook.complete) continue;
         if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
         if (hook.contentPattern != "*" && !StringAllocationPatternMatches(
@@ -1260,6 +1466,12 @@ bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringVal
         if (gJvmti->GetStackTrace(thread, stackStartDepth,
                 kMaximumFrames, frames, &frameCount)
                 != JVMTI_ERROR_NONE || frameCount == 0) return false;
+        // Creator matching needs the full stack, but an injected observation may carry a
+        // normalized source BCI that is more precise than the bridge call-site frame location.
+        if (currentMethod != nullptr) {
+            frames[0].method = currentMethod;
+            frames[0].location = currentLocation;
+        }
     } else {
         frames[0].method = currentMethod;
         frames[0].location = currentLocation;
@@ -1338,25 +1550,50 @@ bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringVal
         reason += matchedIds[index];
     }
     DebuggerTrap(env, thread, frames[0].method, frames[0].location,
-        reason.c_str(), stringValue, "allocation");
+        reason.c_str(), stringValue, observationState);
     return true;
 }
 
-void JNICALL BootstrapStringObserved(JNIEnv* env, jclass, jstring value) {
+void BootstrapStringObservedWithState(JNIEnv* env, jstring value,
+        const char* observationState, bool deduplicateObservation, bool literalObservation,
+        jint observedLocation = -1) {
     if (env == nullptr || value == nullptr || gArmedStringAllocationHookCount.load() == 0
-            || tMatchingStringAllocation) return;
-    std::vector<std::string> fastMatches;
-    const int fastMatch = MatchFastStringHooksWithoutStack(env, value, fastMatches);
-    if (fastMatch == 0) return;
+            || tMatchingStringAllocation || tStringHookSuppressionDepth != 0
+            || tInJavaCallback) return;
+    if (deduplicateObservation && WasMatchedStringAllocation(env, value)) return;
+    constexpr jint kObservedCallerDepth = 3;
     jthread thread = nullptr;
-    if (gJvmti->GetCurrentThread(&thread) != JVMTI_ERROR_NONE || thread == nullptr) return;
     jmethodID method = nullptr;
     jlocation location = 0;
-    // depth 0 is observed0 (native), depth 1 is the Java prefilter wrapper, and depth 2 is
-    // the terminal java.lang.String constructor containing the injected probe.
-    if (gJvmti->GetFrameLocation(thread, 2, &method, &location) != JVMTI_ERROR_NONE) {
+    if (literalObservation) {
+        if (gJvmti->GetCurrentThread(&thread) != JVMTI_ERROR_NONE || thread == nullptr) return;
+        if (gJvmti->GetFrameLocation(thread, kObservedCallerDepth,
+                &method, &location) != JVMTI_ERROR_NONE) {
+            method = nullptr;
+            location = 0;
+        }
+        if (observedLocation != -1) {
+            location = static_cast<jlocation>(observedLocation & 0xffff);
+        }
+    }
+    std::vector<std::string> fastMatches;
+    const int fastMatch = MatchFastStringHooksWithoutStack(
+        env, value, fastMatches, literalObservation);
+    if (fastMatch == 0) {
+        if (thread != nullptr) env->DeleteLocalRef(thread);
+        return;
+    }
+    if (thread == nullptr
+            && (gJvmti->GetCurrentThread(&thread) != JVMTI_ERROR_NONE || thread == nullptr)) return;
+    // depth 0 is the native bridge, depth 1 is the shared Java prefilter, depth 2 is the
+    // observed/observedLiteral wrapper, and depth 3 is the constructor or LDC owner.
+    if (method == nullptr && gJvmti->GetFrameLocation(thread, kObservedCallerDepth,
+            &method, &location) != JVMTI_ERROR_NONE) {
         method = nullptr;
         location = 0;
+    }
+    if (literalObservation && observedLocation != -1) {
+        location = static_cast<jlocation>(observedLocation & 0xffff);
     }
     if (fastMatch > 0) {
         std::string reason = "string_alloc:";
@@ -1364,14 +1601,50 @@ void JNICALL BootstrapStringObserved(JNIEnv* env, jclass, jstring value) {
             if (index != 0) reason.push_back(',');
             reason += fastMatches[index];
         }
-        if (!DebuggerTrap(env, thread, method, location,
-                reason.c_str(), value, "allocation")) {
+        const bool stopped = DebuggerTrap(env, thread, method, location,
+            reason.c_str(), value, observationState);
+        if (stopped && deduplicateObservation) {
+            RememberMatchedStringAllocation(env, value);
+        } else if (!stopped) {
             RollBackFastStringHookEmission(env, fastMatches);
         }
     } else {
-        TrapMatchingStringAllocation(env, thread, value, false, method, location, 2);
+        TrapMatchingStringAllocation(env, thread, value, false, method, location,
+            kObservedCallerDepth,
+            observationState, deduplicateObservation, literalObservation);
     }
     env->DeleteLocalRef(thread);
+}
+
+void JNICALL BootstrapStringObserved(JNIEnv* env, jclass, jstring value) {
+    BootstrapStringObservedWithState(env, value, "allocation", true, false);
+}
+
+void JNICALL BootstrapStringLiteralObserved(JNIEnv* env, jclass, jstring value,
+        jint observedLocation) {
+    // LDC observes a use of an interned constant, not a new allocation. Repeated executions
+    // remain independently observable and must not enter allocation-object de-duplication.
+    BootstrapStringObservedWithState(env, value, "ldc", false, true, observedLocation);
+}
+
+// Returns 0 for no LDC site, 1 when the site was evaluated without stopping, and 2 when it stopped.
+int HandleStringLdcBreakpoint(JNIEnv* env, jthread thread,
+        jmethodID method, jlocation location) {
+    if (tStringHookSuppressionDepth != 0 || tInJavaCallback) return 0;
+    jobject literal = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+        for (const StringLdcBreakpoint& breakpoint : gStringLdcBreakpoints) {
+            if (breakpoint.method != method || breakpoint.location != location) continue;
+            literal = env->NewLocalRef(breakpoint.literal);
+            break;
+        }
+    }
+    if (literal == nullptr) return 0;
+    const bool trapped = TrapMatchingStringAllocation(env, thread, literal, false,
+        method, location, 0, "ldc", false, true);
+    env->DeleteLocalRef(literal);
+    return trapped ? 2 : 1;
 }
 
 void ConfigureStartupDebugger(const char* options) {
@@ -1498,6 +1771,9 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
         jintArray methodArgumentSlots = nullptr, jobjectArray methodArgumentErrors = nullptr,
         jint methodFlags = 0, jobject returnValue = nullptr) {
     if (env == nullptr || gDispatcherClass == nullptr || gDispatchMethod == nullptr || tInJavaCallback) return;
+    // Guard before creating the Java metadata strings. VMObjectAlloc can otherwise recursively
+    // dispatch the allocations performed by NewStringUTF itself.
+    ThreadFlagGuard callbackGuard(tInJavaCallback);
     const MethodDetails details = DescribeMethod(env, method);
     const std::string className = eventClass == nullptr ? details.className : BinaryClassName(eventClass);
     jstring javaEvent = env->NewStringUTF(eventName);
@@ -1514,7 +1790,6 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
     jstring javaReceiverError = receiverError == nullptr || *receiverError == '\0'
         ? nullptr : env->NewStringUTF(receiverError);
     if (javaEvent != nullptr) {
-        tInJavaCallback = true;
         env->CallStaticVoidMethod(gDispatcherClass, gDispatchMethod,
             javaEvent, thread, javaClass, javaMethod, javaDescriptor,
             static_cast<jlong>(location), subject, value,
@@ -1522,7 +1797,6 @@ void DispatchEvent(JNIEnv* env, const char* eventName, jthread thread, jclass ev
             static_cast<jlong>(relatedLocation), javaMemberName, javaMemberDescriptor,
             secondarySubject, javaText, receiver, javaReceiverError, methodArguments,
             methodArgumentNames, methodArgumentSlots, methodArgumentErrors, methodFlags, returnValue);
-        tInJavaCallback = false;
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (javaEvent != nullptr) env->DeleteLocalRef(javaEvent);
@@ -1903,7 +2177,8 @@ void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
     if (startupMain) {
         // break-main is a one-shot bootstrap stop. Leaving it installed can retrap the
         // launcher and keeps startup-only bookkeeping alive during AWT/Swing initialization.
-        if (!HasPersistentBreakpoint(env, gStartupMainMethod, gStartupMainLocation)) {
+        if (!HasPersistentBreakpoint(env, gStartupMainMethod, gStartupMainLocation)
+                && !HasStringLdcBreakpoint(gStartupMainMethod, gStartupMainLocation)) {
             gJvmti->ClearBreakpoint(gStartupMainMethod, gStartupMainLocation);
         }
         gStartupBreakpointInstalled = false;
@@ -1911,17 +2186,27 @@ void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
         gStartupMainLocation = 0;
     }
     if (startupClinit) {
-        if (!HasPersistentBreakpoint(env, gStartupClinitMethod, gStartupClinitLocation)) {
+        if (!HasPersistentBreakpoint(env, gStartupClinitMethod, gStartupClinitLocation)
+                && !HasStringLdcBreakpoint(gStartupClinitMethod, gStartupClinitLocation)) {
             gJvmti->ClearBreakpoint(gStartupClinitMethod, gStartupClinitLocation);
         }
         gStartupClinitBreakpointInstalled = false;
         gStartupClinitMethod = nullptr;
         gStartupClinitLocation = 0;
     }
-    if (!startupMain && !startupClinit
-            && !MatchesPersistentBreakpoint(env, thread, method, location)) return;
-    DebuggerTrap(env, thread, method, location,
-        startupMain ? "main_entry" : startupClinit ? "class_init" : "breakpoint");
+    if (startupMain || startupClinit) {
+        DebuggerTrap(env, thread, method, location,
+            startupMain ? "main_entry" : "class_init");
+        // A String LDC hook may have been installed while the startup stop was paused,
+        // including at the same BCI. Evaluate it before the instruction is allowed to run.
+        HandleStringLdcBreakpoint(env, thread, method, location);
+        return;
+    }
+    const int ldcResult = HandleStringLdcBreakpoint(env, thread, method, location);
+    if (ldcResult == 2) return;
+    if (ldcResult != 0 && !HasPersistentBreakpoint(env, method, location)) return;
+    if (!MatchesPersistentBreakpoint(env, thread, method, location)) return;
+    DebuggerTrap(env, thread, method, location, "breakpoint");
 }
 
 void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -2037,8 +2322,10 @@ void JNICALL VmObjectAlloc(jvmtiEnv*, JNIEnv* env, jthread thread, jobject objec
     if (gJavaVmObjectAllocDispatchEnabled.load()) {
         DispatchEvent(env, "vm_object_alloc", thread, klass, nullptr, 0, object, size);
     }
-    if (gArmedCompleteStringAllocationHookCount.load() == 0 || gStringClass == nullptr
+    if (tStringHookSuppressionDepth != 0 || tInJavaCallback
+            || gArmedCompleteStringAllocationHookCount.load() == 0 || gStringClass == nullptr
             || env->IsSameObject(klass, gStringClass) != JNI_TRUE) return;
+    if (IsJvmrtdpServiceThreadCached(env, thread)) return;
     jmethodID method = nullptr;
     jlocation location = 0;
     if (gJvmti->GetFrameLocation(thread, 0, &method, &location) == JVMTI_ERROR_NONE
@@ -2119,31 +2406,78 @@ void JNICALL ClassFileLoadHook(jvmtiEnv* jvmti, JNIEnv* env, jclass classBeingRe
         jobject loader, const char* name, jobject protectionDomain, jint classDataLength,
         const unsigned char* classData,
         jint* newClassDataLength, unsigned char** newClassData) {
+    // The transformer parses constant-pool UTF8 entries into ordinary Java Strings. Those are
+    // JVMRTDP implementation details, not target String creations or LDC executions. Suppress
+    // both constructor probes and COMPLETE VMObjectAlloc matching for the complete callback,
+    // including allocations made before the Java transformer is invoked.
+    StringHookSuppressionGuard stringHookSuppression;
+    if (classBeingRedefined != nullptr) ClearAllocationOpcodeCache();
     if (tRequestedClass != nullptr && tRequestedBytes != nullptr && classBeingRedefined != nullptr
         && env->IsSameObject(tRequestedClass, classBeingRedefined)) {
         tRequestedBytes->assign(classData, classData + classDataLength);
     }
-    if (gDispatcherClass == nullptr || gTransformMethod == nullptr || classDataLength <= 0 || tInJavaCallback) return;
+    if (classDataLength <= 0) return;
     std::string binaryName = name == nullptr ? BinaryClassName(classBeingRedefined) : name;
     std::replace(binaryName.begin(), binaryName.end(), '/', '.');
+    CacheClassBytes(binaryName, classData, classDataLength);
+    if (tInJavaCallback) return;
+    bool hasBuiltInTransformer = false;
+    {
+        std::lock_guard<std::mutex> guard(gStringLdcTransformerMutex);
+        hasBuiltInTransformer = gStringLdcTransformer != nullptr
+            && gStringLdcTransformMethod != nullptr;
+    }
+    const bool hasGenericTransformer = gJavaClassFileTransformDispatchEnabled.load()
+        && gDispatcherClass != nullptr && gTransformMethod != nullptr;
+    if (!hasBuiltInTransformer && !hasGenericTransformer) return;
     jstring javaName = NewOptionalString(env, binaryName);
     jbyteArray original = env->NewByteArray(classDataLength);
     if (original != nullptr) {
         env->SetByteArrayRegion(original, 0, classDataLength, reinterpret_cast<const jbyte*>(classData));
     }
-    tInJavaCallback = true;
-    jbyteArray replacement = original == nullptr ? nullptr : static_cast<jbyteArray>(env->CallStaticObjectMethod(
-        gDispatcherClass, gTransformMethod, loader, javaName, classBeingRedefined, protectionDomain, original));
-    tInJavaCallback = false;
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        replacement = nullptr;
+    jbyteArray replacement = nullptr;
+    jbyteArray current = original;
+    bool ownsCurrent = false;
+    if (original != nullptr && hasBuiltInTransformer) {
+        std::lock_guard<std::mutex> guard(gStringLdcTransformerMutex);
+        if (gStringLdcTransformer != nullptr && gStringLdcTransformMethod != nullptr) {
+            tInJavaCallback = true;
+            replacement = static_cast<jbyteArray>(env->CallObjectMethod(gStringLdcTransformer,
+                gStringLdcTransformMethod, loader, javaName, classBeingRedefined,
+                protectionDomain, current));
+            tInJavaCallback = false;
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                replacement = nullptr;
+            }
+            if (replacement != nullptr && env->IsSameObject(replacement, current) != JNI_TRUE) {
+                current = replacement;
+                ownsCurrent = true;
+            }
+        }
     }
-    if (replacement != nullptr) {
-        const jsize replacementLength = env->GetArrayLength(replacement);
+    replacement = nullptr;
+    if (current != nullptr && hasGenericTransformer) {
+        tInJavaCallback = true;
+        replacement = static_cast<jbyteArray>(env->CallStaticObjectMethod(
+            gDispatcherClass, gTransformMethod, loader, javaName, classBeingRedefined,
+            protectionDomain, current));
+        tInJavaCallback = false;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            replacement = nullptr;
+        }
+        if (replacement != nullptr && env->IsSameObject(replacement, current) != JNI_TRUE) {
+            if (ownsCurrent) env->DeleteLocalRef(current);
+            current = replacement;
+            ownsCurrent = true;
+        }
+    }
+    if (ownsCurrent && current != nullptr) {
+        const jsize replacementLength = env->GetArrayLength(current);
         unsigned char* allocated = nullptr;
         if (replacementLength > 0 && jvmti->Allocate(replacementLength, &allocated) == JVMTI_ERROR_NONE) {
-            env->GetByteArrayRegion(replacement, 0, replacementLength, reinterpret_cast<jbyte*>(allocated));
+            env->GetByteArrayRegion(current, 0, replacementLength, reinterpret_cast<jbyte*>(allocated));
             if (!env->ExceptionCheck()) {
                 *newClassDataLength = replacementLength;
                 *newClassData = allocated;
@@ -2153,7 +2487,7 @@ void JNICALL ClassFileLoadHook(jvmtiEnv* jvmti, JNIEnv* env, jclass classBeingRe
             }
         }
         if (allocated != nullptr) jvmti->Deallocate(allocated);
-        env->DeleteLocalRef(replacement);
+        env->DeleteLocalRef(current);
     }
     if (original != nullptr) env->DeleteLocalRef(original);
     if (javaName != nullptr) env->DeleteLocalRef(javaName);
@@ -2175,13 +2509,25 @@ jbyteArray JNICALL NativeGetClassBytes(JNIEnv* env, jclass, jstring classNameVal
         ThrowJava(env, "java/lang/IllegalArgumentException", "Class name must not be empty");
         return nullptr;
     }
+    jclass klass = FindLoadedClass(env, className);
+    if (klass == nullptr) return nullptr;
+
+    std::vector<unsigned char> cachedBytes;
+    if (CachedClassBytes(className, cachedBytes) && !cachedBytes.empty()) {
+        env->DeleteLocalRef(klass);
+        jbyteArray cached = env->NewByteArray(static_cast<jsize>(cachedBytes.size()));
+        if (cached != nullptr) env->SetByteArrayRegion(cached, 0,
+            static_cast<jsize>(cachedBytes.size()),
+            reinterpret_cast<const jbyte*>(cachedBytes.data()));
+        return cached;
+    }
+
     if (!gCanRetransform) {
+        env->DeleteLocalRef(klass);
         ThrowJava(env, "java/lang/UnsupportedOperationException",
             "This JVM did not grant can_retransform_classes to the injected JVMTI environment");
         return nullptr;
     }
-    jclass klass = FindLoadedClass(env, className);
-    if (klass == nullptr) return nullptr;
 
     jboolean modifiable = JNI_FALSE;
     jvmtiError error = gJvmti->IsModifiableClass(klass, &modifiable);
@@ -2198,7 +2544,7 @@ jbyteArray JNICALL NativeGetClassBytes(JNIEnv* env, jclass, jstring classNameVal
         tRequestedBytes = &bytes;
         std::lock_guard<std::recursive_mutex> eventGuard(gEventMutex);
         const bool ownsTemporaryEnable = !gClassFileHookEnabled.load()
-            && tTemporaryClassFileHookDepth == 0;
+            && !gClassBytesCacheHookEnabled.load() && tTemporaryClassFileHookDepth == 0;
         error = ownsTemporaryEnable
             ? gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr)
             : JVMTI_ERROR_NONE;
@@ -2207,8 +2553,10 @@ jbyteArray JNICALL NativeGetClassBytes(JNIEnv* env, jclass, jstring classNameVal
             error = gJvmti->RetransformClasses(1, &klass);
             --tTemporaryClassFileHookDepth;
             if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
+            if (error == JVMTI_ERROR_NONE) error = ReapplyStringLdcBreakpoints(env, klass);
         }
-        const bool shouldDisable = ownsTemporaryEnable && !gClassFileHookEnabled.load();
+        const bool shouldDisable = ownsTemporaryEnable && !gClassFileHookEnabled.load()
+            && !gClassBytesCacheHookEnabled.load();
         const jvmtiError disableError = shouldDisable ? gJvmti->SetEventNotificationMode(
             JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr) : JVMTI_ERROR_NONE;
         tRequestedClass = nullptr;
@@ -2574,7 +2922,7 @@ bool ResolveEvent(const std::string& input, jvmtiEvent* event) {
 }
 
 jmethodID ResolveMethod(JNIEnv* env, jclass klass, const std::string& expectedName,
-        const std::string& expectedDescriptor, bool throwIfMissing = true) {
+        const std::string& expectedDescriptor, bool throwIfMissing) {
     jint count = 0;
     jmethodID* methods = nullptr;
     const jvmtiError error = gJvmti->GetClassMethods(klass, &count, &methods);
@@ -2711,6 +3059,8 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
         gJavaBreakpointDispatchEnabled.store(enabled == JNI_TRUE);
     } else if (event == JVMTI_EVENT_VM_OBJECT_ALLOC) {
         gJavaVmObjectAllocDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_CLASS_FILE_LOAD_HOOK) {
+        gJavaClassFileTransformDispatchEnabled.store(enabled == JNI_TRUE);
     }
     if (enabled != JNI_TRUE && event == JVMTI_EVENT_BREAKPOINT) {
         std::lock_guard<std::mutex> debuggerGuard(gDebuggerMutex);
@@ -2728,8 +3078,11 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
         }
     }
     std::lock_guard<std::recursive_mutex> guard(gEventMutex);
+    const bool retainClassBytesCache = event == JVMTI_EVENT_CLASS_FILE_LOAD_HOOK
+        && gClassBytesCacheHookEnabled.load();
     const jvmtiError error = gJvmti->SetEventNotificationMode(
-        enabled == JNI_TRUE ? JVMTI_ENABLE : JVMTI_DISABLE, event, nullptr);
+        enabled == JNI_TRUE || retainClassBytesCache ? JVMTI_ENABLE : JVMTI_DISABLE,
+        event, nullptr);
     if (error == JVMTI_ERROR_NONE && event == JVMTI_EVENT_CLASS_FILE_LOAD_HOOK) {
         gClassFileHookEnabled.store(enabled == JNI_TRUE);
     }
@@ -2789,9 +3142,11 @@ void JNICALL NativeRegisterStringHookBridge(JNIEnv* env, jclass, jclass bridgeCl
     }
     JNINativeMethod methods[] = {
         {const_cast<char*>("observed0"), const_cast<char*>("(Ljava/lang/String;)V"),
-            reinterpret_cast<void*>(&BootstrapStringObserved)}
+            reinterpret_cast<void*>(&BootstrapStringObserved)},
+        {const_cast<char*>("observedLiteral0"), const_cast<char*>("(Ljava/lang/String;I)V"),
+            reinterpret_cast<void*>(&BootstrapStringLiteralObserved)}
     };
-    if (env->RegisterNatives(bridgeClass, methods, 1) != JNI_OK) {
+    if (env->RegisterNatives(bridgeClass, methods, 2) != JNI_OK) {
         ThrowJava(env, "java/lang/IllegalStateException",
             "Cannot register the bootstrap String hook native bridge");
         return;
@@ -2802,6 +3157,137 @@ void JNICALL NativeRegisterStringHookBridge(JNIEnv* env, jclass, jclass bridgeCl
     gStringHookBridgeClass = reference;
     gStringHookSetActiveMethod = setActive;
     gStringHookConfigureMethod = configure;
+}
+
+void JNICALL NativeRegisterStringLdcTransformer(JNIEnv* env, jclass, jobject transformer) {
+    std::lock_guard<std::mutex> guard(gStringLdcTransformerMutex);
+    if (gStringLdcTransformer != nullptr) env->DeleteGlobalRef(gStringLdcTransformer);
+    gStringLdcTransformer = nullptr;
+    gStringLdcTransformMethod = nullptr;
+    if (transformer == nullptr) return;
+    jclass transformerClass = env->GetObjectClass(transformer);
+    if (transformerClass == nullptr) return;
+    jmethodID transform = env->GetMethodID(transformerClass, "transformRaw",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;"
+        "Ljava/security/ProtectionDomain;[B)[B");
+    env->DeleteLocalRef(transformerClass);
+    if (transform == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "String LDC transformer has no compatible transformRaw method");
+        return;
+    }
+    jobject reference = env->NewGlobalRef(transformer);
+    if (reference == nullptr) return;
+    gStringLdcTransformer = reference;
+    gStringLdcTransformMethod = transform;
+}
+
+void JNICALL NativeClearStringLdcBreakpoints(JNIEnv* env, jclass) {
+    std::vector<StringLdcBreakpoint> removed;
+    {
+        std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+        removed.swap(gStringLdcBreakpoints);
+    }
+    for (const StringLdcBreakpoint& breakpoint : removed) {
+        const bool startup = (gStartupBreakpointInstalled
+                && breakpoint.method == gStartupMainMethod
+                && breakpoint.location == gStartupMainLocation)
+            || (gStartupClinitBreakpointInstalled
+                && breakpoint.method == gStartupClinitMethod
+                && breakpoint.location == gStartupClinitLocation);
+        if (!startup && !HasPersistentBreakpoint(env, breakpoint.method, breakpoint.location)) {
+            const jvmtiError error = gJvmti->ClearBreakpoint(
+                breakpoint.method, breakpoint.location);
+            if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_NOT_FOUND
+                    && error != JVMTI_ERROR_INVALID_METHODID) {
+                // Continue releasing references; a stale physical breakpoint is safer than a leak.
+            }
+        }
+        if (breakpoint.literal != nullptr) env->DeleteGlobalRef(breakpoint.literal);
+        if (breakpoint.klass != nullptr) env->DeleteGlobalRef(breakpoint.klass);
+    }
+}
+
+void JNICALL NativeRegisterStringLdcBreakpoint(JNIEnv* env, jclass, jclass klass,
+        jstring methodNameValue, jstring descriptorValue, jlong location,
+        jstring literalValue) {
+    if (klass == nullptr || literalValue == nullptr || location < 0 || location > 65535) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "LDC breakpoint requires a class, literal, and valid BCI");
+        return;
+    }
+    const std::string methodName = JStringToUtf8(env, methodNameValue);
+    const std::string descriptor = JStringToUtf8(env, descriptorValue);
+    jmethodID method = ResolveMethod(env, klass, methodName, descriptor);
+    if (method == nullptr) return;
+    {
+        std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+        for (const StringLdcBreakpoint& breakpoint : gStringLdcBreakpoints) {
+            if (breakpoint.method == method && breakpoint.location == location) return;
+        }
+    }
+    jclass literalClass = env->GetObjectClass(literalValue);
+    if (literalClass == nullptr) return;
+    jmethodID internMethod = env->GetMethodID(literalClass, "intern", "()Ljava/lang/String;");
+    env->DeleteLocalRef(literalClass);
+    if (internMethod == nullptr) return;
+    jobject interned = env->CallObjectMethod(literalValue, internMethod);
+    if (env->ExceptionCheck() || interned == nullptr) return;
+    jvmtiError error = gJvmti->SetEventNotificationMode(
+        JVMTI_ENABLE, JVMTI_EVENT_BREAKPOINT, nullptr);
+    if (error == JVMTI_ERROR_NONE) {
+        error = gJvmti->SetBreakpoint(method, static_cast<jlocation>(location));
+    }
+    if (error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_DUPLICATE) {
+        env->DeleteLocalRef(interned);
+        ThrowJvmti(env, "Set String LDC breakpoint", error);
+        return;
+    }
+
+    std::vector<jmethodID> physicalMethods{method};
+    const std::string className = BinaryClassName(klass);
+    {
+        std::lock_guard<std::mutex> guard(gDebuggerMutex);
+        for (const std::shared_ptr<DebuggerStop>& stop : gDebuggerStops) {
+            if (stop == nullptr || !stop->paused || stop->method == nullptr
+                    || stop->className != className || stop->methodName != methodName
+                    || stop->descriptor != descriptor
+                    || std::find(physicalMethods.begin(), physicalMethods.end(), stop->method)
+                        != physicalMethods.end()) continue;
+            physicalMethods.push_back(stop->method);
+        }
+    }
+
+    std::vector<StringLdcBreakpoint> registrations;
+    for (std::size_t index = 0; index < physicalMethods.size(); ++index) {
+        jmethodID physicalMethod = physicalMethods[index];
+        if (index != 0) {
+            const jvmtiError activeError = gJvmti->SetBreakpoint(
+                physicalMethod, static_cast<jlocation>(location));
+            if (activeError != JVMTI_ERROR_NONE && activeError != JVMTI_ERROR_DUPLICATE) {
+                continue;
+            }
+        }
+        jobject classReference = env->NewGlobalRef(klass);
+        jobject literalReference = env->NewGlobalRef(interned);
+        if (classReference == nullptr || literalReference == nullptr) {
+            if (classReference != nullptr) env->DeleteGlobalRef(classReference);
+            if (literalReference != nullptr) env->DeleteGlobalRef(literalReference);
+            continue;
+        }
+        registrations.push_back({classReference, physicalMethod, methodName, descriptor,
+            static_cast<jlocation>(location), literalReference, index == 0});
+    }
+    env->DeleteLocalRef(interned);
+    if (registrations.empty()) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "Unable to retain String LDC breakpoint references");
+        return;
+    }
+    std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+    gStringLdcBreakpoints.insert(gStringLdcBreakpoints.end(),
+        registrations.begin(), registrations.end());
 }
 
 void JNICALL NativeSetBreakpoint(JNIEnv* env, jclass, jclass klass, jstring methodNameValue,
@@ -3011,7 +3497,7 @@ void JNICALL NativeSetStringAllocationHook(JNIEnv* env, jclass,
         jstring registrationIdValue, jstring contentPatternValue,
         jstring creatorClassPatternValue, jstring creatorMethodPatternValue,
         jstring creatorDescriptorPatternValue, jboolean caseSensitive, jint mode,
-        jlong maximumHits, jint sampleEvery, jboolean enabled) {
+        jlong maximumHits, jint sampleEvery, jboolean includeLdc, jboolean enabled) {
     const std::string registrationId = JStringToUtf8(env, registrationIdValue);
     if (registrationId.empty()) {
         ThrowJava(env, "java/lang/IllegalArgumentException",
@@ -3043,6 +3529,7 @@ void JNICALL NativeSetStringAllocationHook(JNIEnv* env, jclass,
             if (hook.creatorDescriptorPattern.empty()) hook.creatorDescriptorPattern = "*";
             hook.caseSensitive = caseSensitive == JNI_TRUE;
             hook.complete = mode == 1;
+            hook.includeLdc = includeLdc == JNI_TRUE;
             hook.maximumHits = static_cast<std::uint64_t>(maximumHits);
             hook.sampleEvery = static_cast<std::uint64_t>(sampleEvery);
             gStringAllocationHooks.push_back(std::move(hook));
@@ -3068,18 +3555,35 @@ void JNICALL NativeSetStringAllocationHook(JNIEnv* env, jclass,
             gMatchedStringAllocations.clear();
         }
     }
-    if (gArmedCompleteStringAllocationHookCount.load() != 0) {
-        const jvmtiError error = gJvmti->SetEventNotificationMode(
-            JVMTI_ENABLE, JVMTI_EVENT_VM_OBJECT_ALLOC, nullptr);
-        if (error != JVMTI_ERROR_NONE) {
-            ThrowJvmti(env, "Enable complete String allocation events", error);
-            return;
-        }
+    const bool completeAllocationsNeeded =
+        gArmedCompleteStringAllocationHookCount.load() != 0;
+    const bool genericAllocationsNeeded = gJavaVmObjectAllocDispatchEnabled.load();
+    const jvmtiError allocationEventError = gJvmti->SetEventNotificationMode(
+        completeAllocationsNeeded || genericAllocationsNeeded ? JVMTI_ENABLE : JVMTI_DISABLE,
+        JVMTI_EVENT_VM_OBJECT_ALLOC, nullptr);
+    if (allocationEventError != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, completeAllocationsNeeded
+            ? "Enable complete String allocation events"
+            : "Disable unused String allocation events", allocationEventError);
+        return;
     }
     ConfigureStringHookBridge(env);
     // Keep activation independent from optional Java-side prefilter configuration. Native
     // matching remains authoritative if a VM rejects or delays the array configuration call.
     SetStringHookBridgeActive(env, gArmedStringAllocationHookCount.load() != 0);
+}
+
+void JNICALL NativeEnterStringHookSuppression(JNIEnv*, jclass) {
+    ++tStringHookSuppressionDepth;
+}
+
+void JNICALL NativeExitStringHookSuppression(JNIEnv* env, jclass) {
+    if (tStringHookSuppressionDepth == 0) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "String hook suppression is not active on this thread");
+        return;
+    }
+    --tStringHookSuppressionDepth;
 }
 
 void JNICALL NativeDebuggerPauseThread(JNIEnv* env, jclass, jobject requestedThread,
@@ -3926,6 +4430,7 @@ void JNICALL NativeRetransformClass(JNIEnv* env, jclass, jclass klass) {
     }
     jvmtiError error = gJvmti->RetransformClasses(1, &klass);
     if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
+    if (error == JVMTI_ERROR_NONE) error = ReapplyStringLdcBreakpoints(env, klass);
     ThrowJvmti(env, "RetransformClasses", error);
 }
 
@@ -3942,7 +4447,12 @@ void JNICALL NativeRedefineClass(JNIEnv* env, jclass, jclass klass, jbyteArray c
     definition.class_byte_count = length;
     definition.class_bytes = reinterpret_cast<unsigned char*>(bytes);
     jvmtiError error = gJvmti->RedefineClasses(1, &definition);
+    if (error == JVMTI_ERROR_NONE) {
+        CacheClassBytes(BinaryClassName(klass),
+            reinterpret_cast<unsigned char*>(bytes), length);
+    }
     if (error == JVMTI_ERROR_NONE) error = ReapplyPersistentBreakpoints(env, klass);
+    if (error == JVMTI_ERROR_NONE) error = ReapplyStringLdcBreakpoints(env, klass);
     env->ReleaseByteArrayElements(classBytes, bytes, JNI_ABORT);
     ThrowJvmti(env, "RedefineClasses", error);
 }
@@ -4331,6 +4841,38 @@ jobjectArray JNICALL NativeMethodInfo(JNIEnv* env, jclass, jclass klass,
     if (actualDescriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(actualDescriptor));
     if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
     return env->ExceptionCheck() ? nullptr : NewStringArray(env, values);
+}
+
+jobjectArray JNICALL NativeClassMethods(JNIEnv* env, jclass, jclass klass) {
+    if (klass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Class must not be null");
+        return nullptr;
+    }
+    jint count = 0;
+    jmethodID* methods = nullptr;
+    const jvmtiError error = gJvmti->GetClassMethods(klass, &count, &methods);
+    if (error != JVMTI_ERROR_NONE) {
+        ThrowJvmti(env, "GetClassMethods", error);
+        return nullptr;
+    }
+    std::vector<std::string> values;
+    values.reserve(static_cast<std::size_t>(count) * 2);
+    for (jint index = 0; index < count; ++index) {
+        char* name = nullptr;
+        char* descriptor = nullptr;
+        char* generic = nullptr;
+        const jvmtiError nameError = gJvmti->GetMethodName(
+            methods[index], &name, &descriptor, &generic);
+        if (nameError == JVMTI_ERROR_NONE && name != nullptr && descriptor != nullptr) {
+            values.emplace_back(name);
+            values.emplace_back(descriptor);
+        }
+        if (name != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+        if (descriptor != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
+        if (generic != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(generic));
+    }
+    if (methods != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+    return NewStringArray(env, values);
 }
 
 jbyteArray JNICALL NativeMethodBytecodes(JNIEnv* env, jclass, jclass klass,
@@ -4784,6 +5326,18 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("registerStringHookBridge"),
      const_cast<char*>("(Ljava/lang/Class;)V"),
      reinterpret_cast<void*>(&NativeRegisterStringHookBridge)},
+    {const_cast<char*>("registerStringLdcTransformer"),
+     const_cast<char*>("(Ljava/lang/Object;)V"),
+     reinterpret_cast<void*>(&NativeRegisterStringLdcTransformer)},
+    {const_cast<char*>("registerStringLdcBreakpoint"),
+     const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JLjava/lang/String;)V"),
+     reinterpret_cast<void*>(&NativeRegisterStringLdcBreakpoint)},
+    {const_cast<char*>("clearStringLdcBreakpoints"), const_cast<char*>("()V"),
+     reinterpret_cast<void*>(&NativeClearStringLdcBreakpoints)},
+    {const_cast<char*>("enterStringHookSuppression"), const_cast<char*>("()V"),
+     reinterpret_cast<void*>(&NativeEnterStringHookSuppression)},
+    {const_cast<char*>("exitStringHookSuppression"), const_cast<char*>("()V"),
+     reinterpret_cast<void*>(&NativeExitStringHookSuppression)},
     {const_cast<char*>("setBreakpoint"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZLjava/lang/String;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
@@ -4821,7 +5375,7 @@ JNINativeMethod kJvmtiMethods[] = {
      const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatchByName)},
     {const_cast<char*>("setStringAllocationHook"),
-     const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZIJIZ)V"),
+     const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZIJIZZ)V"),
      reinterpret_cast<void*>(&NativeSetStringAllocationHook)},
     {const_cast<char*>("notifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeNotifyFramePop)},
@@ -4857,6 +5411,9 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("methodInfo"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;"),
      reinterpret_cast<void*>(&NativeMethodInfo)},
+    {const_cast<char*>("classMethods"),
+     const_cast<char*>("(Ljava/lang/Class;)[Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeClassMethods)},
     {const_cast<char*>("methodBytecodes"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)[B"),
      reinterpret_cast<void*>(&NativeMethodBytecodes)},
@@ -5106,6 +5663,11 @@ extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options, void*)
     gLoadedAsJvmtiAgent.store(true);
     ConfigureStartupDebugger(options);
     if (!RequestAllCapabilities() || !InstallJvmtiCallbacks()) return JNI_ERR;
+    if (gJvmti->SetEventNotificationMode(
+            JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr) != JVMTI_ERROR_NONE) {
+        return JNI_ERR;
+    }
+    gClassBytesCacheHookEnabled.store(true);
     if (gJvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, nullptr)
         != JVMTI_ERROR_NONE) return JNI_ERR;
     if (!gStartupMainClass.empty() || !gStartupClinitClass.empty()) {
@@ -5163,6 +5725,13 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
         std::lock_guard<std::mutex> guard(gQueueMutex);
         gEventQueue.clear();
     }
+    {
+        std::lock_guard<std::mutex> guard(gClassBytesCacheMutex);
+        gClassBytesCache.clear();
+        gClassBytesCacheOrder.clear();
+        gClassBytesCacheSize = 0;
+    }
+    ClearAllocationOpcodeCache();
     gQueueChanged.notify_all();
     if (gEventWorker != nullptr) {
         if (gEventWorker->joinable()) gEventWorker->join();
@@ -5179,6 +5748,14 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
                 if (breakpoint.receiver != nullptr) env->DeleteGlobalRef(breakpoint.receiver);
             }
             gPersistentBreakpoints.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(gStringLdcBreakpointMutex);
+            for (const StringLdcBreakpoint& breakpoint : gStringLdcBreakpoints) {
+                if (breakpoint.literal != nullptr) env->DeleteGlobalRef(breakpoint.literal);
+                if (breakpoint.klass != nullptr) env->DeleteGlobalRef(breakpoint.klass);
+            }
+            gStringLdcBreakpoints.clear();
         }
         {
             std::lock_guard<std::mutex> guard(gFieldWatchMutex);
@@ -5210,6 +5787,12 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
         RemoveStepOutState(env, nullptr);
         if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
         if (gStringHookBridgeClass != nullptr) env->DeleteGlobalRef(gStringHookBridgeClass);
+        {
+            std::lock_guard<std::mutex> guard(gStringLdcTransformerMutex);
+            if (gStringLdcTransformer != nullptr) env->DeleteGlobalRef(gStringLdcTransformer);
+            gStringLdcTransformer = nullptr;
+            gStringLdcTransformMethod = nullptr;
+        }
         ReleaseCallbackTypes(env);
     }
     gDispatcherClass = nullptr;
@@ -5218,7 +5801,11 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
     gStringHookBridgeClass = nullptr;
     gStringHookSetActiveMethod = nullptr;
     gStringHookConfigureMethod = nullptr;
+    gStringLdcTransformer = nullptr;
+    gStringLdcTransformMethod = nullptr;
     gClassFileHookEnabled.store(false);
+    gClassBytesCacheHookEnabled.store(false);
+    gJavaClassFileTransformDispatchEnabled.store(false);
     gJavaMethodEntryDispatchEnabled.store(false);
     gJavaMethodExitDispatchEnabled.store(false);
     gJavaExceptionDispatchEnabled.store(false);

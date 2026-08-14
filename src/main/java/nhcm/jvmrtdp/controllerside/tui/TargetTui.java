@@ -1450,7 +1450,7 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void addStringHook() throws IOException {
-        String source = editText("String hook: allocation <name> <content-glob> [class method descriptor] [fast|complete] [ignore-case] [once|max=N] [sample=N] | field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
+        String source = editText("String hook: allocation <name> <content-glob> [class method descriptor] [fast|complete] [ldc|no-ldc] [ignore-case] [once|max=N] [sample=N] | field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
         if (source == null || source.trim().isEmpty()) return;
         final CommandLine line = CommandLine.parse(source);
         final List<String> arguments = line.arguments();

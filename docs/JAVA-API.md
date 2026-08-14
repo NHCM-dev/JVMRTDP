@@ -491,6 +491,7 @@ session.stringHooks().breakAllocation("secret-created",
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
                 .mode(JvmStringAllocationMode.FAST)
+                .includeLdc(true)
                 .maximumHits(10)
                 .sampleEvery(2)
                 .build());
@@ -503,10 +504,15 @@ adds lightweight probes to `String.<init>` returns and prefilters content in Jav
 native/JVMTI work; it does not subscribe to global method-exit or allocation events. `COMPLETE`
 adds `VM_OBJECT_ALLOC` for VM/native-created or already JIT-intrinsified Strings and therefore
 has JVM-wide allocation-event overhead. One physical object is de-duplicated across both paths.
+`includeLdc(true)` additionally observes executions of matching String constants. Already-loaded
+methods receive precise JVMTI breakpoints without retransformation, while filtered probes cover
+future class loads. It reports `returnState() == "ldc"` and stops at the method/BCI executing `ldc`
+or `ldc_w`; the default is false because an interned literal may be reused many times.
 `oneShot()`, `maximumHits(long)`, and `sampleEvery(int)` bound stop frequency; the hot path is
 disabled when no allocation hook remains armed. A hit has reason
 `string_alloc:<registration>`,
-`returnState() == "allocation"`, and exposes the matched String through `eventValue()`.
+`returnState() == "allocation"` (or `"ldc"` for a literal-use hit), and exposes the matched String
+through `eventValue()`.
 
 Field-backed hooks support `acquireValue`, `replaceValue`, and `trackValue`. Allocation hooks
 support `acquireValue` and `trackValue` for the latest match. Pass debugger states

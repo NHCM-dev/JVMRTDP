@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 /** Target-side ownership bridge for native String allocation filters and JVMTI events. */
 public final class StringAllocationHookService {
@@ -27,12 +28,21 @@ public final class StringAllocationHookService {
             new HashMap<String, JvmStringAllocationMode>();
     private static final Map<String, String> CONTENT_PATTERNS = new HashMap<String, String>();
     private static final Map<String, Boolean> CASE_SENSITIVITY = new HashMap<String, Boolean>();
+    private static final Map<String, Boolean> LDC_ENABLED = new HashMap<String, Boolean>();
+    private static final Map<String, String> CREATOR_CLASSES = new HashMap<String, String>();
+    private static final Map<String, String> CREATOR_METHODS = new HashMap<String, String>();
+    private static final Map<String, String> CREATOR_DESCRIPTORS = new HashMap<String, String>();
+    private static final Map<String, Long> MAXIMUM_HITS = new HashMap<String, Long>();
+    private static final Map<String, Integer> SAMPLE_INTERVALS = new HashMap<String, Integer>();
     private static final String BRIDGE_CLASS = "nhcm.jvmrtdp.bootstrap.StringHookBridge";
     private static final String BRIDGE_INTERNAL = "nhcm/jvmrtdp/bootstrap/StringHookBridge";
     private static final String BRIDGE_METHOD = "observed";
     private static final String BRIDGE_DESCRIPTOR = "(Ljava/lang/String;)V";
     private static boolean probeInstalled;
     private static Class<?> probeBridge;
+    private static final StringLdcProbeTransformer LDC_TRANSFORMER =
+            new StringLdcProbeTransformer();
+    private static boolean ldcTransformerRegistered;
 
     private StringAllocationHookService() { }
 
@@ -41,20 +51,57 @@ public final class StringAllocationHookService {
             String creatorDescriptorPattern, boolean caseSensitive) {
         set(id, contentPattern, creatorClassPattern, creatorMethodPattern,
                 creatorDescriptorPattern, caseSensitive,
-                JvmStringAllocationMode.FAST, 0L, 1);
+                JvmStringAllocationMode.FAST, 0L, 1, false);
     }
 
     public static synchronized void set(String id, String contentPattern,
             String creatorClassPattern, String creatorMethodPattern,
             String creatorDescriptorPattern, boolean caseSensitive,
             JvmStringAllocationMode mode, long maximumHits, int sampleEvery) {
+        set(id, contentPattern, creatorClassPattern, creatorMethodPattern,
+                creatorDescriptorPattern, caseSensitive, mode, maximumHits,
+                sampleEvery, false);
+    }
+
+    public static synchronized void set(String id, String contentPattern,
+            String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive,
+            JvmStringAllocationMode mode, long maximumHits, int sampleEvery,
+            boolean includeLdc) {
+        NativeAgent.enterStringHookSuppression();
+        try {
+            setSuppressed(id, contentPattern, creatorClassPattern, creatorMethodPattern,
+                    creatorDescriptorPattern, caseSensitive, mode, maximumHits,
+                    sampleEvery, includeLdc);
+        } finally {
+            NativeAgent.exitStringHookSuppression();
+        }
+    }
+
+    private static void setSuppressed(String id, String contentPattern,
+            String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive,
+            JvmStringAllocationMode mode, long maximumHits, int sampleEvery,
+            boolean includeLdc) {
         if (mode == null) mode = JvmStringAllocationMode.FAST;
         JvmStringAllocationMode previous = REGISTRATIONS.get(id);
         String previousContent = CONTENT_PATTERNS.get(id);
         Boolean previousSensitivity = CASE_SENSITIVITY.get(id);
+        Boolean previousLdc = LDC_ENABLED.get(id);
+        String previousCreatorClass = CREATOR_CLASSES.get(id);
+        String previousCreatorMethod = CREATOR_METHODS.get(id);
+        String previousCreatorDescriptor = CREATOR_DESCRIPTORS.get(id);
+        Long previousMaximumHits = MAXIMUM_HITS.get(id);
+        Integer previousSampleInterval = SAMPLE_INTERVALS.get(id);
+        boolean literalRulesChanged = Boolean.TRUE.equals(previousLdc) || includeLdc;
         boolean added = previous == null;
         boolean addedCompleteLease = false;
         boolean installedProbe = false;
+        if (includeLdc && !Boolean.TRUE.equals(previousLdc)) {
+            ensureCapability(JvmtiCapability.CAN_GET_CONSTANT_POOL);
+            ensureCapability(JvmtiCapability.CAN_GET_BYTECODES);
+            ensureCapability(JvmtiCapability.CAN_GENERATE_BREAKPOINT_EVENTS);
+        }
         if (added || previous != mode) {
             ensureCapability(JvmtiCapability.CAN_RETRANSFORM_CLASSES);
             ensureCapability(JvmtiCapability.CAN_REDEFINE_CLASSES);
@@ -85,10 +132,17 @@ public final class StringAllocationHookService {
             REGISTRATIONS.put(id, mode);
             CONTENT_PATTERNS.put(id, normalizedPattern(contentPattern));
             CASE_SENSITIVITY.put(id, Boolean.valueOf(caseSensitive));
+            LDC_ENABLED.put(id, Boolean.valueOf(includeLdc));
+            CREATOR_CLASSES.put(id, normalizedPattern(creatorClassPattern));
+            CREATOR_METHODS.put(id, normalizedPattern(creatorMethodPattern));
+            CREATOR_DESCRIPTORS.put(id, normalizedPattern(creatorDescriptorPattern));
+            MAXIMUM_HITS.put(id, Long.valueOf(maximumHits));
+            SAMPLE_INTERVALS.put(id, Integer.valueOf(sampleEvery));
             configureProbeBridge(false);
+            if (literalRulesChanged) refreshLiteralProbes();
             NativeAgent.setStringAllocationHook(id, contentPattern,
                     creatorClassPattern, creatorMethodPattern, creatorDescriptorPattern,
-                    caseSensitive, mode.ordinal(), maximumHits, sampleEvery, true);
+                    caseSensitive, mode.ordinal(), maximumHits, sampleEvery, includeLdc, true);
             if (previous == JvmStringAllocationMode.COMPLETE
                     && mode != JvmStringAllocationMode.COMPLETE) {
                 JvmtiCallbackDispatcher.releaseInfrastructureEvent(JvmtiEventType.VM_OBJECT_ALLOC);
@@ -98,13 +152,45 @@ public final class StringAllocationHookService {
                 REGISTRATIONS.remove(id);
                 CONTENT_PATTERNS.remove(id);
                 CASE_SENSITIVITY.remove(id);
+                LDC_ENABLED.remove(id);
+                CREATOR_CLASSES.remove(id);
+                CREATOR_METHODS.remove(id);
+                CREATOR_DESCRIPTORS.remove(id);
+                MAXIMUM_HITS.remove(id);
+                SAMPLE_INTERVALS.remove(id);
             } else {
                 REGISTRATIONS.put(id, previous);
                 CONTENT_PATTERNS.put(id, previousContent);
                 CASE_SENSITIVITY.put(id, previousSensitivity);
+                LDC_ENABLED.put(id, previousLdc);
+                CREATOR_CLASSES.put(id, previousCreatorClass);
+                CREATOR_METHODS.put(id, previousCreatorMethod);
+                CREATOR_DESCRIPTORS.put(id, previousCreatorDescriptor);
+                MAXIMUM_HITS.put(id, previousMaximumHits);
+                SAMPLE_INTERVALS.put(id, previousSampleInterval);
+            }
+            if (literalRulesChanged) {
+                try { refreshLiteralProbes(); }
+                catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
             }
             try { configureProbeBridge(!REGISTRATIONS.isEmpty()); }
             catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            try {
+                if (previous == null) {
+                    NativeAgent.setStringAllocationHook(id, "*", "*", "*", "*", true,
+                            mode.ordinal(), 0L, 1, false, false);
+                } else {
+                    NativeAgent.setStringAllocationHook(id, previousContent,
+                            previousCreatorClass, previousCreatorMethod,
+                            previousCreatorDescriptor,
+                            !Boolean.FALSE.equals(previousSensitivity), previous.ordinal(),
+                            previousMaximumHits == null ? 0L : previousMaximumHits.longValue(),
+                            previousSampleInterval == null ? 1 : previousSampleInterval.intValue(),
+                            Boolean.TRUE.equals(previousLdc), true);
+                }
+            } catch (RuntimeException restoreFailure) {
+                failure.addSuppressed(restoreFailure);
+            }
             if (addedCompleteLease) JvmtiCallbackDispatcher.releaseInfrastructureEvent(
                     JvmtiEventType.VM_OBJECT_ALLOC);
             if (installedProbe) uninstallProbeQuietly();
@@ -113,20 +199,70 @@ public final class StringAllocationHookService {
     }
 
     public static synchronized boolean remove(String id) {
-        JvmStringAllocationMode mode = REGISTRATIONS.remove(id);
+        NativeAgent.enterStringHookSuppression();
+        try {
+            return removeSuppressed(id);
+        } finally {
+            NativeAgent.exitStringHookSuppression();
+        }
+    }
+
+    private static boolean removeSuppressed(String id) {
+        JvmStringAllocationMode mode = REGISTRATIONS.get(id);
         if (mode == null) return false;
+        String content = CONTENT_PATTERNS.get(id);
+        Boolean sensitivity = CASE_SENSITIVITY.get(id);
+        Boolean ldc = LDC_ENABLED.get(id);
+        String creatorClass = CREATOR_CLASSES.get(id);
+        String creatorMethod = CREATOR_METHODS.get(id);
+        String creatorDescriptor = CREATOR_DESCRIPTORS.get(id);
+        Long maximumHits = MAXIMUM_HITS.get(id);
+        Integer sampleInterval = SAMPLE_INTERVALS.get(id);
+        REGISTRATIONS.remove(id);
         CONTENT_PATTERNS.remove(id);
         CASE_SENSITIVITY.remove(id);
+        boolean removedLdc = Boolean.TRUE.equals(LDC_ENABLED.remove(id));
+        CREATOR_CLASSES.remove(id);
+        CREATOR_METHODS.remove(id);
+        CREATOR_DESCRIPTORS.remove(id);
+        MAXIMUM_HITS.remove(id);
+        SAMPLE_INTERVALS.remove(id);
         try {
             configureProbeBridge(false);
+            if (removedLdc) refreshLiteralProbes();
             NativeAgent.setStringAllocationHook(id, "*", "*", "*", "*", true,
-                    mode.ordinal(), 0L, 1, false);
-        } finally {
-            if (mode == JvmStringAllocationMode.COMPLETE) {
-                JvmtiCallbackDispatcher.releaseInfrastructureEvent(JvmtiEventType.VM_OBJECT_ALLOC);
+                    mode.ordinal(), 0L, 1, false, false);
+        } catch (RuntimeException failure) {
+            REGISTRATIONS.put(id, mode);
+            CONTENT_PATTERNS.put(id, content);
+            CASE_SENSITIVITY.put(id, sensitivity);
+            LDC_ENABLED.put(id, ldc);
+            CREATOR_CLASSES.put(id, creatorClass);
+            CREATOR_METHODS.put(id, creatorMethod);
+            CREATOR_DESCRIPTORS.put(id, creatorDescriptor);
+            MAXIMUM_HITS.put(id, maximumHits);
+            SAMPLE_INTERVALS.put(id, sampleInterval);
+            if (removedLdc) {
+                try { refreshLiteralProbes(); }
+                catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
             }
-            if (REGISTRATIONS.isEmpty()) uninstallProbe();
+            try {
+                NativeAgent.setStringAllocationHook(id, content, creatorClass, creatorMethod,
+                        creatorDescriptor, !Boolean.FALSE.equals(sensitivity), mode.ordinal(),
+                        maximumHits == null ? 0L : maximumHits.longValue(),
+                        sampleInterval == null ? 1 : sampleInterval.intValue(),
+                        Boolean.TRUE.equals(ldc), true);
+            } catch (RuntimeException restoreFailure) {
+                failure.addSuppressed(restoreFailure);
+            }
+            try { configureProbeBridge(true); }
+            catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            throw failure;
         }
+        if (mode == JvmStringAllocationMode.COMPLETE) {
+            JvmtiCallbackDispatcher.releaseInfrastructureEvent(JvmtiEventType.VM_OBJECT_ALLOC);
+        }
+        if (REGISTRATIONS.isEmpty()) uninstallProbe();
         return true;
     }
 
@@ -153,6 +289,14 @@ public final class StringAllocationHookService {
     private static void uninstallProbe() {
         if (!probeInstalled) return;
         setProbeActive(false);
+        LDC_TRANSFORMER.configure(new String[0], new boolean[0]);
+        if (ldcTransformerRegistered) {
+            refreshLoadedLiteralProbes();
+            JvmtiCallbackDispatcher.releaseInfrastructureEvent(
+                    JvmtiEventType.CLASS_FILE_LOAD_HOOK);
+            NativeAgent.registerStringLdcTransformer(null);
+            ldcTransformerRegistered = false;
+        }
         rewriteStringConstructors(false);
         probeInstalled = false;
     }
@@ -188,6 +332,86 @@ public final class StringAllocationHookService {
 
     private static String normalizedPattern(String pattern) {
         return pattern == null || pattern.isEmpty() ? "*" : pattern;
+    }
+
+    private static void refreshLiteralProbes() {
+        int count = 0;
+        for (Boolean enabled : LDC_ENABLED.values()) if (Boolean.TRUE.equals(enabled)) count++;
+        String[] patterns = new String[count];
+        boolean[] sensitivity = new boolean[count];
+        int index = 0;
+        for (String id : REGISTRATIONS.keySet()) {
+            if (!Boolean.TRUE.equals(LDC_ENABLED.get(id))) continue;
+            patterns[index] = normalizedPattern(CONTENT_PATTERNS.get(id));
+            sensitivity[index] = !Boolean.FALSE.equals(CASE_SENSITIVITY.get(id));
+            index++;
+        }
+        LDC_TRANSFORMER.configure(patterns, sensitivity);
+        if (count != 0 && !ldcTransformerRegistered) {
+            NativeAgent.registerStringLdcTransformer(LDC_TRANSFORMER);
+            try {
+                JvmtiCallbackDispatcher.retainInfrastructureEvent(
+                        JvmtiEventType.CLASS_FILE_LOAD_HOOK);
+                ldcTransformerRegistered = true;
+            } catch (RuntimeException failure) {
+                NativeAgent.registerStringLdcTransformer(null);
+                throw failure;
+            }
+        }
+        if (ldcTransformerRegistered) refreshLoadedLiteralProbes();
+        if (count == 0 && ldcTransformerRegistered) {
+            JvmtiCallbackDispatcher.releaseInfrastructureEvent(
+                    JvmtiEventType.CLASS_FILE_LOAD_HOOK);
+            NativeAgent.registerStringLdcTransformer(null);
+            ldcTransformerRegistered = false;
+        }
+    }
+
+    private static void refreshLoadedLiteralProbes() {
+        NativeAgent.clearStringLdcBreakpoints();
+        Set<String> previouslyInstrumented = LDC_TRANSFORMER.instrumentedClassNames();
+        for (Class<?> type : NativeAgent.listLoadedClasses()) {
+            if (type == null || type.isArray() || type.isPrimitive()
+                    || !StringLdcProbeTransformer.eligibleClass(type.getName())) continue;
+            try {
+                boolean installed = previouslyInstrumented.contains(type.getName());
+                if (installed) {
+                    // Probes are only installed as classes are loaded after the hook. Refreshing
+                    // those few classes updates/removes their probes. Never retransform an
+                    // ordinary already-loaded class here: doing that makes its active frames
+                    // obsolete, so a main-entry hook would miss the very LDC it was meant to see.
+                    NativeAgent.retransformClass(type);
+                    continue;
+                }
+                if (!LDC_TRANSFORMER.enabled()) continue;
+                byte[] constantPool = NativeAgent.constantPool(type);
+                Map<Integer, String> matchingConstants =
+                        LDC_TRANSFORMER.matchingConstants(constantPool);
+                if (matchingConstants.isEmpty()) continue;
+                String[] methods = NativeAgent.classMethods(type);
+                for (int methodIndex = 0; methodIndex + 1 < methods.length; methodIndex += 2) {
+                    String methodName = methods[methodIndex];
+                    String descriptor = methods[methodIndex + 1];
+                    byte[] bytecodes;
+                    try {
+                        bytecodes = NativeAgent.methodBytecodes(type, methodName, descriptor);
+                    } catch (RuntimeException noCode) {
+                        // Abstract and native methods have no bytecode to scan.
+                        continue;
+                    }
+                    for (StringLdcProbeTransformer.Site site : LDC_TRANSFORMER.matchingSites(
+                            methodName, descriptor, bytecodes, matchingConstants)) {
+                        NativeAgent.registerStringLdcBreakpoint(type, site.methodName(),
+                                site.descriptor(), site.bci(), site.literal());
+                    }
+                }
+            } catch (RuntimeException ignored) {
+                // Hidden, unmodifiable, obsolete, and VM-internal classes are expected here.
+                // Future class loads still pass through the installed transformer.
+            } catch (LinkageError ignored) {
+                // A concurrently unloading loader must not prevent other classes from refreshing.
+            }
+        }
     }
 
     private static void uninstallProbeQuietly() {

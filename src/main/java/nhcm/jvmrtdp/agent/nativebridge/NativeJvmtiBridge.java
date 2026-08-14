@@ -20,6 +20,22 @@ public final class NativeJvmtiBridge {
     /** Registers the bootstrap String-constructor probe native on its defining class. */
     public static native void registerStringHookBridge(Class<?> bridgeClass);
 
+    /** Registers or clears the synchronous built-in String LDC class-file transformer. */
+    public static native void registerStringLdcTransformer(Object transformer);
+
+    /** Registers a precise LDC breakpoint for an already loaded class. */
+    public static native void registerStringLdcBreakpoint(Class<?> type, String methodName,
+            String descriptor, long bci, String literal);
+
+    /** Clears all LDC breakpoints owned by the String hook subsystem. */
+    public static native void clearStringLdcBreakpoints();
+
+    /** Suppresses String-hook observation for JVMRTDP work on the current native thread. */
+    public static native void enterStringHookSuppression();
+
+    /** Balances {@link #enterStringHookSuppression()} on the same thread. */
+    public static native void exitStringHookSuppression();
+
     public static native void setBreakpoint(Class<?> type, String methodName,
             String descriptor, long location, boolean enabled, String registrationId,
             Object receiver, String callerClass, String callerMethod, String callerDescriptor);
@@ -71,7 +87,7 @@ public final class NativeJvmtiBridge {
     public static native void setStringAllocationHook(String registrationId,
             String contentPattern, String creatorClassPattern, String creatorMethodPattern,
             String creatorDescriptorPattern, boolean caseSensitive, int mode,
-            long maximumHits, int sampleEvery, boolean enabled);
+            long maximumHits, int sampleEvery, boolean includeLdc, boolean enabled);
 
     public static native void notifyFramePop(Thread thread, int depth);
 
@@ -104,6 +120,9 @@ public final class NativeJvmtiBridge {
     public static native Class<?>[] classLoaderClasses(ClassLoader loader);
 
     public static native String[] methodInfo(Class<?> type, String methodName, String descriptor);
+
+    /** Flat name/descriptor pairs for every declared JVMTI method, including class initializers. */
+    public static native String[] classMethods(Class<?> type);
 
     public static native byte[] methodBytecodes(Class<?> type, String methodName, String descriptor);
 

@@ -231,6 +231,7 @@ session.stringHooks().breakAllocation("secret-created",
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
                 .mode(JvmStringAllocationMode.FAST)
+                .includeLdc(true)
                 .oneShot()
                 .build());
 
@@ -260,7 +261,11 @@ Default `FAST` mode temporarily adds lightweight probes to `String.<init>` retur
 prefilters content in the bootstrap bridge before native/JVMTI work. Select `COMPLETE` only when
 VM/native-created or already JIT-intrinsified Strings must be observed; it adds the high-volume global
 allocation event. `oneShot`, `maximumHits`, and `sampleEvery` bound stops and allow the hot path to
-turn off when no hook remains armed. The latest match is
+turn off when no hook remains armed. `includeLdc(true)` opts into matching String constant uses:
+already-loaded methods receive precise JVMTI breakpoints without retransformation, filtered probes
+cover future class loads, and hits stop at the executing method/BCI with `returnState=ldc`. It is
+disabled by default because the same interned literal may
+execute repeatedly. The latest match is
 retained by the manager and supports `acquireValue`, `trackValue`, and method invocation. It cannot
 be mutated in place; track it or modify the owning field/local instead.
 

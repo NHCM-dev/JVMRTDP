@@ -311,7 +311,7 @@ public class InteractiveCli {
                     "strings [list|field <name> <read|write> <class> <field> [object]|"
                             + "method <name> <entry|exit> <class> <method> <descriptor>|"
                             + "allocation <name> <content-glob> [creator-class creator-method descriptor] "
-                            + "[fast|complete] [ignore-case] [once|max=N] [sample=N]|"
+                            + "[fast|complete] [ldc|no-ldc] [ignore-case] [once|max=N] [sample=N]|"
                             + "on <name>|off <name>|rearm <name>|read <name>|use <name>|set <name> <value>|"
                             + "track <hook> <reference> [strong|weak]|call <hook> <method> <descriptor> [args...]|"
                             + "remove <name>|clear]",

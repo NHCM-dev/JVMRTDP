@@ -345,6 +345,7 @@ session.stringHooks().breakAllocation("secret-created",
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
                 .mode(JvmStringAllocationMode.FAST)
+                .includeLdc(true)
                 .maximumHits(10)
                 .sampleEvery(2)
                 .build());
@@ -354,9 +355,14 @@ Allocation 条件会在目标端同步匹配后才产生调试停止。实现先
 时不遍历完整栈。默认 `FAST` 临时在 `String.<init>` 构造器返回处加入轻量探针，并在进入
 native/JVMTI 前先于 Java bootstrap 桥中过滤内容；它不监听所有方法退出或所有对象分配。
 `COMPLETE` 才额外开启 `VM_OBJECT_ALLOC` 来覆盖 VM/native 或已被 JIT intrinsic 化的 String，因此会有
-JVM 全局分配事件开销。同一对象会去重；`oneShot()`、`maximumHits(...)`、`sampleEvery(...)`
-可限制停止频率；没有 armed Hook 后热路径会自动关闭。停止状态的 `returnState()` 为
-`allocation`，匹配对象从 `eventValue()` 获取。
+JVM 全局分配事件开销。同一对象会去重。`oneShot()`、`maximumHits(...)`、`sampleEvery(...)`
+可限制停止频率；没有 armed Hook 后热路径会自动关闭。
+可选的 `includeLdc(true)` 会额外观察匹配 String 常量的 `ldc`/`ldc_w` 执行。已加载方法直接
+设置精确 JVMTI 断点而不重转换，后续加载类使用过滤探针；命中时以
+`returnState() == "ldc"` 暂停在实际方法/BCI。它观察字面量使用而非对象分配；intern 常量可被
+反复执行，所以默认关闭。
+停止状态的 `returnState()` 为 `allocation`（LDC 命中为 `ldc`），匹配对象从
+`eventValue()` 获取。
 
 引用状态为 `LIVE`、`NULL`、`COLLECTED`、`RELEASED`、`ERROR`。弱引用不占用 JVMTI tag。
 字段型 String Hook 可读取、替换和加入引用管理器；Allocation Hook 可读取和追踪最近命中值；

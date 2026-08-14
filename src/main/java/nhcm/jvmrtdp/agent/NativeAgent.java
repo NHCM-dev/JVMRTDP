@@ -98,6 +98,32 @@ public class NativeAgent {
         NativeJvmtiBridge.registerStringHookBridge(bridgeClass);
     }
 
+    public static void registerStringLdcTransformer(Object transformer) {
+        requireAvailable();
+        NativeJvmtiBridge.registerStringLdcTransformer(transformer);
+    }
+
+    public static void registerStringLdcBreakpoint(Class<?> type, String methodName,
+            String descriptor, long bci, String literal) {
+        requireAvailable();
+        NativeJvmtiBridge.registerStringLdcBreakpoint(type, methodName, descriptor, bci, literal);
+    }
+
+    public static void clearStringLdcBreakpoints() {
+        requireAvailable();
+        NativeJvmtiBridge.clearStringLdcBreakpoints();
+    }
+
+    public static void enterStringHookSuppression() {
+        requireAvailable();
+        NativeJvmtiBridge.enterStringHookSuppression();
+    }
+
+    public static void exitStringHookSuppression() {
+        requireAvailable();
+        NativeJvmtiBridge.exitStringHookSuppression();
+    }
+
     public static void setBreakpoint(Class<?> type, String methodName, String descriptor,
             long location, boolean enabled) {
         if (type == null) throw new IllegalArgumentException("type must not be null");
@@ -255,13 +281,22 @@ public class NativeAgent {
             String creatorDescriptorPattern, boolean caseSensitive, boolean enabled) {
         setStringAllocationHook(registrationId, contentPattern, creatorClassPattern,
                 creatorMethodPattern, creatorDescriptorPattern, caseSensitive,
-                0, 0L, 1, enabled);
+                0, 0L, 1, false, enabled);
     }
 
     public static void setStringAllocationHook(String registrationId,
             String contentPattern, String creatorClassPattern, String creatorMethodPattern,
             String creatorDescriptorPattern, boolean caseSensitive, int mode,
             long maximumHits, int sampleEvery, boolean enabled) {
+        setStringAllocationHook(registrationId, contentPattern, creatorClassPattern,
+                creatorMethodPattern, creatorDescriptorPattern, caseSensitive, mode,
+                maximumHits, sampleEvery, false, enabled);
+    }
+
+    public static void setStringAllocationHook(String registrationId,
+            String contentPattern, String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive, int mode,
+            long maximumHits, int sampleEvery, boolean includeLdc, boolean enabled) {
         requireAvailable();
         if (registrationId == null || registrationId.isEmpty()) {
             throw new IllegalArgumentException("registrationId must not be empty");
@@ -272,7 +307,7 @@ public class NativeAgent {
                 creatorMethodPattern == null || creatorMethodPattern.isEmpty() ? "*" : creatorMethodPattern,
                 creatorDescriptorPattern == null || creatorDescriptorPattern.isEmpty()
                         ? "*" : creatorDescriptorPattern,
-                caseSensitive, mode, maximumHits, sampleEvery, enabled);
+                caseSensitive, mode, maximumHits, sampleEvery, includeLdc, enabled);
     }
 
     public static void setFieldWatch(String className, String fieldName, String descriptor,
@@ -400,6 +435,11 @@ public class NativeAgent {
         requireAvailable();
         requireMember(methodName, descriptor);
         return NativeJvmtiBridge.methodInfo(requireType(type), methodName, descriptor);
+    }
+
+    public static String[] classMethods(Class<?> type) {
+        requireAvailable();
+        return NativeJvmtiBridge.classMethods(requireType(type));
     }
 
     public static byte[] methodBytecodes(Class<?> type, String methodName, String descriptor) {

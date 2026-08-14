@@ -59,11 +59,12 @@ public class JvmtiCommand implements RemoteCommand {
             if ("clear".equals(action)) {
                 return success(Boolean.toString(StringAllocationHookService.remove(id)));
             }
-            if ("set".equals(action) && arguments.size() == 11) {
+            if ("set".equals(action) && (arguments.size() == 11 || arguments.size() == 12)) {
                 StringAllocationHookService.set(id, arguments.get(3), arguments.get(4),
                         arguments.get(5), arguments.get(6), Boolean.parseBoolean(arguments.get(7)),
                         JvmStringAllocationMode.parse(arguments.get(8)),
-                        Long.parseLong(arguments.get(9)), Integer.parseInt(arguments.get(10)));
+                        Long.parseLong(arguments.get(9)), Integer.parseInt(arguments.get(10)),
+                        arguments.size() == 12 && Boolean.parseBoolean(arguments.get(11)));
                 return success("ok");
             }
             return invalid();

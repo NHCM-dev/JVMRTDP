@@ -711,8 +711,9 @@ public class RemoteJVMTIEnv extends RemoteHandle {
     /**
      * Installs or clears a target-side String allocation filter. Fast mode uses a lightweight
      * probe in {@code java.lang.String.<init>} methods and prefilters content before
-     * entering native code; complete mode adds {@code VM_OBJECT_ALLOC}. A hit pauses the
-     * allocating thread and exposes the String as {@link JvmDebuggerState#eventValue()}.
+     * entering native code; complete mode adds {@code VM_OBJECT_ALLOC}. An optional LDC probe
+     * observes matching String constants at their execution site. A hit pauses the current
+     * thread and exposes the String as {@link JvmDebuggerState#eventValue()}.
      */
     public void setStringAllocationHook(String registrationId,
             JvmStringAllocationSpec spec, boolean enabled) {
@@ -725,7 +726,8 @@ public class RemoteJVMTIEnv extends RemoteHandle {
                 spec.contentPattern(), spec.creatorClassPattern(),
                 spec.creatorMethodPattern(), spec.creatorDescriptorPattern(),
                 Boolean.toString(spec.caseSensitive()), spec.mode().name(),
-                Long.toString(spec.maximumHits()), Integer.toString(spec.sampleEvery())));
+                Long.toString(spec.maximumHits()), Integer.toString(spec.sampleEvery()),
+                Boolean.toString(spec.includeLdc())));
     }
 
     public RemoteCodeDeployment deployClasses(String name, Map<String, byte[]> classes) {

@@ -184,6 +184,7 @@ session.stringHooks().breakAllocation("secret-created",
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
                 .mode(JvmStringAllocationMode.FAST)
+                .includeLdc(true)
                 .oneShot()
                 .build());
 
@@ -199,7 +200,10 @@ session.stringHooks().trackValue("message-write", session.references(),
 Allocation Hook 默认使用低开销 `FAST`，临时在 `String.<init>` 构造器返回处加入轻量探针，
 并在进入 native/JVMTI 前先做内容预过滤；需要覆盖 VM/native 或已被 JIT intrinsic 化的 String 时才选 `COMPLETE`，它会开启
 高频全局分配事件。`oneShot`、`maximumHits`、`sampleEvery` 可限制停止频率，并在没有 armed Hook
-时关闭热路径。最近一次命中可读取、调用、加入引用或作为 Context 使用；String 本身不可变，
+时关闭热路径。`includeLdc(true)` 可选择观察匹配 String 常量的 `ldc`/`ldc_w` 使用；已加载
+方法直接设置精确 JVMTI 断点而不重转换，后续加载类使用过滤探针，并以 `returnState=ldc`
+暂停在实际方法/BCI。由于同一个 intern 字面量可能反复执行，该选项默认关闭。最近一次命中可读取、调用、加入引用或作为
+Context 使用；String 本身不可变，
 要修改程序状态应替换拥有它的字段/local。引用与 Hook 会随 session 关闭而清理，并写入调试器
 JSON/JSONL 快照 schema v5。部署回调仍使用 `JvmtiEventHandler`/`JvmtiMethodEvent`；同步
 class-file transformer 仅适合需要返回字节码的场景，普通观察 Hook 应使用异步事件分发。

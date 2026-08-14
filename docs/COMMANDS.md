@@ -176,7 +176,7 @@ strongly/weakly, `=` to replace, `X` to write null, `Delete` to release, and `F5
 ```text
 strings list
 strings allocation <name> <content-glob> [creator-class creator-method descriptor]
-                   [fast|complete] [ignore-case|case-sensitive]
+                   [fast|complete] [ldc|no-ldc] [ignore-case|case-sensitive]
                    [once|max=N] [sample=N]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
@@ -199,6 +199,14 @@ method-exit or allocation callbacks, and the probe is removed with the last allo
 JIT-intrinsified Strings without an observable constructor return; this mode has JVM-wide
 allocation-event overhead. A physical
 String is de-duplicated across both paths.
+
+`ldc` is an opt-in literal-use path. It observes only `ldc`/`ldc_w` String constants whose value can
+match an LDC-enabled hook, then pauses at the executing method and BCI with `returnState=ldc`. It
+can fire every time the literal site executes even though the interned String object is reused;
+`no-ldc` is the default. Already-loaded classes are scanned by constant pool and method bytecodes,
+then receive precise JVMTI breakpoints without retransformation, so an active startup frame remains
+observable. Future class loads receive filtered probes. Both paths are removed with the last LDC
+rule. Agent infrastructure and `java.lang.String` itself are excluded to prevent recursion.
 
 Content is prefiltered in Java before entering native/JVMTI code, then confirmed before creator
 frames are captured. Creator class/method/descriptor patterns

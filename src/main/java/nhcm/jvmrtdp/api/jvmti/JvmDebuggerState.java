@@ -52,15 +52,15 @@ public final class JvmDebuggerState implements AutoCloseable {
     public int sourceLine() { return sourceLine; }
     public long sequence() { return sequence; }
     /**
-     * Event-associated object. This is a boxed return value for method-exit stops and the newly
-     * matched String for a String-allocation stop.
+     * Event-associated object. This is a boxed return value for method-exit stops, a newly
+     * matched String for an allocation stop, or the constant loaded by an LDC observation.
      */
     public RemoteObject returnValue() { return returnValue; }
     /** Descriptive alias for {@link #returnValue()} when the stop is not a method return. */
     public RemoteObject eventValue() { return returnValue; }
     /**
      * Empty for ordinary stops; otherwise {@code value}, {@code void}, {@code exception}, or
-     * {@code allocation}.
+     * {@code allocation}, or {@code ldc}.
      */
     public String returnState() { return returnState; }
 
@@ -75,7 +75,8 @@ public final class JvmDebuggerState implements AutoCloseable {
         return reason + " at " + className + "." + methodName + descriptor
                 + " bci=" + location + (sourceLine < 0 ? "" : " line=" + sourceLine)
                 + (returnState.isEmpty() ? "" : " "
-                        + ("allocation".equals(returnState) ? "event=" : "return=")
+                        + (("allocation".equals(returnState) || "ldc".equals(returnState))
+                                ? "event=" : "return=")
                         + (returnValue == null ? returnState : returnValue));
     }
 }

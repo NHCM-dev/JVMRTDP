@@ -25,8 +25,9 @@ import java.util.Map;
  * Precise, session-scoped String hook registry shared by the library, CLI and TUI.
  * Field hooks are JVMTI access/modification watchpoints. Method hooks are JVMTI
  * entry/exit event breakpoints. Fast allocation hooks use lightweight completed
- * {@code String.<init>} probes; complete hooks add VM object-allocation events. Both filter
- * content and optional creator frames in the target and expose the match through the debugger.
+ * {@code String.<init>} probes; complete hooks add VM object-allocation events. Optional LDC
+ * observation probes matching String constants at their execution sites. All paths filter content
+ * and optional creator frames in the target and expose the match through the debugger.
  */
 public final class JvmStringHookManager implements AutoCloseable {
     private static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
@@ -272,7 +273,9 @@ public final class JvmStringHookManager implements AutoCloseable {
     private static boolean matches(Entry entry, JvmDebuggerState state) {
         String reason = state.reason().toLowerCase(Locale.ROOT);
         if (entry.kind == JvmStringHookKind.ALLOCATION) {
-            return "allocation".equals(state.returnState())
+            boolean literal = "ldc".equals(state.returnState());
+            return ("allocation".equals(state.returnState())
+                    || (literal && entry.allocationSpec.includeLdc()))
                     && reasonContainsRegistration(reason, entry.registrationId);
         }
         if (entry.kind == JvmStringHookKind.METHOD_ENTRY) {
