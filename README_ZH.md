@@ -24,9 +24,6 @@ JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析�
 - Windows x64
 - Java 8 或更高版本
 - 从源码构建原生组件时需要 Visual Studio 2022 C++ 工具链
-- 完整构建默认需要以下相邻源码目录：
-  - `../cfr`
-  - `../procyon`
 
 控制端、目标 JVM 和原生代理必须使用兼容的架构。当前原生构建目标为 x64。
 

@@ -33,8 +33,8 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-def cfrSourceRoot = file('../cfr')
-def procyonSourceRoot = file('../procyon')
+def cfrSourceRoot = file('./decompilers/cfr')
+def procyonSourceRoot = file('./decompilers/procyon')
 def decompilerBuildRoot = layout.buildDirectory.dir('decompiler-sources')
 def cfrGeneratedSources = decompilerBuildRoot.map { it.dir('cfr-generated') }
 def cfrClasses = decompilerBuildRoot.map { it.dir('cfr-classes') }

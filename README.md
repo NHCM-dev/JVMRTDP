@@ -26,9 +26,6 @@ JVMRTDP is a diagnostics, analysis, and debugging tool for HotSpot Java Virtual 
 - Windows x64
 - Java 8 or later
 - Visual Studio 2022 C++ toolchain when building native components from source
-- The complete build expects these adjacent source trees by default:
-  - `../cfr`
-  - `../procyon`
 
 The controller, target JVM, and native agent must use compatible architectures. The current native target is x64.
 
