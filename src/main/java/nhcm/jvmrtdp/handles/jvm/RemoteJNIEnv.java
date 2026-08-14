@@ -349,6 +349,21 @@ public class RemoteJNIEnv extends RemoteHandle {
         executeForOutput(CommandLine.of("object", "release", Long.toString(object.remoteId())));
     }
 
+    /** Returns a separately owned strong or weak handle to the same target object. */
+    public RemoteObject retain(RemoteObject object, boolean weak) {
+        requireObject(object);
+        return object(executeForOutput(CommandLine.of("object", "retain",
+                Long.toString(object.remoteId()), weak ? "weak" : "strong")));
+    }
+
+    /** Returns {@code live}, {@code null}, {@code collected}, or {@code released}. */
+    public String referenceStatus(RemoteObject object) {
+        if (object == null) throw new IllegalArgumentException("object must not be null");
+        if (object.server() != server()) throw new IllegalArgumentException("Remote object belongs to another session");
+        if (object.isReleased()) return "released";
+        return executeForOutput(CommandLine.of("object", "status", Long.toString(object.remoteId())));
+    }
+
     public void refresh(RemoteObject object) {
         requireObject(object);
         RemoteObjectDescriptor descriptor = RemoteObjectDescriptor.decode(executeForOutput(CommandLine.of(

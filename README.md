@@ -1,7 +1,5 @@
 # JVMRTDP
 
-(Credits to GPT 5.6)
-
 [English](README.md) | [中文](README_ZH.md)
 
 JVMRTDP is a diagnostics, analysis, and debugging tool for HotSpot Java Virtual Machines (JVMs) on Windows x64. It injects an agent into a target JVM and exposes class browsing, object inspection, decompilation, bytecode views, breakpoints, thread control, and Java Virtual Machine Tool Interface (JVMTI) operations through a terminal user interface (TUI), a command line, and scripts.
@@ -13,6 +11,8 @@ JVMRTDP is a diagnostics, analysis, and debugging tool for HotSpot Java Virtual 
 - Discover and connect to local Java processes, including embedded JVMs.
 - Browse runtime state by package, class, field, method, object, stack frame, and static context.
 - Read and modify fields, arrays, and collections; invoke methods and constructors.
+- Retain, weakly track, replace, and release named object or field references across Context changes.
+- Manage precise String field watches and String-bearing method entry/exit hooks.
 - Decompile classes or individual methods with CFR or Procyon.
 - Inspect JVM bytecode, bytecode indexes (BCI), source lines, constant-pool references, and method metadata.
 - Manage breakpoints, field access/modification watchpoints, stepping, and paused threads.
@@ -40,12 +40,12 @@ The controller, target JVM, and native agent must use compatible architectures. 
 Build outputs:
 
 ```text
-build/libs/JVMRTDP-2.1.0.jar
-build/libs/jvmrtdp-2.1.0-library.jar
+build/libs/JVMRTDP-2.1.1.jar
+build/libs/jvmrtdp-2.1.1-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
 
-`JVMRTDP-2.1.0.jar` is the self-contained executable. `jvmrtdp-2.1.0-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
+`JVMRTDP-2.1.1.jar` is the self-contained executable. `jvmrtdp-2.1.1-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
 
 To publish the agent DLL to the conventional location:
 
@@ -66,13 +66,13 @@ The agent embedded in the JAR and a DLL preloaded by the target JVM should come 
 Start the default TUI:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.0.jar
+java -jar build\libs\JVMRTDP-2.1.1.jar
 ```
 
 Start in command-line mode:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.0.jar --cli
+java -jar build\libs\JVMRTDP-2.1.1.jar --cli
 ```
 
 Basic CLI workflow:
@@ -161,10 +161,12 @@ Main views:
 
 - `browse`: packages and classes
 - `context`: current class, object, static value, or stack context
+- `references`: strong/weak object snapshots and live field slots
 - `fields` / `methods`: member browsing and operations
 - `decompile`: decompiled class or method source
 - `bytecode`: BCI, source lines, and instruction stream
 - `debug`: current stop, threads, stack, and locals
+- `strings`: String field watches and method entry/exit hooks
 - `frames` / `locals`: stack frames and local variables
 - `breakpoints`: breakpoint management
 - `threads`: all JVM threads and states
@@ -183,14 +185,16 @@ The agent resolves these registrations during `ClassPrepare`, before ordinary cl
 ```text
 decompile class com.example.Application --engine cfr
 decompile method com.example.Application main "([Ljava/lang/String;)V" --engine procyon
+decompile range com.example.Application main "([Ljava/lang/String;)V" 12 48 --engine cfr
 bytecode com.example.Application main "([Ljava/lang/String;)V"
 bytecode insert-before com.example.Application run "()I" 4 "LDC \"return=\" ;; INVOKESTATIC example/Trace log (Ljava/lang/String;)V"
 bytecode replace com.example.Application run "()I" 4 "ICONST_5 ;; IRETURN"
+bytecode flush com.example.Application
 ```
 
 Decompile and bytecode views support search, horizontal scrolling, line or BCI navigation, breakpoints, and export. Native and abstract methods have no JVM `Code` attribute and therefore expose no Java bytecode.
 
-Live bytecode edits use transactional ASM rewrites with frame/max recomputation. In the Bytecode or Debug TUI, `+` inserts at the highlighted BCI (`after:` selects insertion after it), `-` deletes it, and `~` replaces it. CLI patch files combine multiple edits into one class redefinition; managed breakpoints are relocated to the emitted BCIs. Existing active frames may finish their obsolete method body, while new invocations use the replacement.
+Bytecode edits are staged before installation. In the Bytecode or Debug TUI, `+` inserts at the highlighted BCI (`after:` selects insertion after it), `-` deletes it, and `~` replaces it; `F3` verifies and flushes the complete class transaction and `Shift+F3` discards it. CLI edits use the same staging area and install only on `bytecode flush`. This allows temporarily incomplete operand-stack/control-flow edits to be finished before ASM recomputes frames and JVMTI verifies the class. CFR supplies direct BCI/decompiled-line mappings even without a `LineNumberTable`; `S` follows the highlighted BCI and `V` decompiles a selected BCI range. Managed breakpoints are relocated on flush.
 
 ## Debugging
 
@@ -222,6 +226,7 @@ debugger current <paused-index> 0 12
 debugger locals <paused-index> 0
 debugger step <paused-index>
 debugger step-out <paused-index>
+debugger run-to-line com.example.Application run "()V" 18 <paused-index>
 debugger continue <paused-index>
 ```
 
@@ -281,6 +286,29 @@ JVMTI can read frame locations and local variables, but the standard API does no
 
 ## Automation
 
+Tracked references and String hooks use the same managers in the CLI, TUI, and Java API:
+
+```text
+refs save service weak
+refs field currentName name strong
+refs static globalName com.example.Config displayName
+refs use currentName
+refs set currentName string:replacement
+refs release service
+
+strings field display-write write com.example.Config displayName
+strings field user-name-write write com.example.User name object
+strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
+strings track display-write displayValue
+strings use display-write
+strings call display-write length ()I
+```
+
+Strong references keep objects alive until release. Weak references report `COLLECTED` after
+normal GC. A tracked field reports `NULL` when its current value is Java `null`; this is distinct
+from a collected weak receiver. String replacement updates the owning field/reference/local—Java
+`String` instances remain immutable.
+
 Batch mode executes target commands directly:
 
 ```text
@@ -305,7 +333,7 @@ Publish the current build to the local Maven repository:
 
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.0") }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1") }
 ```
 
 Discover and attach to a JVM from Java:
@@ -322,7 +350,11 @@ try (JvmRtdpClient client = JvmRtdpClient.open();
 }
 ```
 
-The library API provides process discovery, configurable attach, captured command results, asynchronous agent commands, direct JNI/JVMTI access, and `session.instrumentation()` for source/JAR deployment, hooks, transformers, transactional ASM bytecode patches, retransformation, and redefinition. See the [Java Library Guide](docs/LIBRARY.md).
+The library API provides process discovery, configurable attach, captured command results,
+asynchronous agent commands, direct JNI/JVMTI access, `session.references()`,
+`session.stringHooks()`, and `session.instrumentation()` for source/JAR deployment, callbacks,
+transformers, transactional ASM bytecode patches, retransformation, and redefinition. See the
+[Java Library Guide](docs/LIBRARY.md).
 
 ## Safety and Behavior
 

@@ -1,7 +1,5 @@
 # JVMRTDP
 
-(Credits to GPT 5.6)
-
 [English](README.md) | [中文](README_ZH.md)
 
 JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析与调试工具。它将代理注入目标 JVM，并通过终端用户界面（TUI）、命令行和脚本提供类浏览、对象检查、反编译、字节码查看、断点、线程控制和 Java 虚拟机工具接口（JVMTI）操作。
@@ -40,12 +38,12 @@ JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析�
 构建产物位于：
 
 ```text
-build/libs/JVMRTDP-2.0.0.jar
-build/libs/jvmrtdp-2.0.0-library.jar
+build/libs/JVMRTDP-2.1.1.jar
+build/libs/jvmrtdp-2.1.1-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
 
-`JVMRTDP-2.0.0.jar` 是自包含可执行程序；`jvmrtdp-2.0.0-library.jar` 是适合作为依赖的库产物，终端相关依赖保持外置。
+`JVMRTDP-2.1.1.jar` 是自包含可执行程序；`jvmrtdp-2.1.1-library.jar` 是适合作为依赖的库产物，终端相关依赖保持外置。
 
 如需将代理 DLL 发布到传统目录：
 
@@ -66,13 +64,13 @@ JAR 中包含的代理和目标 JVM 预加载的 DLL 应来自同一次构建。
 启动默认 TUI：
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.0.0.jar
+java -jar build\libs\JVMRTDP-2.1.1.jar
 ```
 
 启动命令行模式：
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.0.0.jar --cli
+java -jar build\libs\JVMRTDP-2.1.1.jar --cli
 ```
 
 命令行基本流程：
@@ -148,10 +146,12 @@ TUI 默认按包浏览类，并隐藏常见 JDK 内部类型。页脚会根据�
 
 - `browse`：包和类浏览
 - `context`：当前类、对象、静态值或栈上下文
+- `references`：强/弱对象快照和实时字段槽
 - `fields` / `methods`：成员浏览与操作
 - `decompile`：类或方法反编译结果
 - `bytecode`：BCI、行号和指令流
 - `debug`：当前停止位置、线程、栈和局部变量
+- `strings`：String 字段监视与方法进入/退出 Hook
 - `frames` / `locals`：栈帧与局部变量
 - `breakpoints`：断点管理
 - `threads`：所有 JVM 线程及其状态
@@ -228,6 +228,26 @@ jvmti capability add can_generate_method_entry_events
 
 JVMTI 可以读取栈帧位置和局部变量，但标准接口不提供当前 JVM 操作数栈内容。字节码中的 `maxStack` 仅是类文件声明的最大深度。
 
+## 托管引用与 String Hook
+
+CLI、TUI 和 Java API 共享同一套会话级管理器：
+
+```text
+references save service strong
+references field service-name name weak
+references use service-name
+references set service-name "updated"
+
+strings field name-write write com.example.Service name
+strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
+strings track name-write observed-name
+strings call name-write length ()I
+```
+
+`references` 页管理对象快照、实例字段和静态字段。强引用会保持对象存活，弱引用被 GC 回收后显示 `COLLECTED`，Java null 单独显示为 `NULL`。条目可以刷新、写入、作为 Context 打开或手动释放。
+
+`strings` 页管理 String 字段读取/写入监视点以及带 String 签名的方法进入/退出断点。字段值可读取、替换、保存为托管引用或作为接收者调用方法；Hook 命中会同步到 Debug、Frames 和 Locals。调试快照的 JSON/JSONL 也包含引用与 String Hook 状态。
+
 ## 自动化
 
 批处理直接执行目标命令：
@@ -254,7 +274,7 @@ script workflow.jrd
 
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.0.0") }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1") }
 ```
 
 在 Java 中发现并连接 JVM：

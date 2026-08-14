@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-This document describes the TUI, command line, and debugger commands in JVMRTDP 2.1.0. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
+This document describes the TUI, command line, and debugger commands in JVMRTDP 2.1.1. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
 
 ## 1. Conventions
 
@@ -16,8 +16,8 @@ This document describes the TUI, command line, and debugger commands in JVMRTDP 
 ## 2. Startup and Sessions
 
 ```powershell
-java -jar JVMRTDP-2.1.0.jar
-java -jar JVMRTDP-2.1.0.jar --cli
+java -jar JVMRTDP-2.1.1.jar
+java -jar JVMRTDP-2.1.1.jar --cli
 ```
 
 Controller commands:
@@ -62,12 +62,14 @@ The footer lists actions available in the current view. CLI and TUI are two inte
 | `[` / `]` | Scroll horizontally faster |
 | `0` | Reset horizontal position |
 | `/` | Filter the current list; `Esc` cancels |
-| `f` | Find only in the currently displayed Browse/Fields/Methods list |
+| `f` | Find in the currently displayed Browse/Fields/Methods/References/String Hooks list |
 | `F` | Search all loaded classes, fields, methods, and packages |
 | `:` | Enter an exact class, package, field, or method target |
 | `@` | Show or hide static members in Fields/Methods |
 | `#` | Show or hide instance fields and virtual methods in Fields/Methods |
 | `=` | Set a field, paused local, or writable context source |
+| `&` in Fields | Track the selected live field in References |
+| `;` in Fields | Create a guided String read/write hook for a String field |
 | `x` / `X` | Invoke a selected method virtually / exact declaring implementation |
 | `n` / `N` | Next or previous match |
 | `P` | Enter a package name |
@@ -141,6 +143,62 @@ stack clear
 ```
 
 `stack pop`, `stack back`, and `stack drop` are equivalent. Stack index `0` is the top.
+
+### 4.1 Tracked references
+
+```text
+references list
+references save <name> [strong|weak]
+references field <name> [declaring.Class::]<field> [strong|weak]
+references static <name> <class> [declaring.Class::]<field>
+references use <name>
+references refresh [name]
+references info <name>
+references set <name> <value>
+references null <name>
+references release <name|all>
+```
+
+`refs` is an alias for `references`. `save` captures the current object Context. `field` tracks
+the selected instance field slot and re-reads it on refresh; its strength controls whether the
+receiver is retained. `static` tracks the static slot. `use` acquires a new strong handle into
+Context. Tracked values can be supplied to any value expression as `$name` or `&name`.
+
+States are `LIVE`, `NULL`, `COLLECTED`, `RELEASED`, and `ERROR`. Strong entries keep an object
+alive until release. Weak entries do not use or overwrite JVMTI object tags. `NULL` means the Java
+slot contains null; `COLLECTED` means a weakly tracked object/receiver was reclaimed.
+
+The TUI `references` tab uses `Enter` to open Context, `S`/`Shift+S` to save the current Context
+strongly/weakly, `=` to replace, `X` to write null, `Delete` to release, and `F5` to refresh.
+
+### 4.2 String hooks
+
+```text
+strings list
+strings field <name> <read|write> <class> <field> [object]
+strings method <name> <entry|exit> <class> <method> <descriptor>
+strings on <name>
+strings off <name>
+strings read <name>
+strings use <name>
+strings set <name> <value>
+strings track <hook> <reference> [strong|weak]
+strings call <hook> <method> <descriptor> [arguments...]
+strings remove <name>
+strings clear
+```
+
+Field hooks require descriptor `Ljava/lang/String;` and use JVMTI field access/modification
+watchpoints. The optional `object` scope uses the current object Context; otherwise the watch
+applies to every matching instance. Method hooks use managed entry/exit event breakpoints and
+target either `java.lang.String` or a signature containing `Ljava/lang/String;`.
+
+`read`, `use`, `set`, `track`, and `call` operate on field-backed hooks. Method hook hits appear in
+Debug, where Frames/Locals expose the receiver, arguments, and return value. Replacing a String
+updates its owning reference; Java String instances are not mutated internally.
+
+The TUI `strings` tab uses `A` to add, `Enter` to open a value or last hit, `F9` to enable/disable,
+`=` to replace a field value, `&` to add it to References, and `Delete` to remove the hook.
 
 ## 5. Value Expressions
 
@@ -257,12 +315,19 @@ dumpclass package <name|.> <directory> [--recursive|--no-recursive] [--match glo
 ```text
 decompile class [class] [--engine cfr|procyon] [--out <file>]
 decompile method [class] <method> <descriptor> [--engine cfr|procyon] [--out <file>]
+decompile range [class] <method> <descriptor> <from-bci> <to-bci> [--engine cfr|procyon] [--out <file>]
 bytecode [class] <method> <descriptor> [--out <file>]
 bytecode <insert-before|insert-after|replace> <class> <method> <descriptor> <bci> <assembly>
 bytecode delete <class> <method> <descriptor> <from-bci> [to-bci]
 bytecode <returns-insert|returns-replace> <class> <method> <descriptor> <assembly>
 bytecode intercept-return <class> <method> <descriptor> <hook-class> <hook-method>
 bytecode patch-file <class> <file> [--preview] [--out <class-file>]
+bytecode status [class]
+bytecode flush [class|--all]
+bytecode discard [class|--all]
+bytecode handlers <class> <method> <descriptor>
+bytecode handler-add <class> <method> <descriptor> <start-bci> <end-bci> <handler-bci> [type|any]
+bytecode handler-delete <class> <method> <descriptor> <index>
 bytecode <undo|redo> <class>
 ```
 
@@ -278,6 +343,7 @@ bytecode replace com.example.Service value "()I" 8 "BIPUSH 42 ;; IRETURN"
 bytecode delete com.example.Service value "()I" 2 7
 bytecode returns-insert com.example.Service value "()I" "DUP ;; INVOKESTATIC example/Trace onInt (I)V"
 bytecode intercept-return com.example.Service value "()I" example.ReturnHooks onInt
+bytecode flush com.example.Service
 ```
 
 `intercept-return` calls a visible static hook immediately before every normal return. A return type `T` requires hook descriptor `(T)T`; `void` requires `()V`. The returned hook value replaces the method result. Deploy the hook into a loader visible to the edited class, normally `SAME_LOADER`.
@@ -294,7 +360,9 @@ delete|other|()V|4|9
 returns-insert|compute|(J)J|DUP2 ;; INVOKESTATIC example/Trace onLong (J)V
 ```
 
-`--preview` validates and emits bytes without installing them. `--out` saves those bytes. The rewrite recomputes stack-map frames and maximums, then performs one JVMTI class redefinition. A failure before redefine leaves the class unchanged. Managed breakpoints are cleared and reinstalled at relocated BCIs. HotSpot schema limits still apply, and active frames may finish obsolete bytecodes; invoke the method again to observe the replacement reliably.
+Normal edit commands and patch files update a shared in-memory staging area; they do not redefine the target immediately. Inspect the staged form with `bytecode`, list it with `bytecode status`, then use `bytecode flush` after every related edit is complete. Flush drops provisional frames, recomputes stack-map frames/maximums once, sanitizes empty exception-handler ranges, and performs one JVMTI class redefinition. `handler-add` and `handler-delete` edit the staged exception table explicitly. `--preview` emits without changing the staging area, while `--out` saves the emitted bytes. A failed flush leaves the staged transaction available for correction or discard. Managed breakpoints are reinstalled at relocated BCIs.
+
+CFR's mapping is from actual bytecode locations to decompiled output rows and does not depend on a `LineNumberTable`. `decompile range` uses it to isolate a selected BCI interval. In the TUI, `S` maps the selected bytecode/debug BCI to Decompile, `Enter` maps a decompiled row back to BCI, and `V` decompiles a BCI range.
 
 ## 9. Debugger
 
@@ -391,6 +459,7 @@ Without a `LocalVariableTable`, JVMRTDP attempts to read slots up to `maxLocals`
 ```text
 debugger step [paused-index]
 debugger step-out [paused-index]
+debugger run-to-line <class> <method> <descriptor> <decompiled-line> [paused-index]
 debugger continue [paused-index|all]
 ```
 
@@ -410,7 +479,7 @@ debugger thaw
 debugger snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]
 ```
 
-Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshot schema version 3 includes bytecode breakpoints, event breakpoints, field watches, paused frames/locals, and captured method-exit return values for offline analysis and external tools.
+Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshot schema version 4 includes bytecode breakpoints, event breakpoints, field watches, tracked references, String hooks, paused frames/locals, and captured method-exit return values for offline analysis and external tools.
 
 ### 9.7 Debugging Limits
 
@@ -544,6 +613,8 @@ session.operations()
 session.context()
 session.workspace()
 session.debugger()
+session.references()
+session.stringHooks()
 ```
 
 See the [Java Library Guide](LIBRARY.md) for dependencies, lifecycle rules, async calls, and complete examples.

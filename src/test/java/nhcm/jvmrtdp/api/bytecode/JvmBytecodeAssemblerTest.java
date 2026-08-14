@@ -39,4 +39,19 @@ class JvmBytecodeAssemblerTest {
                 .build();
         assertEquals(3, patch.operations().size());
     }
+
+    @Test void buildsManualExceptionTableEdits() {
+        JvmBytecodePatch patch = JvmBytecodePatch.builder("example.Target")
+                .addExceptionHandler("run", "()V", 0, 9, 12,
+                        "java.lang.RuntimeException")
+                .deleteExceptionHandler("run", "()V", 0)
+                .build();
+
+        assertEquals(JvmBytecodePatch.Kind.ADD_EXCEPTION_HANDLER,
+                patch.operations().get(0).kind());
+        assertEquals("12|java.lang.RuntimeException",
+                patch.operations().get(0).assembly());
+        assertEquals(JvmBytecodePatch.Kind.DELETE_EXCEPTION_HANDLER,
+                patch.operations().get(1).kind());
+    }
 }

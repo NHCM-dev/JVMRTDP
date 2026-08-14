@@ -51,9 +51,15 @@ public final class ClassDecompiler {
         DecompilationResult result = decompile(className, classBytes, engine);
         JavaMethodExtractor.Extraction extracted = JavaMethodExtractor.extractDetails(
                 result.source(), simpleName(className), methodName, descriptor);
-        if (extracted == null) return new DecompilationResult(result.engine(), className,
-                "// Could not isolate " + methodName + descriptor + "; showing the complete class.\n"
-                        + result.source(), result.diagnostics());
+        if (extracted == null) {
+            List<String> diagnostics = new ArrayList<String>(result.diagnostics());
+            diagnostics.add("The decompiler did not expose an isolatable declaration for "
+                    + methodName + descriptor + "; the class result is shown.");
+            return new DecompilationResult(result.engine(), className,
+                    result.source(), diagnostics,
+                    Collections.singletonMap(DecompilationResult.mappingKey(methodName, descriptor),
+                            result.lineMappings(methodName, descriptor)));
+        }
         NavigableMap<Integer, Integer> adjusted = new TreeMap<Integer, Integer>();
         int lineCount = extracted.source().split("\\r?\\n", -1).length;
         for (Map.Entry<Integer, Integer> mapping
@@ -66,6 +72,57 @@ public final class ClassDecompiler {
         mappings.put(DecompilationResult.mappingKey(methodName, descriptor), adjusted);
         return new DecompilationResult(result.engine(), className, extracted.source(),
                 result.diagnostics(), mappings);
+    }
+
+    /**
+     * Decompiles only the source rows correlated by CFR with a selected BCI range. CFR's
+     * bytecode-location map is produced by its control-flow analysis and does not require
+     * a LineNumberTable in the target class.
+     */
+    public DecompilationResult decompileRangeResult(String className, byte[] classBytes,
+            String methodName, String descriptor, int fromBci, int toBci,
+            DecompilerEngine engine) {
+        if (fromBci < 0 || toBci < fromBci) throw new IllegalArgumentException(
+                "Invalid BCI range " + fromBci + ".." + toBci);
+        DecompilationResult method = decompileMethodResult(
+                className, classBytes, methodName, descriptor, engine);
+        NavigableMap<Integer, Integer> map = method.lineMappings(methodName, descriptor);
+        if (map.isEmpty()) throw new IllegalStateException(
+                "No decompiler BCI mapping is available for " + methodName + descriptor
+                        + "; CFR is required for range decompilation");
+        int first = Integer.MAX_VALUE;
+        int last = Integer.MIN_VALUE;
+        for (Map.Entry<Integer, Integer> entry : map.entrySet()) {
+            if (entry.getKey().intValue() < fromBci || entry.getKey().intValue() > toBci) continue;
+            first = Math.min(first, entry.getValue().intValue());
+            last = Math.max(last, entry.getValue().intValue());
+        }
+        if (first == Integer.MAX_VALUE) {
+            Map.Entry<Integer, Integer> near = map.floorEntry(Integer.valueOf(fromBci));
+            if (near == null) near = map.ceilingEntry(Integer.valueOf(fromBci));
+            if (near == null) throw new IllegalStateException("No decompiled row is near BCI " + fromBci);
+            first = last = near.getValue().intValue();
+        }
+        String[] lines = method.source().split("\\r?\\n", -1);
+        first = Math.max(1, Math.min(first, lines.length));
+        last = Math.max(first, Math.min(last, lines.length));
+        StringBuilder source = new StringBuilder();
+        for (int line = first; line <= last; line++) {
+            if (source.length() > 0) source.append(System.lineSeparator());
+            source.append(lines[line - 1]);
+        }
+        NavigableMap<Integer, Integer> adjusted = new TreeMap<Integer, Integer>();
+        for (Map.Entry<Integer, Integer> entry : map.entrySet()) {
+            if (entry.getKey().intValue() >= fromBci && entry.getKey().intValue() <= toBci
+                    && entry.getValue().intValue() >= first && entry.getValue().intValue() <= last) {
+                adjusted.put(entry.getKey(), Integer.valueOf(entry.getValue().intValue() - first + 1));
+            }
+        }
+        Map<String, NavigableMap<Integer, Integer>> mappings =
+                new HashMap<String, NavigableMap<Integer, Integer>>();
+        mappings.put(DecompilationResult.mappingKey(methodName, descriptor), adjusted);
+        return new DecompilationResult(method.engine(), className, source.toString(),
+                method.diagnostics(), mappings);
     }
 
     private static DecompilationResult decompileCfr(final String className, final byte[] classBytes) {

@@ -3,6 +3,7 @@ package nhcm.jvmrtdp.remoteside;
 import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 
 import java.lang.reflect.Array;
+import java.lang.ref.WeakReference;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,7 +25,7 @@ public class TargetObjectRegistry implements AutoCloseable {
     public RemoteObjectDescriptor storeOpaque(Object value) {
         String type = value == null ? Object.class.getName() : value.getClass().getName();
         long id = ids.getAndIncrement();
-        objects.put(id, new Entry(value == null ? NULL : value, type));
+        objects.put(id, Entry.strong(value == null ? NULL : value, type));
         String display;
         if (value == null) display = "null";
         else if (value instanceof String || value instanceof Number
@@ -40,24 +41,40 @@ public class TargetObjectRegistry implements AutoCloseable {
 
     public RemoteObjectDescriptor store(Object value, String declaredType) {
         long id = ids.getAndIncrement();
-        objects.put(id, new Entry(value == null ? NULL : value, declaredType));
+        objects.put(id, Entry.strong(value == null ? NULL : value, declaredType));
         return descriptor(id, value, declaredType);
     }
 
-    public Object resolve(long id) {
+    /** Creates an independently releasable strong or weak handle for an existing value. */
+    public RemoteObjectDescriptor retain(long sourceId, boolean weak) {
+        Entry source = requireEntry(sourceId);
+        Object stored = source.value(sourceId);
+        Object value = stored == NULL ? null : stored;
+        long id = ids.getAndIncrement();
+        objects.put(id, weak && value != null
+                ? Entry.weak(value, source.declaredType)
+                : Entry.strong(value == null ? NULL : value, source.declaredType));
+        return descriptor(id, value, source.declaredType);
+    }
+
+    /** Distinguishes a collected weak handle from an explicit Java null. */
+    public String status(long id) {
         Entry entry = objects.get(id);
-        if (entry == null) {
-            throw new IllegalArgumentException("Unknown or released remote object: " + id);
-        }
-        return entry.value == NULL ? null : entry.value;
+        if (entry == null) return "released";
+        Object value = entry.rawValue();
+        if (value == null && entry.weak) return "collected";
+        return value == NULL ? "null" : "live";
+    }
+
+    public Object resolve(long id) {
+        Object value = requireEntry(id).value(id);
+        return value == NULL ? null : value;
     }
 
     public RemoteObjectDescriptor describe(long id) {
-        Entry entry = objects.get(id);
-        if (entry == null) {
-            throw new IllegalArgumentException("Unknown or released remote object: " + id);
-        }
-        Object value = entry.value == NULL ? null : entry.value;
+        Entry entry = requireEntry(id);
+        Object stored = entry.value(id);
+        Object value = stored == NULL ? null : stored;
         return descriptor(id, value, entry.declaredType);
     }
 
@@ -72,6 +89,12 @@ public class TargetObjectRegistry implements AutoCloseable {
     @Override
     public void close() {
         objects.clear();
+    }
+
+    private Entry requireEntry(long id) {
+        Entry entry = objects.get(id);
+        if (entry == null) throw new IllegalArgumentException("Unknown or released remote object: " + id);
+        return entry;
     }
 
     private static RemoteObjectDescriptor descriptor(long id, Object value, String declaredType) {
@@ -118,12 +141,35 @@ public class TargetObjectRegistry implements AutoCloseable {
     }
 
     private static class Entry {
-        private final Object value;
+        private final Object strongValue;
+        private final WeakReference<Object> weakValue;
+        private final boolean weak;
         private final String declaredType;
 
-        private Entry(Object value, String declaredType) {
-            this.value = value;
+        private Entry(Object strongValue, WeakReference<Object> weakValue,
+                boolean weak, String declaredType) {
+            this.strongValue = strongValue;
+            this.weakValue = weakValue;
+            this.weak = weak;
             this.declaredType = declaredType;
+        }
+
+        private static Entry strong(Object value, String declaredType) {
+            return new Entry(value, null, false, declaredType);
+        }
+
+        private static Entry weak(Object value, String declaredType) {
+            return new Entry(null, new WeakReference<Object>(value), true, declaredType);
+        }
+
+        private Object rawValue() { return weak ? weakValue.get() : strongValue; }
+
+        private Object value(long id) {
+            Object value = rawValue();
+            if (value == null && weak) {
+                throw new IllegalStateException("Weak remote object has been garbage collected: " + id);
+            }
+            return value;
         }
     }
 }

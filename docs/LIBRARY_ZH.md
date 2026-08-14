@@ -20,7 +20,7 @@ repositories {
 }
 
 dependencies {
-    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.0")
+    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1")
 }
 ```
 
@@ -30,11 +30,11 @@ Maven：
 <dependency>
   <groupId>nhcm.jvmrtdp</groupId>
   <artifactId>jvmrtdp</artifactId>
-  <version>2.1.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 
-本地文件依赖使用 `build/libs/jvmrtdp-2.1.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 ASM 与 JLine；使用文件依赖时，字节码 API 需自行添加 `asm-tree` 与 `asm-util`，终端控制类需添加 JLine。`build/libs/JVMRTDP-2.1.0.jar` 仍是自包含可执行程序。
+本地文件依赖使用 `build/libs/jvmrtdp-2.1.1-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 ASM 与 JLine；使用文件依赖时，字节码 API 需自行添加 `asm-tree` 与 `asm-util`，终端控制类需添加 JLine。`build/libs/JVMRTDP-2.1.1.jar` 仍是自包含可执行程序。
 
 发布产物包括库 JAR、源码包、Javadoc 和 Maven POM。自动模块名为 `nhcm.jvmrtdp`。
 
@@ -139,9 +139,54 @@ System.out.println(session.jvmti().capabilityStatuses());
 | `session.context()` | 嵌入式 CLI 命令使用的上下文栈 |
 | `session.workspace()` | 具名类和对象句柄 |
 | `session.debugger()` | 可逆分析冻结和调试器协调 |
+| `session.references()` | 强/弱对象快照与实时实例/静态字段槽 |
+| `session.stringHooks()` | String 字段监视与带 String 签名的方法进入/退出 Hook |
 | `session.serverHandle()` | 高级认证协议访问 |
 
 远程对象句柄是强引用。不再使用 `RemoteObject`、`RemoteJvmtiThread`、部署、回调和其他可关闭句柄时，应尽快关闭。
+
+### 托管对象与字段引用
+
+`JvmReferenceManager` 独立持有目标端句柄。强引用会保持对象存活；弱引用不占用 JVMTI tag，也不会阻止 GC：
+
+```java
+RemoteClass config = session.findClass("com.example.Config");
+RemoteField singleton = config.getStaticField("INSTANCE");
+session.references().trackStaticField("service", singleton);
+
+try (RemoteObject service = session.references().acquire("service")) {
+    session.references().trackObject(
+            "service-weak", service, JvmReferenceStrength.WEAK);
+}
+
+for (JvmReferenceInfo info : session.references().refreshAll()) {
+    System.out.println(info.name() + " " + info.state());
+}
+session.references().setNull("service");
+session.references().release("service-weak");
+```
+
+状态包括 `LIVE`、`NULL`、`COLLECTED`、`RELEASED` 和 `ERROR`。`trackField` 与 `trackStaticField` 在刷新时重新读取字段；`replace`/`setNull` 写回字段；`acquire` 返回由调用者关闭的新强句柄。
+
+### String Hook
+
+```java
+RemoteField message = config.getStaticField("message");
+session.stringHooks().watchField("message-write", message, true, null);
+session.stringHooks().breakMethod("parse-exit", JvmStringHookKind.METHOD_EXIT,
+        "com.example.Parser", "parse",
+        "(Ljava/lang/String;)Ljava/lang/String;");
+
+try (RemoteObject value = session.stringHooks().acquireValue("message-write")) {
+    System.out.println(value.displayValue());
+}
+session.stringHooks().trackValue("message-write", session.references(),
+        "message", JvmReferenceStrength.STRONG);
+```
+
+字段 Hook 使用 JVMTI 字段访问/修改监视点，可选择所有实例或精确接收者。方法 Hook 使用托管 `METHOD_ENTRY`/`METHOD_EXIT` 事件断点。内置 CLI/TUI 会自动把 Hook 命中与共享调试器关联；自定义界面可将 `debuggerStates()` 传给 `observe(...)`。String 不可变，`replaceValue` 替换字段引用，而不是改写 String 内部数组。
+
+引用与 Hook 会随 session 关闭而清理，并写入调试器 JSON/JSONL 快照 schema v4。部署回调仍使用 `JvmtiEventHandler`/`JvmtiMethodEvent`；同步 class-file transformer 仅适合需要返回字节码的场景，普通观察 Hook 应使用异步事件分发。
 
 ## 7. Agent 命令与异步调用
 

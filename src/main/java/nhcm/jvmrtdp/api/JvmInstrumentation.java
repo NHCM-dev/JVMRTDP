@@ -31,7 +31,7 @@ public final class JvmInstrumentation {
     public byte[] classBytes(String className) { return jvmti.getClassBytes(className); }
 
     public void redefine(String className, byte[] classBytes) {
-        jvmti.redefineClass(className, classBytes);
+        bytecode.redefineExternal(className, classBytes);
     }
 
     public void redefine(String className, Path classFile) throws IOException {
@@ -48,7 +48,7 @@ public final class JvmInstrumentation {
         return replacement.clone();
     }
 
-    public void retransform(String className) { jvmti.retransformClass(className); }
+    public void retransform(String className) { bytecode.retransformExternal(className); }
 
     public RemoteCodeDeployment deployClasses(String name, Map<String, byte[]> classes,
             String anchorClass, RemoteJVMTIEnv.DefinitionMode mode) {

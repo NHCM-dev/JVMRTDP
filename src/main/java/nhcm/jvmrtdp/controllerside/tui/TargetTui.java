@@ -10,8 +10,13 @@ import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatch;
 import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
+import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
+import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
+import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
+import nhcm.jvmrtdp.api.reference.JvmReferenceStrength;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.controllerside.RemoteArgumentList;
+import nhcm.jvmrtdp.command.CommandLine;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerFreezeReport;
 import nhcm.jvmrtdp.controllerside.analysis.BytecodeInstruction;
 import nhcm.jvmrtdp.controllerside.analysis.ClassFileMethod;
@@ -57,7 +62,8 @@ import java.util.function.Consumer;
 /** Context-oriented package browser and bytecode debugger for one attached JVM. */
 public final class TargetTui implements AutoCloseable {
     private enum Tab {
-        BROWSE, CONTEXT, FIELDS, METHODS, SOURCE, BYTECODE, DEBUG, FRAMES, LOCALS, BREAKPOINTS, THREADS
+        BROWSE, CONTEXT, REFERENCES, FIELDS, METHODS, SOURCE, BYTECODE, DEBUG,
+        STRINGS, FRAMES, LOCALS, BREAKPOINTS, THREADS
     }
 
     private final TargetSession session;
@@ -131,6 +137,7 @@ public final class TargetTui implements AutoCloseable {
     private String bytecodeDescriptor = "";
     private JvmClassPathCatalog.ClassEntry bytecodeCatalogClass;
     private int pendingBytecodeLocation = -1;
+    private int pendingSourceBci = -1;
     private JvmDebuggerState debuggerState;
     private int debuggerFrameDepth;
     private DebuggerFreezeReport lastFreezeReport;
@@ -157,12 +164,14 @@ public final class TargetTui implements AutoCloseable {
     private String pagedStatus = "";
     private String status = "Opening root package...";
     private long synchronizedContextRevision = -1L;
+    private long synchronizedBytecodeRevision = -1L;
     private long scheduledContextRevision = -1L;
     private boolean browserInitialized;
     private boolean closed;
 
     public TargetTui(TargetSession session) {
         this.session = session;
+        this.synchronizedBytecodeRevision = session.instrumentation().bytecode().revision();
         synchronizeManagedControls();
     }
 
@@ -189,6 +198,7 @@ public final class TargetTui implements AutoCloseable {
                 // one queued action already occupy the runner. Reconcile every idle frame so
                 // CLI -> TUI context changes can never leave empty derived member panes.
                 maybeSynchronizeContext();
+                maybeSynchronizeBytecode();
                 maybeAutoRefreshDebugger();
                 render();
                 int key = screen.readKey(90L);
@@ -237,6 +247,20 @@ public final class TargetTui implements AutoCloseable {
         }
     }
 
+    private void maybeSynchronizeBytecode() {
+        long revision = session.instrumentation().bytecode().revision();
+        if (revision == synchronizedBytecodeRevision || tasks.busy()) return;
+        synchronizedBytecodeRevision = revision;
+        if ((tab == Tab.BYTECODE || tab == Tab.DEBUG) && !bytecodeClass.isEmpty()
+                && !bytecodeMethod.isEmpty()) {
+            int location = bytecode == null || bytecode.instructions().isEmpty() ? -1
+                    : bytecode.instructions().get(bytecodeCursor()).offset();
+            if (location >= 0) pendingBytecodeLocation = location;
+            requestBytecode(bytecodeClass, bytecodeMethod, bytecodeDescriptor, tab);
+            status = "Bytecode transaction changed outside this view; refreshing staged/live code...";
+        }
+    }
+
     private void synchronizeManagedControls() {
         Map<String, BreakpointSpec> currentBreakpoints =
                 new LinkedHashMap<String, BreakpointSpec>(breakpoints);
@@ -274,7 +298,18 @@ public final class TargetTui implements AutoCloseable {
             return TuiResult.BACK;
         }
         if (handleInspectorNavigation(key)) return null;
-        if (key == TuiKey.CTRL_LEFT) changeTab(-1);
+        if (key == TuiKey.DELETE && tab == Tab.REFERENCES) releaseSelectedReference();
+        else if (key == TuiKey.DELETE && tab == Tab.STRINGS) removeSelectedStringHook();
+        else if ((key == 's' || key == 'S') && tab == Tab.REFERENCES) {
+            saveCurrentReference(key == 'S');
+        }
+        else if (key == '&' && tab == Tab.FIELDS) trackSelectedFieldReference();
+        else if (key == ';' && tab == Tab.FIELDS) hookSelectedStringField();
+        else if (key == '&' && tab == Tab.STRINGS) trackSelectedStringHookValue();
+        else if ((key == 'a' || key == 'A') && tab == Tab.STRINGS) addStringHook();
+        else if ((key == 'x' || key == 'X') && tab == Tab.REFERENCES) nullSelectedReference();
+        else if (key == TuiKey.F9 && tab == Tab.STRINGS) toggleSelectedStringHook();
+        else if (key == TuiKey.CTRL_LEFT) changeTab(-1);
         else if (key == TuiKey.CTRL_RIGHT) changeTab(1);
         else if (key == TuiKey.LEFT && horizontallyScrollable()) moveHorizontal(-8);
         else if (key == TuiKey.RIGHT && horizontallyScrollable()) moveHorizontal(8);
@@ -313,6 +348,7 @@ public final class TargetTui implements AutoCloseable {
         else if (key == '#' && (tab == Tab.FIELDS || tab == Tab.METHODS)) toggleVirtualMembers();
         else if (key == 'r' || key == 'R' || key == TuiKey.F5) refresh();
         else if ((key == 's' || key == 'S') && tab == Tab.CONTEXT) swapContextTop();
+        else if (key == 'V' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) requestSourceRange();
         else if (key == 's' || key == 'S') requestSource(false);
         else if (key == 'a' || key == 'A') {
             if (tab == Tab.BREAKPOINTS) clearAllBreakpoints();
@@ -352,9 +388,12 @@ public final class TargetTui implements AutoCloseable {
         else if (key == TuiKey.CTRL_E && (tab == Tab.METHODS || tab == Tab.BROWSE)) toggleMethodEventBreakpoint(true);
         else if (key == TuiKey.CTRL_X && (tab == Tab.METHODS || tab == Tab.BROWSE)) toggleMethodEventBreakpoint(false);
         else if (key == TuiKey.CTRL_X && tab == Tab.DEBUG) toggleExceptionBreakpoint();
+        else if (key == TuiKey.F3 && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) flushBytecodeEdits();
+        else if (key == TuiKey.SHIFT_F3 && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) discardBytecodeEdits();
         else if (key == '+' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) insertBytecode();
         else if (key == '-' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) deleteBytecode();
         else if (key == '~' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) replaceBytecode();
+        else if (key == '|' && (tab == Tab.BYTECODE || tab == Tab.DEBUG)) editExceptionHandlers();
         return null;
     }
 
@@ -453,8 +492,9 @@ public final class TargetTui implements AutoCloseable {
             editViewSearch();
             return;
         }
-        if (tab != Tab.BROWSE && tab != Tab.FIELDS && tab != Tab.METHODS) {
-            status = "List Find is available in Browse, Fields, Methods, Decompile, Bytecode, and Debug.";
+        if (tab != Tab.BROWSE && tab != Tab.FIELDS && tab != Tab.METHODS
+                && tab != Tab.REFERENCES && tab != Tab.STRINGS) {
+            status = "List Find is available in Browse, Fields, Methods, References, String Hooks, Decompile, Bytecode, and Debug.";
             return;
         }
         String value = editText("Find in current list", listSearch);
@@ -888,6 +928,7 @@ public final class TargetTui implements AutoCloseable {
         }
         if (tab == Tab.BROWSE) selectBrowserEntry();
         else if (tab == Tab.CONTEXT) selectContextStackItem();
+        else if (tab == Tab.REFERENCES) useSelectedReference();
         else if (tab == Tab.FIELDS) readSelectedField();
         else if (tab == Tab.METHODS) requestSelectedBytecode(Tab.BYTECODE);
         else if (tab == Tab.SOURCE) jumpSourceLineToBytecode();
@@ -895,6 +936,7 @@ public final class TargetTui implements AutoCloseable {
         else if (tab == Tab.LOCALS) selectLocalAsContext();
         else if (tab == Tab.BREAKPOINTS) openSelectedBreakpoint();
         else if (tab == Tab.THREADS) selectOrPauseThread();
+        else if (tab == Tab.STRINGS) openSelectedStringHook();
         else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) toggleBreakpoint(false);
     }
 
@@ -1243,7 +1285,371 @@ public final class TargetTui implements AutoCloseable {
         if (tab == Tab.FIELDS) setSelectedField();
         else if (tab == Tab.LOCALS) setSelectedLocal();
         else if (tab == Tab.CONTEXT) setCurrentContext();
-        else status = "Use = in Context, Fields, or Locals. Methods/classes use redefine instead.";
+        else if (tab == Tab.REFERENCES) setSelectedReference();
+        else if (tab == Tab.STRINGS) setSelectedStringHookValue();
+        else status = "Use = in Context, References, String Hooks, Fields, or Locals. Methods/classes use redefine instead.";
+    }
+
+    private void saveCurrentReference(boolean weak) throws IOException {
+        if (!session.context().isSet() || session.context().isClass()) {
+            status = "Select an object context before saving a tracked reference.";
+            return;
+        }
+        final String name = editText("Reference name", "ref" + (session.references().snapshot().size() + 1));
+        if (name == null || name.trim().isEmpty()) return;
+        final RemoteObject object = session.context().remoteObject();
+        final JvmReferenceStrength strength = weak
+                ? JvmReferenceStrength.WEAK : JvmReferenceStrength.STRONG;
+        submit("Saving " + strength.name().toLowerCase(Locale.ROOT) + " reference " + name + "...",
+                new Callable<JvmReferenceInfo>() {
+                    @Override public JvmReferenceInfo call() {
+                        return session.references().trackObject(name, object, strength);
+                    }
+                }, new Consumer<JvmReferenceInfo>() {
+                    @Override public void accept(JvmReferenceInfo value) {
+                        tab = Tab.REFERENCES;
+                        selectReference(value.name());
+                        status = "Saved " + value;
+                    }
+                });
+    }
+
+    private void trackSelectedFieldReference() throws IOException {
+        if (unloadedContextClass != null) {
+            status = "Unloaded fields have metadata but no value to track until the class is prepared.";
+            return;
+        }
+        List<RemoteField> visible = visibleFields();
+        if (visible.isEmpty()) { status = "No field is selected."; return; }
+        final RemoteField field = visible.get(selection());
+        if (!field.isStatic() && session.context().isClass()) {
+            status = "Select an object context to track this instance field.";
+            return;
+        }
+        final String name = editText("Tracked field reference name", field.name());
+        if (name == null || name.trim().isEmpty()) return;
+        String policy = field.isStatic() ? "strong" : editText("Receiver lifetime: strong or weak", "strong");
+        if (policy == null) return;
+        final JvmReferenceStrength strength = "weak".equalsIgnoreCase(policy.trim())
+                ? JvmReferenceStrength.WEAK : JvmReferenceStrength.STRONG;
+        if (!"strong".equalsIgnoreCase(policy.trim()) && !"weak".equalsIgnoreCase(policy.trim())) {
+            status = "Receiver lifetime must be strong or weak.";
+            return;
+        }
+        final RemoteObject receiver = field.isStatic() ? null : session.context().remoteObject();
+        submit("Tracking field " + field.declaringClass() + "." + field.name() + "...",
+                new Callable<JvmReferenceInfo>() {
+                    @Override public JvmReferenceInfo call() {
+                        return field.isStatic()
+                                ? session.references().trackStaticField(name, field)
+                                : session.references().trackField(name, field, receiver, strength);
+                    }
+                }, new Consumer<JvmReferenceInfo>() {
+                    @Override public void accept(JvmReferenceInfo value) {
+                        tab = Tab.REFERENCES;
+                        selectReference(value.name());
+                        status = "Tracking " + value.source();
+                    }
+                });
+    }
+
+    private void requestReferenceRefresh() {
+        submit("Refreshing tracked references...", new Callable<List<JvmReferenceInfo>>() {
+            @Override public List<JvmReferenceInfo> call() { return session.references().refreshAll(); }
+        }, new Consumer<List<JvmReferenceInfo>>() {
+            @Override public void accept(List<JvmReferenceInfo> values) {
+                selections[Tab.REFERENCES.ordinal()] = clamp(selections[Tab.REFERENCES.ordinal()],
+                        0, Math.max(0, values.size() - 1));
+                status = "Refreshed " + values.size() + " tracked reference(s).";
+            }
+        });
+    }
+
+    private JvmReferenceInfo selectedReference() {
+        List<JvmReferenceInfo> values = session.references().snapshot();
+        return values.isEmpty() ? null : values.get(clamp(
+                selections[Tab.REFERENCES.ordinal()], 0, values.size() - 1));
+    }
+
+    private void selectReference(String name) {
+        List<JvmReferenceInfo> values = session.references().snapshot();
+        for (int index = 0; index < values.size(); index++) {
+            if (values.get(index).name().equals(name)) {
+                selections[Tab.REFERENCES.ordinal()] = index;
+                return;
+            }
+        }
+    }
+
+    private void useSelectedReference() {
+        final JvmReferenceInfo selected = selectedReference();
+        if (selected == null) return;
+        submit("Acquiring " + selected.name() + " as Context...", new Callable<RemoteObject>() {
+            @Override public RemoteObject call() { return session.references().acquire(selected.name()); }
+        }, new Consumer<RemoteObject>() {
+            @Override public void accept(RemoteObject value) {
+                session.context().select(value);
+                tab = Tab.CONTEXT;
+                status = "Context <- tracked reference " + selected.name();
+                requestContextRefresh();
+            }
+        });
+    }
+
+    private void setSelectedReference() throws IOException {
+        final JvmReferenceInfo selected = selectedReference();
+        if (selected == null) return;
+        final String expression = editText("Replace tracked reference " + selected.name(), "null");
+        if (expression == null) return;
+        submit("Updating tracked reference " + selected.name() + "...",
+                new Callable<JvmReferenceInfo>() {
+                    @Override public JvmReferenceInfo call() {
+                        try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                                session, Collections.singletonList(expression))) {
+                            return session.references().replace(selected.name(), value.only());
+                        }
+                    }
+                }, new Consumer<JvmReferenceInfo>() {
+                    @Override public void accept(JvmReferenceInfo value) { status = "Updated " + value; }
+                });
+    }
+
+    private void nullSelectedReference() {
+        final JvmReferenceInfo selected = selectedReference();
+        if (selected == null) return;
+        submit("Setting " + selected.name() + " to null...", new Callable<JvmReferenceInfo>() {
+            @Override public JvmReferenceInfo call() { return session.references().setNull(selected.name()); }
+        }, new Consumer<JvmReferenceInfo>() {
+            @Override public void accept(JvmReferenceInfo value) { status = "Updated " + value; }
+        });
+    }
+
+    private void releaseSelectedReference() {
+        final JvmReferenceInfo selected = selectedReference();
+        if (selected == null) return;
+        submit("Releasing tracked reference " + selected.name() + "...", new Callable<String>() {
+            @Override public String call() {
+                session.references().release(selected.name());
+                return selected.name();
+            }
+        }, new Consumer<String>() {
+            @Override public void accept(String name) {
+                selections[Tab.REFERENCES.ordinal()] = clamp(selections[Tab.REFERENCES.ordinal()],
+                        0, Math.max(0, session.references().snapshot().size() - 1));
+                status = "Released tracked reference " + name;
+            }
+        });
+    }
+
+    private JvmStringHookInfo selectedStringHook() {
+        List<JvmStringHookInfo> values = session.stringHooks().snapshot();
+        return values.isEmpty() ? null : values.get(clamp(
+                selections[Tab.STRINGS.ordinal()], 0, values.size() - 1));
+    }
+
+    private void addStringHook() throws IOException {
+        String source = editText("String hook: field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
+        if (source == null || source.trim().isEmpty()) return;
+        final CommandLine line = CommandLine.parse(source);
+        final List<String> arguments = line.arguments();
+        final String operation = line.name().toLowerCase(Locale.ROOT);
+        submit("Installing String hook...", new Callable<JvmStringHookInfo>() {
+            @Override public JvmStringHookInfo call() {
+                if ("field".equals(operation) && (arguments.size() == 4 || arguments.size() == 5)) {
+                    boolean write = "write".equalsIgnoreCase(arguments.get(1));
+                    if (!write && !"read".equalsIgnoreCase(arguments.get(1))) {
+                        throw new IllegalArgumentException("Field hook mode must be read or write");
+                    }
+                    RemoteField field = findStringField(session.findClass(arguments.get(2)), arguments.get(3));
+                    boolean objectSpecific = arguments.size() == 5 && "object".equalsIgnoreCase(arguments.get(4));
+                    if (arguments.size() == 5 && !objectSpecific) {
+                        throw new IllegalArgumentException("Optional field hook scope must be object");
+                    }
+                    return session.stringHooks().watchField(arguments.get(0), field, write,
+                            objectSpecific ? session.context().remoteObject() : null);
+                }
+                if ("method".equals(operation) && arguments.size() == 5) {
+                    JvmStringHookKind kind = "entry".equalsIgnoreCase(arguments.get(1))
+                            ? JvmStringHookKind.METHOD_ENTRY : "exit".equalsIgnoreCase(arguments.get(1))
+                            ? JvmStringHookKind.METHOD_EXIT : null;
+                    if (kind == null) throw new IllegalArgumentException("Method hook mode must be entry or exit");
+                    return session.stringHooks().breakMethod(arguments.get(0), kind,
+                            arguments.get(2), arguments.get(3), arguments.get(4));
+                }
+                throw new IllegalArgumentException("Expected field ... or method ... String hook syntax");
+            }
+        }, new Consumer<JvmStringHookInfo>() {
+            @Override public void accept(JvmStringHookInfo value) {
+                selectStringHook(value.name());
+                status = "Installed " + value;
+            }
+        });
+    }
+
+    private void hookSelectedStringField() throws IOException {
+        if (unloadedContextClass != null) { status = "Load the class before creating a runtime String hook."; return; }
+        List<RemoteField> visible = visibleFields();
+        if (visible.isEmpty()) return;
+        final RemoteField field = visible.get(selection());
+        if (!"Ljava/lang/String;".equals(field.descriptor())) {
+            status = "Selected field is not java.lang.String.";
+            return;
+        }
+        final String name = editText("String hook name", field.name() + "-string");
+        if (name == null || name.trim().isEmpty()) return;
+        String mode = editText("Pause on read or write", "write");
+        if (mode == null) return;
+        final boolean write = "write".equalsIgnoreCase(mode.trim());
+        if (!write && !"read".equalsIgnoreCase(mode.trim())) { status = "Mode must be read or write."; return; }
+        String scope = field.isStatic() ? "all" : editText("Scope: all instances or this object", "all");
+        if (scope == null) return;
+        final boolean objectSpecific = "object".equalsIgnoreCase(scope.trim())
+                || "this".equalsIgnoreCase(scope.trim());
+        if (!field.isStatic() && objectSpecific && session.context().isClass()) {
+            status = "Object-specific String hooks require an object context.";
+            return;
+        }
+        final RemoteObject receiver = !field.isStatic() && objectSpecific
+                ? session.context().remoteObject() : null;
+        submit("Installing String field hook...", new Callable<JvmStringHookInfo>() {
+            @Override public JvmStringHookInfo call() {
+                return session.stringHooks().watchField(name, field, write, receiver);
+            }
+        }, new Consumer<JvmStringHookInfo>() {
+            @Override public void accept(JvmStringHookInfo value) {
+                tab = Tab.STRINGS;
+                selectStringHook(value.name());
+                status = "Installed " + value;
+            }
+        });
+    }
+
+    private void selectStringHook(String name) {
+        List<JvmStringHookInfo> values = session.stringHooks().snapshot();
+        for (int index = 0; index < values.size(); index++) {
+            if (values.get(index).name().equals(name)) {
+                selections[Tab.STRINGS.ordinal()] = index;
+                return;
+            }
+        }
+    }
+
+    private void toggleSelectedStringHook() {
+        final JvmStringHookInfo selected = selectedStringHook();
+        if (selected == null) return;
+        submit((selected.enabled() ? "Disabling " : "Enabling ") + selected.name() + "...",
+                new Callable<JvmStringHookInfo>() {
+                    @Override public JvmStringHookInfo call() {
+                        return session.stringHooks().setEnabled(selected.name(), !selected.enabled());
+                    }
+                }, new Consumer<JvmStringHookInfo>() {
+                    @Override public void accept(JvmStringHookInfo value) { status = value.toString(); }
+                });
+    }
+
+    private void removeSelectedStringHook() {
+        final JvmStringHookInfo selected = selectedStringHook();
+        if (selected == null) return;
+        submit("Removing String hook " + selected.name() + "...", new Callable<String>() {
+            @Override public String call() { session.stringHooks().remove(selected.name()); return selected.name(); }
+        }, new Consumer<String>() {
+            @Override public void accept(String name) {
+                selections[Tab.STRINGS.ordinal()] = clamp(selections[Tab.STRINGS.ordinal()], 0,
+                        Math.max(0, session.stringHooks().snapshot().size() - 1));
+                status = "Removed String hook " + name;
+            }
+        });
+    }
+
+    private void openSelectedStringHook() {
+        final JvmStringHookInfo selected = selectedStringHook();
+        if (selected == null) return;
+        if (!selected.fieldHook()) {
+            if (selected.lastHitSequence() < 0) {
+                status = "This method hook has not fired yet; its next hit will appear in Debug.";
+            } else {
+                tab = Tab.DEBUG;
+                alignDebuggerLocation(Tab.DEBUG);
+                status = "Opened last String hook hit: " + selected.lastHit();
+            }
+            return;
+        }
+        submit("Reading String hook value " + selected.name() + "...", new Callable<RemoteObject>() {
+            @Override public RemoteObject call() { return session.stringHooks().acquireValue(selected.name()); }
+        }, new Consumer<RemoteObject>() {
+            @Override public void accept(RemoteObject value) {
+                session.context().select(value);
+                tab = Tab.CONTEXT;
+                status = "Context <- String hook " + selected.name()
+                        + "; Methods can invoke code on this String.";
+                requestContextRefresh();
+            }
+        });
+    }
+
+    private void setSelectedStringHookValue() throws IOException {
+        final JvmStringHookInfo selected = selectedStringHook();
+        if (selected == null || !selected.fieldHook()) {
+            status = "Only field-backed String hooks have a replaceable value.";
+            return;
+        }
+        final String expression = editText("Replace String field value", "string:");
+        if (expression == null) return;
+        submit("Replacing String hook value...", new Callable<String>() {
+            @Override public String call() {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(expression))) {
+                    session.stringHooks().replaceValue(selected.name(), value.only());
+                }
+                return selected.name();
+            }
+        }, new Consumer<String>() {
+            @Override public void accept(String name) { status = "Updated String field for hook " + name; }
+        });
+    }
+
+    private void trackSelectedStringHookValue() throws IOException {
+        final JvmStringHookInfo selected = selectedStringHook();
+        if (selected == null || !selected.fieldHook()) {
+            status = "Only a field-backed String hook can become a tracked value.";
+            return;
+        }
+        final String name = editText("Tracked reference name", selected.name());
+        if (name == null || name.trim().isEmpty()) return;
+        submit("Tracking String hook value...", new Callable<JvmReferenceInfo>() {
+            @Override public JvmReferenceInfo call() {
+                return session.stringHooks().trackValue(selected.name(), session.references(),
+                        name, JvmReferenceStrength.STRONG);
+            }
+        }, new Consumer<JvmReferenceInfo>() {
+            @Override public void accept(JvmReferenceInfo value) {
+                tab = Tab.REFERENCES;
+                selectReference(value.name());
+                status = "Tracking String field as " + value.name();
+            }
+        });
+    }
+
+    private static RemoteField findStringField(RemoteClass type, String expression) {
+        int qualifier = expression.lastIndexOf("::");
+        String owner = qualifier < 0 ? null : expression.substring(0, qualifier);
+        String name = qualifier < 0 ? expression : expression.substring(qualifier + 2);
+        List<RemoteField> matches = new ArrayList<RemoteField>();
+        for (RemoteField field : type.getStaticFields()) {
+            if (stringFieldMatches(field, owner, name)) matches.add(field);
+        }
+        for (RemoteField field : type.getVirtualFields()) {
+            if (stringFieldMatches(field, owner, name)) matches.add(field);
+        }
+        if (matches.size() != 1) throw new IllegalArgumentException(matches.isEmpty()
+                ? "String field was not found: " + type.className() + "." + expression
+                : "String field is ambiguous; use declaring.Class::field");
+        return matches.get(0);
+    }
+
+    private static boolean stringFieldMatches(RemoteField field, String owner, String name) {
+        return field.name().equals(name) && "Ljava/lang/String;".equals(field.descriptor())
+                && (owner == null || owner.equals(field.declaringClass()));
     }
 
     private void setSelectedField() throws IOException {
@@ -1395,6 +1801,10 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void requestSource(boolean wholeClass) {
+        if (!wholeClass && (tab == Tab.BYTECODE || tab == Tab.DEBUG)
+                && bytecode != null && !bytecode.instructions().isEmpty()) {
+            pendingSourceBci = bytecode.instructions().get(bytecodeCursor()).offset();
+        }
         if (tab == Tab.BROWSE && !visibleBrowserEntries.isEmpty()) {
             TuiBrowserEntry entry = visibleBrowserEntries.get(selection());
             if (entry.unloaded() && entry.unloadedClass() != null) {
@@ -1469,6 +1879,69 @@ public final class TargetTui implements AutoCloseable {
         startDecompile(type, methodName, descriptor);
     }
 
+    /** Decompiles the bytecode interval selected by BCI rather than the complete method. */
+    private void requestSourceRange() throws IOException {
+        BytecodeInstruction selected = selectedBytecodeForEdit();
+        if (selected == null) return;
+        String entered = editText("Decompile bytecode range (start..end, or end from current BCI)",
+                selected.offset() + ".." + selected.offset());
+        if (entered == null || entered.trim().isEmpty()) return;
+        String value = entered.trim();
+        int from = selected.offset();
+        int to;
+        int separator = value.indexOf("..");
+        try {
+            if (separator >= 0) {
+                from = Integer.decode(value.substring(0, separator).trim()).intValue();
+                to = Integer.decode(value.substring(separator + 2).trim()).intValue();
+            } else to = Integer.decode(value).intValue();
+        } catch (NumberFormatException failure) {
+            status = "Invalid BCI range: " + value + " (expected start..end)";
+            return;
+        }
+        if (from < 0 || to < from) { status = "Invalid BCI range " + from + ".." + to; return; }
+        final int rangeStart = from;
+        final int rangeEnd = to;
+        final String className = bytecodeClass;
+        final String methodName = bytecodeMethod;
+        final String descriptor = bytecodeDescriptor;
+        final JvmClassPathCatalog.ClassEntry catalogEntry = bytecodeCatalogClass;
+        final DecompilerEngine selectedEngine = engine;
+        pendingSourceBci = rangeStart;
+        if (!submit("Decompiling " + className + "." + methodName + " BCI "
+                        + rangeStart + ".." + rangeEnd + "...",
+                new Callable<DecompilationResult>() {
+                    @Override public DecompilationResult call() throws IOException {
+                        byte[] bytes = catalogEntry == null
+                                ? session.instrumentation().bytecode().classBytes(className)
+                                : catalogEntry.bytes();
+                        return new ClassDecompiler().decompileRangeResult(className, bytes,
+                                methodName, descriptor, rangeStart, rangeEnd, selectedEngine);
+                    }
+                }, new Consumer<DecompilationResult>() {
+                    @Override public void accept(DecompilationResult result) {
+                        sourceLines.clear();
+                        addLines(sourceLines, result.source());
+                        sourceClass = className;
+                        sourceMethod = methodName;
+                        sourceDescriptor = descriptor;
+                        sourceCatalogClass = catalogEntry;
+                        sourceBciToLine.clear();
+                        sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
+                        alignPendingSourceBci();
+                        status = "Decompiled BCI " + rangeStart + ".." + rangeEnd
+                                + " with CFR bytecode-location mapping";
+                    }
+                })) return;
+        sourceLines.clear();
+        sourceLines.add("Decompiling BCI " + rangeStart + ".." + rangeEnd + "...");
+        sourceTitle = className + "." + methodName + descriptor
+                + " [BCI " + rangeStart + ".." + rangeEnd + "]";
+        tab = Tab.SOURCE;
+        selections[Tab.SOURCE.ordinal()] = 0;
+        scrolls[Tab.SOURCE.ordinal()] = 0;
+    }
+
     /** Decompiles the class owning the selected browser row without requiring a context first. */
     private void requestBrowserClassSource() {
         if (visibleBrowserEntries.isEmpty()) {
@@ -1515,6 +1988,7 @@ public final class TargetTui implements AutoCloseable {
                         if (!methodName.isEmpty()) {
                             sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
                         }
+                        alignPendingSourceBci();
                         status = "Decompiled unloaded " + title + " with " + selectedEngine
                                 + "; no class was defined or initialized";
                     }
@@ -1540,8 +2014,12 @@ public final class TargetTui implements AutoCloseable {
         if (!submit("Decompiling " + title + " with " + selectedEngine + "...",
                 new Callable<DecompilationResult>() {
                     @Override public DecompilationResult call() {
-                        return methodName.isEmpty() ? type.decompile(selectedEngine)
-                                : type.decompileMethodResult(methodName, descriptor, selectedEngine);
+                        byte[] bytes = session.instrumentation().bytecode().classBytes(type.className());
+                        ClassDecompiler decompiler = new ClassDecompiler();
+                        return methodName.isEmpty()
+                                ? decompiler.decompile(type.className(), bytes, selectedEngine)
+                                : decompiler.decompileMethodResult(type.className(), bytes,
+                                        methodName, descriptor, selectedEngine);
                     }
                 }, new Consumer<DecompilationResult>() {
                     @Override public void accept(DecompilationResult result) {
@@ -1555,7 +2033,7 @@ public final class TargetTui implements AutoCloseable {
                         if (!methodName.isEmpty()) {
                             sourceBciToLine.putAll(result.lineMappings(methodName, descriptor));
                         }
-                        alignSourceWithDebugger();
+                        if (!alignPendingSourceBci()) alignSourceWithDebugger();
                         status = "Decompiled " + title + " with " + selectedEngine
                                 + (methodName.isEmpty() || !sourceBciToLine.isEmpty() ? ""
                                 : "; decompiled-line breakpoints need CFR line mappings");
@@ -1578,6 +2056,21 @@ public final class TargetTui implements AutoCloseable {
                 0, Math.max(0, sourceLines.size() - 1));
         scrolls[Tab.SOURCE.ordinal()] = Math.max(0,
                 line - Math.max(1, screen.height() / 3));
+    }
+
+    private boolean alignPendingSourceBci() {
+        if (pendingSourceBci < 0 || sourceBciToLine.isEmpty()) return false;
+        int requested = pendingSourceBci;
+        Map.Entry<Integer, Integer> mapping = sourceBciToLine.floorEntry(requested);
+        if (mapping == null) mapping = sourceBciToLine.ceilingEntry(requested);
+        pendingSourceBci = -1;
+        if (mapping == null) return false;
+        int line = mapping.getValue().intValue() - 1;
+        selections[Tab.SOURCE.ordinal()] = clamp(line,
+                0, Math.max(0, sourceLines.size() - 1));
+        scrolls[Tab.SOURCE.ordinal()] = Math.max(0,
+                line - Math.max(1, screen.height() / 3));
+        return true;
     }
 
     /** Returns the 0-based decompiled source row for the currently viewed stack frame. */
@@ -1699,8 +2192,9 @@ public final class TargetTui implements AutoCloseable {
                         // Reflection lists inherited members. Class bytes must come from the method's
                         // declaring class, not from the current context/runtime class.
                         try {
-                            return new BytecodeLoadResult(
-                                    session.findClass(className).classFileView(), null);
+                            session.findClass(className); // Preserve the unloaded-class fallback below.
+                            byte[] bytes = session.instrumentation().bytecode().classBytes(className);
+                            return new BytecodeLoadResult(new JvmClassFileParser().parse(bytes), null);
                         } catch (RuntimeException failure) {
                             if (!classNotLoaded(failure)) throw failure;
                             JvmClassPathCatalog catalog = session.refreshClassPathCatalog();
@@ -2143,6 +2637,7 @@ public final class TargetTui implements AutoCloseable {
         liveSampleAvailable = false;
         closeDebuggerStates();
         debuggerStates.addAll(value.states);
+        session.stringHooks().observe(debuggerStates);
         debuggerThreads.addAll(value.threads);
         if (!selectedThreadName.isEmpty()) {
             for (int index = 0; index < debuggerThreads.size(); index++) {
@@ -2795,6 +3290,11 @@ public final class TargetTui implements AutoCloseable {
             toggleMethodEntryBreakpoint(receiverOnly);
             return;
         }
+        if (!bytecodeClass.isEmpty()
+                && session.instrumentation().bytecode().hasStaged(bytecodeClass)) {
+            status = "This BCI belongs to staged code. Press F3 to flush it before installing a breakpoint.";
+            return;
+        }
         if (bytecode == null || bytecode.instructions().isEmpty()) {
             status = "Load a method bytecode view first; F9 applies to the highlighted BCI.";
             return;
@@ -2850,6 +3350,51 @@ public final class TargetTui implements AutoCloseable {
         applyBytecodeEdit("Deleting bytecode at BCI ", instruction.offset(), patch);
     }
 
+    private void editExceptionHandlers() throws IOException {
+        if (bytecode == null || bytecodeClass.isEmpty() || bytecodeMethod.isEmpty()) {
+            status = "Load a Java bytecode method before editing its exception table.";
+            return;
+        }
+        String entered = editText("Handlers: list | add <start> <end> <handler> [type|any] | delete <index>",
+                "list");
+        if (entered == null || entered.trim().isEmpty()) return;
+        String[] values = entered.trim().split("\\s+");
+        if ("list".equalsIgnoreCase(values[0])) {
+            List<nhcm.jvmrtdp.api.bytecode.JvmExceptionHandlerInfo> handlers =
+                    session.instrumentation().bytecode().exceptionHandlers(
+                            bytecodeClass, bytecodeMethod, bytecodeDescriptor);
+            if (handlers.isEmpty()) status = "Exception handlers: <none>";
+            else {
+                StringBuilder summary = new StringBuilder("Exception handlers: ");
+                for (int index = 0; index < handlers.size(); index++) {
+                    if (index > 0) summary.append("; ");
+                    summary.append(handlers.get(index));
+                }
+                status = summary.toString();
+            }
+            return;
+        }
+        try {
+            JvmBytecodePatch.Builder builder = JvmBytecodePatch.builder(bytecodeClass);
+            if ("add".equalsIgnoreCase(values[0]) && (values.length == 4 || values.length == 5)) {
+                builder.addExceptionHandler(bytecodeMethod, bytecodeDescriptor,
+                        Integer.decode(values[1]).intValue(), Integer.decode(values[2]).intValue(),
+                        Integer.decode(values[3]).intValue(), values.length == 5 ? values[4] : null);
+            } else if ("delete".equalsIgnoreCase(values[0]) && values.length == 2) {
+                builder.deleteExceptionHandler(bytecodeMethod, bytecodeDescriptor,
+                        Integer.decode(values[1]).intValue());
+            } else {
+                status = "Expected: list | add <start> <end> <handler> [type|any] | delete <index>";
+                return;
+            }
+            int anchor = bytecode.instructions().isEmpty() ? 0
+                    : bytecode.instructions().get(bytecodeCursor()).offset();
+            applyBytecodeEdit("Staging exception-table edit at BCI ", anchor, builder.build());
+        } catch (NumberFormatException failure) {
+            status = "Invalid numeric exception-handler BCI/index.";
+        }
+    }
+
     private BytecodeInstruction selectedBytecodeForEdit() {
         if (bytecode == null || bytecode.instructions().isEmpty()
                 || bytecodeClass.isEmpty() || bytecodeMethod.isEmpty()) {
@@ -2867,17 +3412,56 @@ public final class TargetTui implements AutoCloseable {
         final Tab destination = tab;
         submit(activity + oldBci + "...", new Callable<JvmBytecodePatchResult>() {
             @Override public JvmBytecodePatchResult call() {
-                return session.instrumentation().bytecode().apply(patch);
+                return session.instrumentation().bytecode().stage(patch);
             }
         }, new Consumer<JvmBytecodePatchResult>() {
             @Override public void accept(JvmBytecodePatchResult result) {
+                synchronizedBytecodeRevision = session.instrumentation().bytecode().revision();
                 Long relocated = result.relocatedBci(methodName, descriptor, oldBci);
                 pendingBytecodeLocation = relocated == null ? oldBci : relocated.intValue();
                 synchronizeManagedControls();
-                status = result + "; reloading live bytecode...";
+                status = "Staged " + result.operationCount() + " edit(s); F3 flushes the complete "
+                        + "transaction, Shift+F3 discards it. Reloading staged bytecode...";
                 requestBytecode(className, methodName, descriptor, destination);
             }
         });
+    }
+
+    private void flushBytecodeEdits() {
+        if (bytecodeClass.isEmpty() || !session.instrumentation().bytecode().hasStaged(bytecodeClass)) {
+            status = "No staged bytecode edits for the viewed class.";
+            return;
+        }
+        final String className = bytecodeClass;
+        final String methodName = bytecodeMethod;
+        final String descriptor = bytecodeDescriptor;
+        final Tab destination = tab;
+        submit("Verifying and flushing all staged edits for " + className + "...",
+                new Callable<JvmBytecodePatchResult>() {
+                    @Override public JvmBytecodePatchResult call() {
+                        return session.instrumentation().bytecode().flush(className);
+                    }
+                }, new Consumer<JvmBytecodePatchResult>() {
+                    @Override public void accept(JvmBytecodePatchResult result) {
+                        synchronizedBytecodeRevision = session.instrumentation().bytecode().revision();
+                        synchronizeManagedControls();
+                        status = "Flushed " + result.operationCount() + " bytecode edit(s) for "
+                                + className + "; refreshing debugger and bytecode views...";
+                        requestBytecode(className, methodName, descriptor, destination);
+                        requestDebuggerRefresh();
+                    }
+                });
+    }
+
+    private void discardBytecodeEdits() {
+        if (bytecodeClass.isEmpty() || !session.instrumentation().bytecode().hasStaged(bytecodeClass)) {
+            status = "No staged bytecode edits for the viewed class.";
+            return;
+        }
+        session.instrumentation().bytecode().discard(bytecodeClass);
+        synchronizedBytecodeRevision = session.instrumentation().bytecode().revision();
+        status = "Discarded staged edits for " + bytecodeClass + "; reloading live bytecode...";
+        requestBytecode(bytecodeClass, bytecodeMethod, bytecodeDescriptor, tab);
     }
 
     private void toggleMethodEntryBreakpoint(boolean receiverOnly) {
@@ -3181,6 +3765,18 @@ public final class TargetTui implements AutoCloseable {
                 lines.addAll(contextLines);
                 baseName = session.context().description();
             }
+        } else if (tab == Tab.REFERENCES) {
+            lines.add("TRACKED REFERENCES");
+            for (JvmReferenceInfo reference : session.references().snapshot()) {
+                lines.add(reference.toString());
+                lines.add("  source=" + reference.source() + " assignable=" + reference.assignable()
+                        + (reference.error().isEmpty() ? "" : " error=" + reference.error()));
+            }
+            baseName = "tracked-references";
+        } else if (tab == Tab.STRINGS) {
+            lines.add("STRING HOOKS");
+            for (JvmStringHookInfo hook : session.stringHooks().snapshot()) lines.add(hook.toString());
+            baseName = "string-hooks";
         } else if (tab == Tab.FIELDS) {
             if (unloadedContextClass != null) {
                 lines.add("Fields of unloaded " + unloadedContextClass.name());
@@ -3261,7 +3857,8 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private boolean horizontallyScrollable() {
-        return tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG;
+        return tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG
+                || tab == Tab.REFERENCES || tab == Tab.STRINGS;
     }
 
     private void moveHorizontal(int delta) {
@@ -3392,7 +3989,12 @@ public final class TargetTui implements AutoCloseable {
 
     private void refresh() {
         if (tasks.userOperationBusy()) { status = busyMessage(); return; }
-        if (tab == Tab.BROWSE) {
+        if (tab == Tab.REFERENCES) requestReferenceRefresh();
+        else if (tab == Tab.STRINGS) {
+            requestDebuggerRefresh();
+            status = "Refreshing debugger hits for String hooks...";
+        }
+        else if (tab == Tab.BROWSE) {
             if (browseUnloaded) requestUnloadedPackage(packageName, true);
             else if (searchMode && !lastSearch.isEmpty()) requestSearch(lastSearch);
             else requestPackage(packageName);
@@ -3504,7 +4106,13 @@ public final class TargetTui implements AutoCloseable {
             }
         } else if (tab == Tab.SOURCE || tab == Tab.BYTECODE || tab == Tab.DEBUG) {
             editViewSearch();
-        } else status = "Use / in Browse, Fields, Methods, Decompile, Bytecode, or Debug.";
+        } else if (tab == Tab.REFERENCES || tab == Tab.STRINGS) {
+            String value = editText("Find in current list", listSearch);
+            if (value != null && !value.trim().isEmpty()) {
+                listSearch = value.trim();
+                findNextInView(1);
+            }
+        } else status = "Use / in Browse, Fields, Methods, References, String Hooks, Decompile, Bytecode, or Debug.";
     }
 
     private void editViewSearch() throws IOException {
@@ -3517,7 +4125,8 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void findNextInView(int direction) {
-        if (tab == Tab.BROWSE || tab == Tab.FIELDS || tab == Tab.METHODS) {
+        if (tab == Tab.BROWSE || tab == Tab.FIELDS || tab == Tab.METHODS
+                || tab == Tab.REFERENCES || tab == Tab.STRINGS) {
             if (listSearch.isEmpty()) { status = "Press f to find within the current list first."; return; }
             List<String> rows = new ArrayList<String>();
             if (tab == Tab.BROWSE) {
@@ -3528,12 +4137,20 @@ public final class TargetTui implements AutoCloseable {
                         rows.add(unloadedFieldLabel(field));
                     }
                 } else for (RemoteField field : visibleFields()) rows.add(fieldLabel(field));
-            } else {
+            } else if (tab == Tab.METHODS) {
                 if (unloadedContextClass != null) {
                     for (JvmClassPathCatalog.Member method : visibleUnloadedMethods()) {
                         rows.add(unloadedMethodLabel(method));
                     }
                 } else for (RemoteMethod method : visibleMethods()) rows.add(methodLabel(method));
+            } else if (tab == Tab.REFERENCES) {
+                for (JvmReferenceInfo reference : session.references().snapshot()) {
+                    rows.add(referenceLabel(reference));
+                }
+            } else {
+                for (JvmStringHookInfo hook : session.stringHooks().snapshot()) {
+                    rows.add(stringHookLabel(hook));
+                }
             }
             int match = nextTextMatch(rows, selections[tab.ordinal()], listSearch, direction);
             if (match < 0) status = "No current-list match for: " + listSearch;
@@ -3744,14 +4361,17 @@ public final class TargetTui implements AutoCloseable {
         Tab[] tabs = Tab.values();
         tab = tabs[(tab.ordinal() + delta + tabs.length) % tabs.length];
         if (tab == Tab.DEBUG) alignDebuggerLocation(Tab.DEBUG);
+        if (tab == Tab.REFERENCES && !tasks.busy()) requestReferenceRefresh();
         if ((tab == Tab.DEBUG || tab == Tab.FRAMES || tab == Tab.LOCALS || tab == Tab.THREADS)
                 && !tasks.busy()) requestDebuggerRefresh();
+        if (tab == Tab.STRINGS && !tasks.busy()) requestDebuggerRefresh();
     }
 
     private int itemCount(Tab value) {
         if (value == Tab.BROWSE) return visibleBrowserEntries.size();
         if (value == Tab.CONTEXT) return unloadedContextClass != null ? 1
                 : session.context().isSet() ? session.context().depth() : 0;
+        if (value == Tab.REFERENCES) return session.references().snapshot().size();
         if (value == Tab.FIELDS) return unloadedContextClass != null
                 ? visibleUnloadedFields().size() : visibleFields().size();
         if (value == Tab.METHODS) return unloadedContextClass != null
@@ -3760,6 +4380,7 @@ public final class TargetTui implements AutoCloseable {
         if (value == Tab.LOCALS) return debuggerLocals.size();
         if (value == Tab.BREAKPOINTS) return breakpoints.size();
         if (value == Tab.THREADS) return debuggerThreads.size();
+        if (value == Tab.STRINGS) return session.stringHooks().snapshot().size();
         if (value == Tab.BYTECODE || value == Tab.DEBUG) {
             return bytecode == null ? 0 : bytecode.instructions().size();
         }
@@ -4032,7 +4653,8 @@ public final class TargetTui implements AutoCloseable {
     private boolean selectableTab() {
         return tab == Tab.BROWSE || tab == Tab.CONTEXT || tab == Tab.FIELDS
                 || tab == Tab.METHODS || tab == Tab.FRAMES || tab == Tab.LOCALS
-                || tab == Tab.BREAKPOINTS || tab == Tab.THREADS;
+                || tab == Tab.BREAKPOINTS || tab == Tab.THREADS
+                || tab == Tab.REFERENCES || tab == Tab.STRINGS;
     }
 
     private List<String> leftLines() {
@@ -4052,6 +4674,10 @@ public final class TargetTui implements AutoCloseable {
                     result.add(unloadedFieldLabel(field));
                 }
             } else for (RemoteField field : visibleFields()) result.add(fieldLabel(field));
+        } else if (tab == Tab.REFERENCES) {
+            for (JvmReferenceInfo reference : session.references().snapshot()) {
+                result.add(referenceLabel(reference));
+            }
         } else if (tab == Tab.METHODS) {
             if (unloadedContextClass != null) {
                 for (JvmClassPathCatalog.Member method : visibleUnloadedMethods()) {
@@ -4070,6 +4696,10 @@ public final class TargetTui implements AutoCloseable {
         } else if (tab == Tab.THREADS) {
             for (RemoteJvmtiThread thread : debuggerThreads) {
                 result.add(debuggerThreadLabel(thread));
+            }
+        } else if (tab == Tab.STRINGS) {
+            for (JvmStringHookInfo hook : session.stringHooks().snapshot()) {
+                result.add(stringHookLabel(hook));
             }
         }
         return result;
@@ -4100,6 +4730,66 @@ public final class TargetTui implements AutoCloseable {
             addKeyHelp(result, "S", "Swap top two items");
             addKeyHelp(result, "Delete", "Remove selected item");
             addKeyHelp(result, "X", "Clear context stack");
+            return result;
+        }
+        if (tab == Tab.REFERENCES) {
+            List<String> result = new ArrayList<String>();
+            JvmReferenceInfo reference = selectedReference();
+            result.add("TRACKED REFERENCES");
+            if (reference == null) {
+                result.add("<none>");
+                result.add("");
+                result.add("Select an object Context, then press S (strong) or Shift+S (weak).");
+                result.add("In Fields, & tracks a live field slot instead of a one-time snapshot.");
+                return result;
+            }
+            result.add("Name:       " + reference.name());
+            result.add("State:      " + reference.state());
+            result.add("Strength:   " + reference.strength());
+            result.add("Kind:       " + reference.kind());
+            result.add("Source:     " + reference.source());
+            result.add("Assignable: " + reference.assignable());
+            result.add("Remote ID:  " + (reference.remoteId() == 0L ? "<none>" : reference.remoteId()));
+            result.add("Type:       " + (reference.className().isEmpty() ? "<unavailable>" : reference.className()));
+            result.add("Value:      " + (reference.displayValue().isEmpty() ? "<unavailable>" : reference.displayValue()));
+            if (!reference.error().isEmpty()) result.add("Error:      " + reference.error());
+            result.add("");
+            result.add("LIVE means accessible; NULL is Java null; COLLECTED is a reclaimed weak object.");
+            addKeyHelp(result, "Enter", "Acquire a strong handle and set it as Context");
+            addKeyHelp(result, "S / Shift+S", "Save current Context strongly / weakly");
+            addKeyHelp(result, "=", "Replace this object slot or tracked field value");
+            addKeyHelp(result, "X", "Set the tracked slot/field to Java null");
+            addKeyHelp(result, "Delete", "Release this tracked reference");
+            addKeyHelp(result, "F5", "Refresh liveness and live field values");
+            return result;
+        }
+        if (tab == Tab.STRINGS) {
+            List<String> result = new ArrayList<String>();
+            JvmStringHookInfo hook = selectedStringHook();
+            result.add("STRING HOOKS");
+            if (hook == null) {
+                result.add("<none>");
+                result.add("");
+                result.add("A adds a field read/write or method entry/exit hook.");
+                result.add("Select a java.lang.String field in Fields and press ; for a guided hook.");
+                return result;
+            }
+            result.add("Name:       " + hook.name());
+            result.add("State:      " + (hook.enabled() ? "ENABLED" : "disabled"));
+            result.add("Kind:       " + hook.kind());
+            result.add("Target:     " + hook.className() + "." + hook.memberName());
+            result.add("Descriptor: " + hook.descriptor());
+            result.add("Scope:      " + (hook.objectSpecific() ? "current object only" : "all matching instances"));
+            result.add("Last hit:   " + (hook.lastHit().isEmpty() ? "<none>" : hook.lastHit()));
+            result.add("");
+            result.add("Field hooks can read, replace, track, or open their current String value.");
+            result.add("Method hook hits pause in Debug; Locals/Frames expose arguments and return values.");
+            addKeyHelp(result, "A", "Add a String field or method hook");
+            addKeyHelp(result, "Enter", hook.fieldHook() ? "Open current String as Context" : "Open last hit in Debug");
+            addKeyHelp(result, "F9", "Enable or disable this hook");
+            addKeyHelp(result, "=", "Replace a field-backed String value");
+            addKeyHelp(result, "&", "Track a field-backed String in References");
+            addKeyHelp(result, "Delete", "Remove this hook");
             return result;
         }
         if (tab == Tab.SOURCE) return sourceLines;
@@ -4573,6 +5263,12 @@ public final class TargetTui implements AutoCloseable {
                 + " maxLocals=" + bytecode.maxLocals());
         if (bytecode != null) result.add("implementation=" + bytecode.implementationKind()
                 + (bytecode.isNative() || bytecode.isAbstract() ? " (no Code attribute)" : ""));
+        if (!bytecodeClass.isEmpty()
+                && session.instrumentation().bytecode().hasStaged(bytecodeClass)) {
+            result.add("STAGED: " + session.instrumentation().bytecode()
+                    .stagedOperationCount(bytecodeClass) + " edit(s), not executing yet");
+            result.add("F3 flush/verify; Shift+F3 discard");
+        }
         if (bytecode != null && !bytecode.instructions().isEmpty()) {
             result.add("EDIT: + insert, - delete, ~ replace highlighted BCI");
             result.add("Insert accepts 'after: ASM'; separate instructions with ;;");
@@ -4788,8 +5484,11 @@ public final class TargetTui implements AutoCloseable {
                 "A Class Decompile", "B Method Bytecode", "F9 Pending Break", "Backspace Parent");
         else if (tab == Tab.FIELDS) Collections.addAll(result,
                 "/ Filter", "f Find List", "F Global Find", "@ Static", "# Instance", "Enter Read", "= Set",
-                "U Break Read", "W Break Write",
+                "& Track Ref", "; String Hook", "U Break Read", "W Break Write",
                 "A Class Decompile", "Backspace Context", "D Dump");
+        else if (tab == Tab.REFERENCES) Collections.addAll(result,
+                "Enter Context", "S Save Strong", "Shift+S Save Weak", "= Replace", "X Set Null",
+                "Delete Release", "F5 Refresh");
         else if (tab == Tab.METHODS) Collections.addAll(result,
                 "/ Filter", "f Find List", "F Global Find", "@ Static", "# Virtual",
                 "H Hide Object", "K <init>/<clinit>", "x/X Invoke/Exact", "Enter/B Bytecode",
@@ -4800,12 +5499,15 @@ public final class TargetTui implements AutoCloseable {
                 "A Class Decompile", "O Export");
         else if (tab == Tab.BYTECODE) Collections.addAll(result,
                 "G Current Frame", "/ Search", "n/N Match", "g BCI/Line", "+ Insert ASM", "- Delete ASM", "~ Replace ASM",
-                "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
-                "A Class Decompile", "I Info");
+                "| Try/Catch", "F3 Flush Edits", "Shift+F3 Discard Edits", "F9 Break", "Shift+F9 Object Break", "S Method Decompile",
+                "V Range Decompile", "A Class Decompile", "I Info");
         else if (tab == Tab.DEBUG) Collections.addAll(result,
-                "T Threads", "G Current", "+ Insert ASM", "- Delete ASM", "~ Replace ASM",
-                "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
-                "/ Search", "S Method Decompile", "A Class Decompile", "I Info");
+                "T Threads", "G Current", "+ Insert ASM", "- Delete ASM", "~ Replace ASM", "| Try/Catch",
+                "F3 Flush Edits", "Shift+F3 Discard Edits", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
+                "/ Search", "S Method Decompile", "V Range Decompile", "A Class Decompile", "I Info");
+        else if (tab == Tab.STRINGS) Collections.addAll(result,
+                "A Add Hook", "Enter Open", "F9 Enable/Disable", "= Replace Field",
+                "& Track Value", "Delete Remove", "F5 Refresh Hits");
         else if (tab == Tab.FRAMES) Collections.addAll(result,
                 "Enter Debug Frame", "B Frame Bytecode", "S Frame Decompile", "G Frame BCI",
                 "M Frame Locals", "T Threads", "F4 Live Follow", "* Freeze/Thaw", "F5 Refresh");
@@ -4855,6 +5557,23 @@ public final class TargetTui implements AutoCloseable {
                 + " " + local.descriptor() + " = " + value;
     }
 
+    private static String referenceLabel(JvmReferenceInfo reference) {
+        String value = reference.state().name();
+        if (reference.state() == nhcm.jvmrtdp.api.reference.JvmReferenceState.LIVE) {
+            value = reference.className() + "#" + reference.remoteId();
+        } else if (reference.state() == nhcm.jvmrtdp.api.reference.JvmReferenceState.NULL) {
+            value = "null";
+        }
+        return (reference.strength() == JvmReferenceStrength.WEAK ? "W" : "S")
+                + " " + reference.name() + " = " + value;
+    }
+
+    private static String stringHookLabel(JvmStringHookInfo hook) {
+        return (hook.enabled() ? "*" : " ") + " " + hook.name() + " "
+                + hook.kind() + " " + hook.className() + "." + hook.memberName()
+                + (hook.lastHit().isEmpty() ? "" : " [HIT]");
+    }
+
     private String breakpointLabel(BreakpointSpec breakpoint) {
         return (isCurrentBreakpoint(breakpoint) ? "> HIT " : "  ")
                 + breakpoint.className + "." + breakpoint.methodName
@@ -4893,11 +5612,13 @@ public final class TargetTui implements AutoCloseable {
         switch (value) {
             case BROWSE: return "brw";
             case CONTEXT: return "ctx";
+            case REFERENCES: return "ref";
             case FIELDS: return "fld";
             case METHODS: return "mth";
             case SOURCE: return "dec";
             case BYTECODE: return "bc";
             case DEBUG: return "dbg";
+            case STRINGS: return "str";
             case FRAMES: return "frm";
             case LOCALS: return "loc";
             case BREAKPOINTS: return "bp";

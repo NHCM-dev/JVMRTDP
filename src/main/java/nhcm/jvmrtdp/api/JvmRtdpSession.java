@@ -6,6 +6,8 @@ import nhcm.jvmrtdp.controllerside.RemoteOperations;
 import nhcm.jvmrtdp.controllerside.RemoteWorkspace;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
+import nhcm.jvmrtdp.api.hook.JvmStringHookManager;
+import nhcm.jvmrtdp.api.reference.JvmReferenceManager;
 import nhcm.jvmrtdp.handles.ServerHandle;
 import nhcm.jvmrtdp.handles.java.RemoteClass;
 import nhcm.jvmrtdp.handles.jvm.RemoteJNIEnv;
@@ -179,6 +181,18 @@ public final class JvmRtdpSession implements AutoCloseable {
     public JvmInstrumentation instrumentation() {
         ensureOpen();
         return instrumentation;
+    }
+
+    /** Session-owned tracked objects/fields. Close or release entries explicitly when no longer needed. */
+    public JvmReferenceManager references() {
+        ensureOpen();
+        return target.references();
+    }
+
+    /** Precise String field watches and String-bearing method entry/exit hooks. */
+    public JvmStringHookManager stringHooks() {
+        ensureOpen();
+        return target.stringHooks();
     }
 
     public RemoteOperations operations() {

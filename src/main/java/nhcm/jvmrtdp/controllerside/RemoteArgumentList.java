@@ -68,7 +68,7 @@ public class RemoteArgumentList implements AutoCloseable {
             return value.object;
         }
 
-        RemoteObject referenced = reference(session, expression);
+        RemoteObject referenced = reference(session, expression, owned);
         if (referenced != null) return referenced;
 
         RemoteObject literal;
@@ -341,7 +341,8 @@ public class RemoteArgumentList implements AutoCloseable {
         }
     }
 
-    private static RemoteObject reference(TargetSession session, String expression) {
+    private static RemoteObject reference(TargetSession session, String expression,
+            List<RemoteObject> owned) {
         if ("this".equalsIgnoreCase(expression) || "context".equalsIgnoreCase(expression)) {
             return session.context().remoteObject();
         }
@@ -349,8 +350,14 @@ public class RemoteArgumentList implements AutoCloseable {
             String normalized = RemoteWorkspace.normalize(expression);
             RemoteObject value = session.workspace().objects().get(normalized);
             if (value != null) return value;
+            if ((expression.startsWith("$") || expression.startsWith("&"))
+                    && session.references().contains(normalized)) {
+                RemoteObject acquired = session.references().acquire(normalized);
+                owned.add(acquired);
+                return acquired;
+            }
         }
-        if (expression.startsWith("$") || expression.startsWith("@")) {
+        if (expression.startsWith("$") || expression.startsWith("@") || expression.startsWith("&")) {
             throw new IllegalArgumentException("Unknown object variable: " + expression);
         }
         return null;

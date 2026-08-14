@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-本文档说明 JVMRTDP 2.1.0 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
+本文档说明 JVMRTDP 2.1.1 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
 
 ## 1. 基本约定
 
@@ -16,8 +16,8 @@
 ## 2. 启动与会话
 
 ```powershell
-java -jar JVMRTDP-2.1.0.jar
-java -jar JVMRTDP-2.1.0.jar --cli
+java -jar JVMRTDP-2.1.1.jar
+java -jar JVMRTDP-2.1.1.jar --cli
 ```
 
 控制端命令：
@@ -129,6 +129,46 @@ stack clear
 ```
 
 `stack pop`、`stack back` 和 `stack drop` 等价。栈索引 `0` 表示栈顶。
+
+### 4.1 托管引用
+
+```text
+references list
+references save <name> [strong|weak]
+references field <name> [declaring.Class::]<field> [strong|weak]
+references static <name> <class> [declaring.Class::]<field>
+references use <name>
+references refresh [name]
+references info <name>
+references set <name> <value>
+references null <name>
+references release <name|all>
+```
+
+`refs` 是 `references` 的别名。对象快照可使用强引用或弱引用；字段条目会在刷新时重新读取实例或静态字段。状态包括 `LIVE`、`NULL`、`COLLECTED`、`RELEASED` 和 `ERROR`。托管引用可在值表达式中写作 `$name` 或 `&name`。
+
+TUI 的 `references` 页中，`Enter` 打开为 Context，`S`/`Shift+S` 强/弱保存当前对象，`=` 替换，`X` 写入 null，`Delete` 释放，`F5` 刷新。
+
+### 4.2 String Hook
+
+```text
+strings list
+strings field <name> <read|write> <class> <field> [object]
+strings method <name> <entry|exit> <class> <method> <descriptor>
+strings on <name>
+strings off <name>
+strings read <name>
+strings use <name>
+strings set <name> <value>
+strings track <hook> <reference> [strong|weak]
+strings call <hook> <method> <descriptor> [arguments...]
+strings remove <name>
+strings clear
+```
+
+字段 Hook 仅接受 `Ljava/lang/String;` 字段，分别映射到 JVMTI 字段读取/修改监视点。可选的 `object` 使用当前对象 Context，只匹配该实例；省略时匹配所有实例。方法 Hook 映射到进入/退出事件断点。命中记录和 Frames/Locals 由共享调试器提供。
+
+`read`、`use`、`set`、`track` 和 `call` 用于字段型 Hook。字符串不可变，因此 `set` 替换字段持有的引用，不直接修改 String 内部存储。TUI 的 `strings` 页使用 `A` 添加、`Enter` 打开、`F9` 启用/禁用、`=` 替换、`&` 加入 References、`Delete` 删除。
 
 ## 5. 值表达式
 
@@ -360,7 +400,7 @@ debugger thaw
 debugger snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]
 ```
 
-冻结会保存线程原状态，排除代理服务、Attach Listener 等敏感线程，并只恢复本次冻结暂停的线程。快照用于离线分析或其他程序读取。
+冻结会保存线程原状态，排除代理服务、Attach Listener 等敏感线程，并只恢复本次冻结暂停的线程。快照 schema v4 包含断点、监视点、托管引用、String Hook、暂停栈帧/local 和方法退出返回值，供离线分析或其他程序读取。
 
 ### 9.7 调试限制
 
@@ -493,6 +533,8 @@ session.operations()
 session.context()
 session.workspace()
 session.debugger()
+session.references()
+session.stringHooks()
 ```
 
 依赖、生命周期、异步调用和完整示例见 [Java 库指南](LIBRARY_ZH.md)。

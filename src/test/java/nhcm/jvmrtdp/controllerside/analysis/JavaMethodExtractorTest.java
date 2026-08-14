@@ -60,4 +60,16 @@ final class JavaMethodExtractorTest {
         assertTrue(result.source().contains("static"));
         assertTrue(result.source().contains("42"), result.source());
     }
+
+    @Test void fallsBackToUniqueArityWhenDecompilerErasesAnUnresolvableType() {
+        String source = "public class Demo {\n"
+                + "  public void process(Object value) { System.out.println(value); }\n"
+                + "}\n";
+
+        JavaMethodExtractor.Extraction result = JavaMethodExtractor.extractDetails(
+                source, "Demo", "process", "(Lmissing/RuntimeType;)V");
+
+        assertNotNull(result);
+        assertTrue(result.source().contains("void process"));
+    }
 }

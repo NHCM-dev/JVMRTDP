@@ -1510,7 +1510,8 @@ void JNICALL FieldAccess(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID metho
         nullptr, 0, details.name.c_str(), details.descriptor.c_str());
     if (!MatchesPersistentFieldWatch(env, fieldClass, field, false, object)) return;
     DebuggerTrap(env, thread, method, location,
-        ("field_read:" + details.name + details.descriptor).c_str());
+        ("field_read:" + BinaryClassName(fieldClass) + "." + details.name
+            + details.descriptor).c_str());
 }
 
 void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -1523,7 +1524,8 @@ void JNICALL FieldModification(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID
         nullptr, 0, details.name.c_str(), details.descriptor.c_str(), newObject);
     if (!MatchesPersistentFieldWatch(env, fieldClass, field, true, object)) return;
     DebuggerTrap(env, thread, method, location,
-        ("field_write:" + details.name + details.descriptor).c_str());
+        ("field_write:" + BinaryClassName(fieldClass) + "." + details.name
+            + details.descriptor).c_str());
 }
 
 void JNICALL MethodEntry(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method) {

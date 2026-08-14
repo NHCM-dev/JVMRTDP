@@ -22,6 +22,9 @@ public final class LibraryExample {
             try (JvmRtdpSession session = client.attach(pid)) {
                 JvmRtdpCommandResult result = session.execute("jvmti phase").requireSuccess();
                 System.out.print(result.standardOutput());
+                System.out.printf("Tracked references: %d; String hooks: %d%n",
+                        session.references().snapshot().size(),
+                        session.stringHooks().snapshot().size());
             }
         }
     }

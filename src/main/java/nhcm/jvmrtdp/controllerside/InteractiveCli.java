@@ -49,6 +49,11 @@ import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatch;
 import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
+import nhcm.jvmrtdp.api.bytecode.JvmExceptionHandlerInfo;
+import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
+import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
+import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
+import nhcm.jvmrtdp.api.reference.JvmReferenceStrength;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
 import nhcm.jvmrtdp.handles.search.RemoteMemberQuery;
 import nhcm.jvmrtdp.protocol.CommandReply;
@@ -188,6 +193,8 @@ public class InteractiveCli {
         commands.register(new HelpCommand(commands));
         commands.register(new StackCommand());
         commands.register(new ContextCommand());
+        commands.register(new ReferencesCommand());
+        commands.register(new StringsCommand());
         commands.register(new ValueCommand());
         commands.register(new FieldCommand());
         commands.register(new ReadCommand());
@@ -219,6 +226,206 @@ public class InteractiveCli {
         commands.register(new ForwardCommand("native", "native", "Shows native bridge/JVMTI status.", false));
         commands.register(new BackCommand());
         commands.register(new ExitCommand());
+    }
+
+    private static class ReferencesCommand extends ShellCommand<TargetSession> {
+        private ReferencesCommand() {
+            super("references",
+                    "references [list|save <name> [strong|weak]|field <name> <field> [strong|weak]|"
+                            + "static <name> <class> <field>|use <name>|refresh [name]|"
+                            + "set <name> <value>|null <name>|release <name|all>|info <name>]",
+                    "Tracks strong/weak object snapshots and live instance/static field slots.",
+                    "refs");
+        }
+
+        @Override public boolean execute(TargetSession session, List<String> arguments) {
+            String operation = arguments.isEmpty() ? "list" : lower(arguments.get(0));
+            if ("list".equals(operation) && arguments.size() <= 1) {
+                List<JvmReferenceInfo> values = session.references().refreshAll();
+                for (JvmReferenceInfo value : values) session.output().println(value);
+                if (values.isEmpty()) session.output().println("<no tracked references>");
+                return true;
+            }
+            if ("save".equals(operation) && (arguments.size() == 2 || arguments.size() == 3)) {
+                JvmReferenceStrength strength = arguments.size() == 3
+                        ? referenceStrength(arguments.get(2)) : JvmReferenceStrength.STRONG;
+                session.output().println(session.references().trackObject(arguments.get(1),
+                        session.context().remoteObject(), strength));
+                return true;
+            }
+            if ("field".equals(operation) && (arguments.size() == 3 || arguments.size() == 4)) {
+                RemoteObject receiver = session.context().remoteObject();
+                RemoteField field = FieldSelection.parse(arguments.get(2))
+                        .resolveVirtual(session.context().remoteClass());
+                JvmReferenceStrength strength = arguments.size() == 4
+                        ? referenceStrength(arguments.get(3)) : JvmReferenceStrength.STRONG;
+                session.output().println(session.references().trackField(
+                        arguments.get(1), field, receiver, strength));
+                return true;
+            }
+            if ("static".equals(operation) && arguments.size() == 4) {
+                RemoteClass type = session.findClass(arguments.get(2));
+                RemoteField field = FieldSelection.parse(arguments.get(3)).resolveStatic(type);
+                session.output().println(session.references().trackStaticField(arguments.get(1), field));
+                return true;
+            }
+            if ("use".equals(operation) && arguments.size() == 2) {
+                session.context().select(session.references().acquire(arguments.get(1)));
+                printContext(session);
+                return true;
+            }
+            if ("refresh".equals(operation) && (arguments.size() == 1 || arguments.size() == 2)) {
+                if (arguments.size() == 2) session.output().println(session.references().refresh(arguments.get(1)));
+                else for (JvmReferenceInfo value : session.references().refreshAll()) session.output().println(value);
+                return true;
+            }
+            if ("info".equals(operation) && arguments.size() == 2) {
+                session.output().println(session.references().refresh(arguments.get(1)));
+                return true;
+            }
+            if ("set".equals(operation) && arguments.size() == 3) {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(2)))) {
+                    session.output().println(session.references().replace(arguments.get(1), value.only()));
+                }
+                return true;
+            }
+            if ("null".equals(operation) && arguments.size() == 2) {
+                session.output().println(session.references().setNull(arguments.get(1)));
+                return true;
+            }
+            if ("release".equals(operation) && arguments.size() == 2) {
+                if ("all".equalsIgnoreCase(arguments.get(1))) session.references().releaseAll();
+                else session.references().release(arguments.get(1));
+                session.output().println("released");
+                return true;
+            }
+            return InteractiveCli.usage(session, this);
+        }
+    }
+
+    private static class StringsCommand extends ShellCommand<TargetSession> {
+        private StringsCommand() {
+            super("strings",
+                    "strings [list|field <name> <read|write> <class> <field> [object]|"
+                            + "method <name> <entry|exit> <class> <method> <descriptor>|"
+                            + "on <name>|off <name>|read <name>|use <name>|set <name> <value>|"
+                            + "track <hook> <reference> [strong|weak]|call <hook> <method> <descriptor> [args...]|"
+                            + "remove <name>|clear]",
+                    "Manages precise String field watches and String-bearing method entry/exit hooks.",
+                    "string-hooks");
+        }
+
+        @Override public boolean execute(TargetSession session, List<String> arguments) {
+            String operation = arguments.isEmpty() ? "list" : lower(arguments.get(0));
+            if ("list".equals(operation) && arguments.size() <= 1) {
+                observeStringHooks(session);
+                List<JvmStringHookInfo> hooks = session.stringHooks().snapshot();
+                for (JvmStringHookInfo hook : hooks) session.output().println(hook);
+                if (hooks.isEmpty()) session.output().println("<no String hooks>");
+                return true;
+            }
+            if ("field".equals(operation) && (arguments.size() == 5 || arguments.size() == 6)) {
+                boolean write = "write".equalsIgnoreCase(arguments.get(2));
+                if (!write && !"read".equalsIgnoreCase(arguments.get(2))) return InteractiveCli.usage(session, this);
+                RemoteClass type = session.findClass(arguments.get(3));
+                RemoteField field = findStringField(type, arguments.get(4));
+                boolean objectSpecific = arguments.size() == 6 && "object".equalsIgnoreCase(arguments.get(5));
+                if (arguments.size() == 6 && !objectSpecific) return InteractiveCli.usage(session, this);
+                RemoteObject receiver = objectSpecific ? session.context().remoteObject() : null;
+                session.output().println(session.stringHooks().watchField(
+                        arguments.get(1), field, write, receiver));
+                return true;
+            }
+            if ("method".equals(operation) && arguments.size() == 6) {
+                JvmStringHookKind kind = "entry".equalsIgnoreCase(arguments.get(2))
+                        ? JvmStringHookKind.METHOD_ENTRY : "exit".equalsIgnoreCase(arguments.get(2))
+                        ? JvmStringHookKind.METHOD_EXIT : null;
+                if (kind == null) return InteractiveCli.usage(session, this);
+                session.output().println(session.stringHooks().breakMethod(arguments.get(1), kind,
+                        arguments.get(3), arguments.get(4), arguments.get(5)));
+                return true;
+            }
+            if (("on".equals(operation) || "off".equals(operation)) && arguments.size() == 2) {
+                session.output().println(session.stringHooks().setEnabled(
+                        arguments.get(1), "on".equals(operation)));
+                return true;
+            }
+            if (("read".equals(operation) || "use".equals(operation)) && arguments.size() == 2) {
+                RemoteObject value = session.stringHooks().acquireValue(arguments.get(1));
+                if ("use".equals(operation)) {
+                    session.context().select(value);
+                    printContext(session);
+                } else try (RemoteObject owned = value) { printReadObject(session, owned); }
+                return true;
+            }
+            if ("set".equals(operation) && arguments.size() == 3) {
+                try (RemoteArgumentList value = RemoteArgumentList.resolve(
+                        session, Collections.singletonList(arguments.get(2)))) {
+                    session.stringHooks().replaceValue(arguments.get(1), value.only());
+                }
+                session.output().println("String field updated");
+                return true;
+            }
+            if ("track".equals(operation) && (arguments.size() == 3 || arguments.size() == 4)) {
+                JvmReferenceStrength strength = arguments.size() == 4
+                        ? referenceStrength(arguments.get(3)) : JvmReferenceStrength.STRONG;
+                session.output().println(session.stringHooks().trackValue(arguments.get(1),
+                        session.references(), arguments.get(2), strength));
+                return true;
+            }
+            if ("call".equals(operation) && arguments.size() >= 4) {
+                try (RemoteObject receiver = session.stringHooks().acquireValue(arguments.get(1));
+                        RemoteArgumentList values = RemoteArgumentList.resolve(
+                                session, arguments.subList(4, arguments.size()))) {
+                    RemoteMethod method = receiver.remoteClass().getVirtualMethod(
+                            arguments.get(2), arguments.get(3));
+                    selectInvocationResult(session, method.call(receiver, values.values()));
+                }
+                return true;
+            }
+            if ("remove".equals(operation) && arguments.size() == 2) {
+                session.stringHooks().remove(arguments.get(1));
+                session.output().println("removed");
+                return true;
+            }
+            if ("clear".equals(operation) && arguments.size() == 1) {
+                session.stringHooks().clear();
+                session.output().println("cleared");
+                return true;
+            }
+            return InteractiveCli.usage(session, this);
+        }
+
+        private static RemoteField findStringField(RemoteClass type, String expression) {
+            FieldSelection selection = FieldSelection.parse(expression);
+            List<RemoteField> candidates = new ArrayList<RemoteField>();
+            for (RemoteField field : type.getStaticFields()) if (stringField(selection, field)) candidates.add(field);
+            for (RemoteField field : type.getVirtualFields()) if (stringField(selection, field)) candidates.add(field);
+            if (candidates.size() != 1) throw new IllegalArgumentException(candidates.isEmpty()
+                    ? "String field was not found: " + type.className() + "." + expression
+                    : "String field selection is ambiguous; qualify it as declaring.Class::field");
+            return candidates.get(0);
+        }
+
+        private static boolean stringField(FieldSelection selection, RemoteField field) {
+            return selection.index == null && field.name().equals(selection.field)
+                    && (selection.declaringClass == null
+                            || field.declaringClass().equals(selection.declaringClass))
+                    && "Ljava/lang/String;".equals(field.descriptor());
+        }
+    }
+
+    private static JvmReferenceStrength referenceStrength(String value) {
+        if ("strong".equalsIgnoreCase(value)) return JvmReferenceStrength.STRONG;
+        if ("weak".equalsIgnoreCase(value)) return JvmReferenceStrength.WEAK;
+        throw new IllegalArgumentException("Reference strength must be strong or weak: " + value);
+    }
+
+    private static void observeStringHooks(TargetSession session) {
+        List<JvmDebuggerState> states = new ArrayList<JvmDebuggerState>(session.jvmti().debuggerStates());
+        try { session.stringHooks().observe(states); }
+        finally { for (JvmDebuggerState state : states) state.close(); }
     }
 
     private class ContextCommand extends ShellCommand<TargetSession> {
@@ -1333,12 +1540,13 @@ public class InteractiveCli {
                 return true;
             }
             if ("retransform".equals(operation) && arguments.size() == 2) {
-                session.jvmti().retransformClass(arguments.get(1));
+                session.instrumentation().retransform(arguments.get(1));
                 session.output().println("ok");
                 return true;
             }
             if ("redefine".equals(operation) && arguments.size() == 3) {
-                session.jvmti().redefineClass(arguments.get(1), Files.readAllBytes(Paths.get(arguments.get(2))));
+                session.instrumentation().redefine(arguments.get(1),
+                        Files.readAllBytes(Paths.get(arguments.get(2))));
                 session.output().println("ok");
                 return true;
             }
@@ -1551,7 +1759,9 @@ public class InteractiveCli {
     private static class DecompileCommand extends ShellCommand<TargetSession> {
         private DecompileCommand() {
             super("decompile", "decompile class [class] [--engine cfr|procyon] [--out file] | "
-                            + "decompile method [class] <name> <descriptor> [--engine cfr|procyon] [--out file]",
+                            + "decompile method [class] <name> <descriptor> [--engine cfr|procyon] [--out file] | "
+                            + "decompile range [class] <name> <descriptor> <from-bci> <to-bci> "
+                            + "[--engine cfr|procyon] [--out file]",
                     "Decompiles target class bytes with source-built CFR or Procyon.", "decomp");
         }
 
@@ -1567,7 +1777,9 @@ public class InteractiveCli {
                 if (!options.positionals.isEmpty()) {
                     String className = options.positionals.get(0);
                     try {
-                        result = session.findClass(className).decompile(options.engine);
+                        session.findClass(className);
+                        result = new ClassDecompiler().decompile(className,
+                                session.instrumentation().bytecode().classBytes(className), options.engine);
                     } catch (RuntimeException failure) {
                         JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
                                 session, className, failure);
@@ -1575,7 +1787,11 @@ public class InteractiveCli {
                                 unloaded.name(), unloaded.bytes(), options.engine);
                         session.error().println("decompiler: using unloaded class-path bytes; target class remains unloaded");
                     }
-                } else result = session.context().remoteClass().decompile(options.engine);
+                } else {
+                    String className = session.context().remoteClass().className();
+                    result = new ClassDecompiler().decompile(className,
+                            session.instrumentation().bytecode().classBytes(className), options.engine);
+                }
                 text = result.source();
                 for (String diagnostic : result.diagnostics()) session.error().println("decompiler: " + diagnostic);
             } else if ("method".equals(mode)) {
@@ -1584,14 +1800,18 @@ public class InteractiveCli {
                 if (options.positionals.size() == 2) {
                     name = options.positionals.get(0);
                     descriptor = options.positionals.get(1);
-                    text = session.context().remoteClass().decompileMethod(
+                    String className = session.context().remoteClass().className();
+                    text = new ClassDecompiler().decompileMethod(className,
+                            session.instrumentation().bytecode().classBytes(className),
                             name, descriptor, options.engine);
                 } else if (options.positionals.size() == 3) {
                     String className = options.positionals.get(0);
                     name = options.positionals.get(1);
                     descriptor = options.positionals.get(2);
                     try {
-                        text = session.findClass(className).decompileMethod(
+                        session.findClass(className);
+                        text = new ClassDecompiler().decompileMethod(className,
+                                session.instrumentation().bytecode().classBytes(className),
                                 name, descriptor, options.engine);
                     } catch (RuntimeException failure) {
                         JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
@@ -1601,6 +1821,35 @@ public class InteractiveCli {
                         session.error().println("decompiler: using unloaded class-path bytes; target class remains unloaded");
                     }
                 } else return InteractiveCli.usage(session, this);
+            } else if ("range".equals(mode)) {
+                final String className;
+                final String name;
+                final String descriptor;
+                final int from;
+                final int to;
+                if (options.positionals.size() == 4) {
+                    className = session.context().remoteClass().className();
+                    name = options.positionals.get(0);
+                    descriptor = options.positionals.get(1);
+                    from = integer(options.positionals.get(2), "from BCI");
+                    to = integer(options.positionals.get(3), "to BCI");
+                } else if (options.positionals.size() == 5) {
+                    className = options.positionals.get(0);
+                    name = options.positionals.get(1);
+                    descriptor = options.positionals.get(2);
+                    from = integer(options.positionals.get(3), "from BCI");
+                    to = integer(options.positionals.get(4), "to BCI");
+                } else return InteractiveCli.usage(session, this);
+                byte[] bytes;
+                try {
+                    session.findClass(className);
+                    bytes = session.instrumentation().bytecode().classBytes(className);
+                } catch (RuntimeException failure) {
+                    bytes = unloadedCatalogEntry(session, className, failure).bytes();
+                }
+                DecompilationResult result = new ClassDecompiler().decompileRangeResult(
+                        className, bytes, name, descriptor, from, to, options.engine);
+                text = result.source();
             } else return InteractiveCli.usage(session, this);
             outputAnalysis(session, text, options.output);
             return true;
@@ -1615,8 +1864,12 @@ public class InteractiveCli {
                             + "bytecode <returns-insert|returns-replace> <class> <method> <descriptor> <assembly> | "
                             + "bytecode intercept-return <class> <method> <descriptor> <hook-class> <hook-method> | "
                             + "bytecode patch-file <class> <file> [--preview] [--out class-file] | "
+                            + "bytecode <status|flush|discard> [class|--all] | "
+                            + "bytecode handlers <class> <method> <descriptor> | "
+                            + "bytecode handler-add <class> <method> <descriptor> <start> <end> <handler> [type|any] | "
+                            + "bytecode handler-delete <class> <method> <descriptor> <index> | "
                             + "bytecode <undo|redo> <class>",
-                    "Disassembles or transactionally edits live bytecode with ASM; use ';;' between instructions.",
+                    "Stages ASM edits in memory; use 'bytecode flush' once the complete transaction verifies.",
                     "disasm", "bc");
         }
 
@@ -1624,17 +1877,83 @@ public class InteractiveCli {
         public boolean execute(TargetSession session, List<String> arguments) throws IOException {
             if (!arguments.isEmpty()) {
                 String action = arguments.get(0).toLowerCase(Locale.ROOT);
+                if ("status".equals(action)) {
+                    if (arguments.size() > 2) return InteractiveCli.usage(session, this);
+                    if (arguments.size() == 2) {
+                        String owner = arguments.get(1);
+                        session.output().println(session.instrumentation().bytecode().hasStaged(owner)
+                                ? owner + ": " + session.instrumentation().bytecode()
+                                        .stagedOperationCount(owner) + " staged operation(s)"
+                                : owner + ": no staged edits");
+                    } else if (session.instrumentation().bytecode().stagedClasses().isEmpty()) {
+                        session.output().println("No staged bytecode edits.");
+                    } else for (String owner : session.instrumentation().bytecode().stagedClasses()) {
+                        session.output().println(owner + ": " + session.instrumentation().bytecode()
+                                .stagedOperationCount(owner) + " staged operation(s)");
+                    }
+                    return true;
+                }
+                if ("flush".equals(action)) {
+                    if (arguments.size() == 1 || arguments.size() == 2
+                            && "--all".equalsIgnoreCase(arguments.get(1))) {
+                        for (JvmBytecodePatchResult value
+                                : session.instrumentation().bytecode().flushAll()) {
+                            printPatchResult(session, value);
+                        }
+                    } else if (arguments.size() == 2) {
+                        printPatchResult(session, session.instrumentation().bytecode()
+                                .flush(arguments.get(1)));
+                    } else return InteractiveCli.usage(session, this);
+                    return true;
+                }
+                if ("discard".equals(action)) {
+                    if (arguments.size() == 1 || arguments.size() == 2
+                            && "--all".equalsIgnoreCase(arguments.get(1))) {
+                        session.instrumentation().bytecode().discardAll();
+                        session.output().println("Discarded all staged bytecode edits.");
+                    } else if (arguments.size() == 2) {
+                        session.instrumentation().bytecode().discard(arguments.get(1));
+                        session.output().println("Discarded staged edits for " + arguments.get(1));
+                    } else return InteractiveCli.usage(session, this);
+                    return true;
+                }
+                if ("handlers".equals(action) && arguments.size() == 4) {
+                    List<JvmExceptionHandlerInfo> handlers = session.instrumentation().bytecode()
+                            .exceptionHandlers(arguments.get(1), arguments.get(2), arguments.get(3));
+                    if (handlers.isEmpty()) session.output().println("<no exception handlers>");
+                    else for (JvmExceptionHandlerInfo handler : handlers) session.output().println(handler);
+                    return true;
+                }
+                if ("handler-add".equals(action)
+                        && (arguments.size() == 7 || arguments.size() == 8)) {
+                    JvmBytecodePatch patch = JvmBytecodePatch.builder(arguments.get(1))
+                            .addExceptionHandler(arguments.get(2), arguments.get(3),
+                                    integer(arguments.get(4), "start BCI"),
+                                    integer(arguments.get(5), "end BCI"),
+                                    integer(arguments.get(6), "handler BCI"),
+                                    arguments.size() == 8 ? arguments.get(7) : null).build();
+                    printPatchResult(session, session.instrumentation().bytecode().stage(patch));
+                    return true;
+                }
+                if ("handler-delete".equals(action) && arguments.size() == 5) {
+                    JvmBytecodePatch patch = JvmBytecodePatch.builder(arguments.get(1))
+                            .deleteExceptionHandler(arguments.get(2), arguments.get(3),
+                                    integer(arguments.get(4), "handler index")).build();
+                    printPatchResult(session, session.instrumentation().bytecode().stage(patch));
+                    return true;
+                }
                 if ("insert-before".equals(action) || "insert-after".equals(action)
                         || "replace".equals(action)) {
-                    if (arguments.size() == 6) {
+                    if (arguments.size() >= 6) {
                         JvmBytecodePatch.Builder patch = JvmBytecodePatch.builder(arguments.get(1));
                         int bci = integer(arguments.get(4), "BCI");
+                        String assembly = assemblyArgument(arguments, 5);
                         if ("insert-before".equals(action)) patch.insertBefore(
-                                arguments.get(2), arguments.get(3), bci, arguments.get(5));
+                                arguments.get(2), arguments.get(3), bci, assembly);
                         else if ("insert-after".equals(action)) patch.insertAfter(
-                                arguments.get(2), arguments.get(3), bci, arguments.get(5));
-                        else patch.replace(arguments.get(2), arguments.get(3), bci, arguments.get(5));
-                        printPatchResult(session, session.instrumentation().bytecode().apply(patch.build()));
+                                arguments.get(2), arguments.get(3), bci, assembly);
+                        else patch.replace(arguments.get(2), arguments.get(3), bci, assembly);
+                        printPatchResult(session, session.instrumentation().bytecode().stage(patch.build()));
                         return true;
                     }
                     if (arguments.size() > 3) return InteractiveCli.usage(session, this);
@@ -1645,25 +1964,26 @@ public class InteractiveCli {
                         int to = arguments.size() == 6 ? integer(arguments.get(5), "to BCI") : from;
                         JvmBytecodePatch patch = JvmBytecodePatch.builder(arguments.get(1))
                                 .delete(arguments.get(2), arguments.get(3), from, to).build();
-                        printPatchResult(session, session.instrumentation().bytecode().apply(patch));
+                        printPatchResult(session, session.instrumentation().bytecode().stage(patch));
                         return true;
                     }
                     if (arguments.size() > 3) return InteractiveCli.usage(session, this);
                 }
                 if ("returns-insert".equals(action) || "returns-replace".equals(action)) {
-                    if (arguments.size() == 5) {
+                    if (arguments.size() >= 5) {
                         JvmBytecodePatch.Builder patch = JvmBytecodePatch.builder(arguments.get(1));
+                        String assembly = assemblyArgument(arguments, 4);
                         if ("returns-insert".equals(action)) patch.insertBeforeReturns(
-                                arguments.get(2), arguments.get(3), arguments.get(4));
-                        else patch.replaceReturns(arguments.get(2), arguments.get(3), arguments.get(4));
-                        printPatchResult(session, session.instrumentation().bytecode().apply(patch.build()));
+                                arguments.get(2), arguments.get(3), assembly);
+                        else patch.replaceReturns(arguments.get(2), arguments.get(3), assembly);
+                        printPatchResult(session, session.instrumentation().bytecode().stage(patch.build()));
                         return true;
                     }
                     if (arguments.size() > 3) return InteractiveCli.usage(session, this);
                 }
                 if ("intercept-return".equals(action)) {
                     if (arguments.size() == 6) {
-                        printPatchResult(session, session.instrumentation().bytecode().interceptReturns(
+                        printPatchResult(session, session.instrumentation().bytecode().stageInterceptReturns(
                                 arguments.get(1), arguments.get(2), arguments.get(3),
                                 arguments.get(4), arguments.get(5)));
                         return true;
@@ -1692,13 +2012,15 @@ public class InteractiveCli {
                 ownerName = type.className();
                 name = options.positionals.get(0);
                 descriptor = options.positionals.get(1);
-                method = type.bytecode(name, descriptor);
+                byte[] bytes = session.instrumentation().bytecode().classBytes(ownerName);
+                method = new JvmClassFileParser().parse(bytes).method(name, descriptor);
             } else if (options.positionals.size() == 3) {
                 ownerName = options.positionals.get(0);
                 name = options.positionals.get(1);
                 descriptor = options.positionals.get(2);
                 try {
-                    method = session.findClass(ownerName).bytecode(name, descriptor);
+                    byte[] bytes = session.instrumentation().bytecode().classBytes(ownerName);
+                    method = new JvmClassFileParser().parse(bytes).method(name, descriptor);
                 } catch (RuntimeException failure) {
                     JvmClassPathCatalog.ClassEntry unloaded = unloadedCatalogEntry(
                             session, ownerName, failure);
@@ -1741,7 +2063,7 @@ public class InteractiveCli {
             JvmBytecodePatch patch = builder.build();
             JvmBytecodePatchResult result = preview
                     ? session.instrumentation().bytecode().preview(patch)
-                    : session.instrumentation().bytecode().apply(patch);
+                    : session.instrumentation().bytecode().stage(patch);
             if (output != null) {
                 Path absolute = output.toAbsolutePath().normalize();
                 Path parent = absolute.getParent();
@@ -1749,7 +2071,8 @@ public class InteractiveCli {
                 Files.write(absolute, result.patchedBytes());
                 session.output().println("patched class bytes -> " + absolute);
             }
-            printPatchResult(session, result);
+            if (preview) session.output().println(result);
+            else printPatchResult(session, result);
             return true;
         }
 
@@ -1758,7 +2081,7 @@ public class InteractiveCli {
             String action = separator < 0 ? line
                     : line.substring(0, separator).trim().toLowerCase(Locale.ROOT);
             int limit = "returns-insert".equals(action) || "returns-replace".equals(action)
-                    ? 4 : 5;
+                    ? 4 : "handler-add".equals(action) ? 7 : 5;
             return line.split("\\|", limit);
         }
 
@@ -1787,13 +2110,49 @@ public class InteractiveCli {
                         action + " expects operation|method|descriptor|assembly");
                 if ("returns-insert".equals(action)) builder.insertBeforeReturns(method, descriptor, fields[3]);
                 else builder.replaceReturns(method, descriptor, fields[3]);
+            } else if ("handler-add".equals(action)) {
+                if (fields.length != 6 && fields.length != 7) throw new IllegalArgumentException(
+                        "handler-add expects operation|method|descriptor|start|end|handler[|type]");
+                builder.addExceptionHandler(method, descriptor,
+                        integer(fields[3].trim(), "start BCI"),
+                        integer(fields[4].trim(), "end BCI"),
+                        integer(fields[5].trim(), "handler BCI"),
+                        fields.length == 7 ? fields[6].trim() : null);
+            } else if ("handler-delete".equals(action)) {
+                if (fields.length != 4) throw new IllegalArgumentException(
+                        "handler-delete expects operation|method|descriptor|index");
+                builder.deleteExceptionHandler(method, descriptor,
+                        integer(fields[3].trim(), "handler index"));
             } else throw new IllegalArgumentException("unknown operation " + action);
         }
 
         private static void printPatchResult(TargetSession session, JvmBytecodePatchResult result) {
-            session.output().println(result);
+            session.output().println(result.installed() ? result
+                    : "staged bytecode patch for " + result.className() + ": "
+                            + result.operationCount() + " operation(s), " + result.changedMethods());
             if (result.installed()) session.output().println(
                     "New invocations use the new bytecode; frames already executing may finish obsolete code.");
+            else session.output().println("Not installed yet. Continue editing, inspect staged bytecode, then run: "
+                    + "bytecode flush " + result.className());
+        }
+
+        private static String assemblyArgument(List<String> arguments, int from) {
+            StringBuilder value = new StringBuilder();
+            for (int index = from; index < arguments.size(); index++) {
+                if (value.length() > 0) value.append(' ');
+                value.append(arguments.get(index));
+            }
+            String result = value.toString().trim();
+            if (result.length() >= 2 && isQuote(result.charAt(0))
+                    && isQuote(result.charAt(result.length() - 1))) {
+                result = result.substring(1, result.length() - 1).trim();
+            }
+            return result;
+        }
+
+        private static boolean isQuote(char value) {
+            return value == '"' || value == '\'' || value == '\u201c' || value == '\u201d'
+                    || value == '\u2018' || value == '\u2019';
         }
     }
 
@@ -1812,6 +2171,7 @@ public class InteractiveCli {
                             + "event-break <entry|exit> <class> <method> <descriptor> [subtypes]|"
                             + "exception-break <class-glob>|event-breakpoints [clear-all]|event-clear <index>|"
                             + "watch <read|write> <set|clear> <class> <field> <descriptor>|watches [clear-all]|"
+                            + "run-to-line <class> <method> <descriptor> <decompiled-line> [thread-index]|"
                             + "continue [thread-index|all]|step [thread-index]|step-out [thread-index]|"
                             + "force-return <thread-index> <value>|force-return-void <thread-index>|"
                             + "snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]> ...",
@@ -1998,6 +2358,38 @@ public class InteractiveCli {
                 session.jvmti().setBreakpoint(arguments.get(1), arguments.get(2), arguments.get(3),
                         Long.parseLong(arguments.get(4)), enabled);
                 session.output().println("ok");
+                return true;
+            }
+            if ((arguments.size() == 5 || arguments.size() == 6)
+                    && "run-to-line".equalsIgnoreCase(arguments.get(0))) {
+                String className = arguments.get(1);
+                String methodName = arguments.get(2);
+                String descriptor = arguments.get(3);
+                int requestedLine = integer(arguments.get(4), "decompiled line");
+                if (session.instrumentation().bytecode().hasStaged(className)) {
+                    throw new IllegalStateException("The class has staged edits; flush or discard them "
+                            + "before executing target code: " + className);
+                }
+                byte[] bytes = session.instrumentation().bytecode().classBytes(className);
+                DecompilationResult decompiled = new ClassDecompiler().decompileMethodResult(
+                        className, bytes, methodName, descriptor, DecompilerEngine.CFR);
+                Map.Entry<Integer, Integer> best = null;
+                int distance = Integer.MAX_VALUE;
+                for (Map.Entry<Integer, Integer> mapping
+                        : decompiled.lineMappings(methodName, descriptor).entrySet()) {
+                    int candidate = Math.abs(mapping.getValue().intValue() - requestedLine);
+                    if (candidate < distance) { best = mapping; distance = candidate; }
+                }
+                if (best == null) throw new IllegalStateException(
+                        "CFR produced no BCI mapping for " + methodName + descriptor);
+                session.jvmti().configureDebugger(true);
+                session.jvmti().setBreakpoint(className, methodName, descriptor,
+                        best.getKey().longValue(), true);
+                if (arguments.size() == 6) resumeDebuggerThread(session,
+                        integer(arguments.get(5), "thread index"), false);
+                else session.jvmti().continueExecution();
+                session.output().println("running to decompiled line " + requestedLine
+                        + " -> BCI " + best.getKey() + " (managed breakpoint; clear it when done)");
                 return true;
             }
             if (arguments.size() >= 4 && arguments.size() <= 7

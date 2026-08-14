@@ -11,6 +11,8 @@ final class TuiKey {
     static final int CTRL_LEFT = 0x1006;
     static final int CTRL_RIGHT = 0x1007;
     static final int F2 = 0x1012;
+    static final int F3 = 0x1013;
+    static final int SHIFT_F3 = 0x1113;
     static final int F4 = 0x1014;
     static final int F5 = 0x1015;
     static final int F6 = 0x1016;

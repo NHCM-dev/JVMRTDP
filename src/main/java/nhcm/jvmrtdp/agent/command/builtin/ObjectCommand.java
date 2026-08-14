@@ -17,7 +17,7 @@ public class ObjectCommand implements RemoteCommand {
     public String usage() {
         return "object <value|construct|methods|fields|constructors|class.info|class.names|system.property|class.load|class.load.no-init|class.load.start|package|class.search|"
                 + "package.search|field.search|method.search|call|call.special|"
-                + "field.get|field.set|instanceof|array.length|array.get|array.set|iterable|map|stats|debug|as|release> ...";
+                + "field.get|field.set|instanceof|array.length|array.get|array.set|iterable|map|stats|debug|as|retain|status|release> ...";
     }
 
     @Override
@@ -116,6 +116,14 @@ public class ObjectCommand implements RemoteCommand {
         }
         if ("describe".equals(operation) && arguments.size() == 2) {
             return success(objects.describe(id(arguments.get(1))).encode());
+        }
+        if ("retain".equals(operation) && arguments.size() == 3) {
+            String strength = arguments.get(2).toLowerCase(java.util.Locale.ROOT);
+            if (!"strong".equals(strength) && !"weak".equals(strength)) return invalidUsage();
+            return success(objects.retain(id(arguments.get(1)), "weak".equals(strength)).encode());
+        }
+        if ("status".equals(operation) && arguments.size() == 2) {
+            return success(objects.referenceStatus(id(arguments.get(1))));
         }
         if ("array.length".equals(operation) && arguments.size() == 2) {
             return success(Integer.toString(objects.arrayLength(id(arguments.get(1)))));

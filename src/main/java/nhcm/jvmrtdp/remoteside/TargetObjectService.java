@@ -41,6 +41,13 @@ public class TargetObjectService implements AutoCloseable {
         return objects.storeOpaque(value);
     }
 
+    /** Duplicates a session object handle; weak duplicates do not keep the target object alive. */
+    public RemoteObjectDescriptor retain(long objectId, boolean weak) {
+        return objects.retain(objectId, weak);
+    }
+
+    public String referenceStatus(long objectId) { return objects.status(objectId); }
+
     /** Resolves an argument handle for another target-side service. */
     public Object resolveExternal(long objectId) {
         return objects.resolve(objectId);

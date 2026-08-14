@@ -166,6 +166,8 @@ public final class TerminalScreen implements AutoCloseable {
         if ("3~".equals(value)) return TuiKey.DELETE;
         if ("Z".equals(value)) return TuiKey.SHIFT_TAB;
         if ("12~".equals(value) || "Q".equals(value)) return TuiKey.F2;
+        if ("13~".equals(value) || "R".equals(value)) return TuiKey.F3;
+        if ("13;2~".equals(value)) return TuiKey.SHIFT_F3;
         if ("14~".equals(value) || "S".equals(value)) return TuiKey.F4;
         if ("15~".equals(value)) return TuiKey.F5;
         if ("17~".equals(value)) return TuiKey.F6;

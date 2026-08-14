@@ -1,5 +1,6 @@
 package nhcm.jvmrtdp.controllerside.debug;
 
+import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
@@ -7,6 +8,7 @@ import nhcm.jvmrtdp.api.jvmti.JvmFieldWatchInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmEventBreakpointSpec;
 import nhcm.jvmrtdp.api.jvmti.JvmStackFrame;
+import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.handles.jvm.RemoteJvmtiThread;
 
@@ -64,6 +66,7 @@ public final class DebuggerAnalysisExporter {
         result.breakpoints.addAll(session.jvmti().managedBreakpoints());
         result.eventBreakpoints.addAll(session.jvmti().managedEventBreakpoints());
         result.watches.addAll(session.jvmti().managedFieldWatches());
+        result.references.addAll(session.references().refreshAll());
 
         List<RemoteJvmtiThread> threads = session.jvmti().threads();
         try {
@@ -112,14 +115,16 @@ public final class DebuggerAnalysisExporter {
                 result.stops.add(stop);
             }
         } finally {
+            session.stringHooks().observe(states);
             for (JvmDebuggerState state : states) state.close();
         }
+        result.stringHooks.addAll(session.stringHooks().snapshot());
         return result;
     }
 
     private static String json(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
-        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 3,");
+        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 4,");
         field(out, "capturedAt", value.capturedAt, true, 2);
         out.append(",\n  \"target\": {\"pid\": ").append(value.pid).append("},");
         out.append("\n  \"freeze\": ");
@@ -153,6 +158,16 @@ public final class DebuggerAnalysisExporter {
             if (index > 0) out.append(',');
             appendEventBreakpoint(out, value.eventBreakpoints.get(index));
         }
+        out.append("],\n  \"references\": [");
+        for (int index = 0; index < value.references.size(); index++) {
+            if (index > 0) out.append(',');
+            appendReference(out, value.references.get(index));
+        }
+        out.append("],\n  \"stringHooks\": [");
+        for (int index = 0; index < value.stringHooks.size(); index++) {
+            if (index > 0) out.append(',');
+            appendStringHook(out, value.stringHooks.get(index));
+        }
         out.append("]\n}\n");
         return out.toString();
     }
@@ -160,7 +175,7 @@ public final class DebuggerAnalysisExporter {
     private static String jsonLines(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
         out.append("{\"type\":\"meta\",\"schema\":\"jvmrtdp.debug-analysis\","
-                + "\"version\":3,\"capturedAt\":");
+                + "\"version\":4,\"capturedAt\":");
         quote(out, value.capturedAt);
         out.append(",\"pid\":").append(value.pid).append(",\"freeze\":");
         appendFreeze(out, value.freeze);
@@ -188,6 +203,16 @@ public final class DebuggerAnalysisExporter {
         for (JvmEventBreakpointInfo breakpoint : value.eventBreakpoints) {
             out.append("{\"type\":\"eventBreakpoint\",\"data\":");
             appendEventBreakpoint(out, breakpoint);
+            out.append("}\n");
+        }
+        for (JvmReferenceInfo reference : value.references) {
+            out.append("{\"type\":\"reference\",\"data\":");
+            appendReference(out, reference);
+            out.append("}\n");
+        }
+        for (JvmStringHookInfo hook : value.stringHooks) {
+            out.append("{\"type\":\"stringHook\",\"data\":");
+            appendStringHook(out, hook);
             out.append("}\n");
         }
         return out.toString();
@@ -326,6 +351,35 @@ public final class DebuggerAnalysisExporter {
         out.append(",\"includeSubtypes\":").append(spec.includeSubtypes()).append('}');
     }
 
+    private static void appendReference(StringBuilder out, JvmReferenceInfo value) {
+        out.append('{');
+        field(out, "name", value.name(), true, 0);
+        field(out, "kind", value.kind().name().toLowerCase(Locale.ROOT), false, 0);
+        field(out, "strength", value.strength().name().toLowerCase(Locale.ROOT), false, 0);
+        field(out, "state", value.state().name().toLowerCase(Locale.ROOT), false, 0);
+        out.append(",\"remoteId\":").append(value.remoteId());
+        nullableField(out, "class", emptyToNull(value.className()));
+        nullableField(out, "value", emptyToNull(value.displayValue()));
+        field(out, "source", value.source(), false, 0);
+        out.append(",\"assignable\":").append(value.assignable());
+        nullableField(out, "error", emptyToNull(value.error()));
+        out.append('}');
+    }
+
+    private static void appendStringHook(StringBuilder out, JvmStringHookInfo value) {
+        out.append('{');
+        field(out, "name", value.name(), true, 0);
+        field(out, "kind", value.kind().name().toLowerCase(Locale.ROOT), false, 0);
+        field(out, "class", value.className(), false, 0);
+        field(out, "member", value.memberName(), false, 0);
+        field(out, "descriptor", value.descriptor(), false, 0);
+        out.append(",\"objectSpecific\":").append(value.objectSpecific())
+                .append(",\"enabled\":").append(value.enabled())
+                .append(",\"lastHitSequence\":").append(value.lastHitSequence());
+        nullableField(out, "lastHit", emptyToNull(value.lastHit()));
+        out.append('}');
+    }
+
     private static void strings(StringBuilder out, List<String> values) {
         for (int index = 0; index < values.size(); index++) {
             if (index > 0) out.append(',');
@@ -389,6 +443,8 @@ public final class DebuggerAnalysisExporter {
         private final List<JvmBreakpointInfo> breakpoints = new ArrayList<JvmBreakpointInfo>();
         private final List<JvmEventBreakpointInfo> eventBreakpoints = new ArrayList<JvmEventBreakpointInfo>();
         private final List<JvmFieldWatchInfo> watches = new ArrayList<JvmFieldWatchInfo>();
+        private final List<JvmReferenceInfo> references = new ArrayList<JvmReferenceInfo>();
+        private final List<JvmStringHookInfo> stringHooks = new ArrayList<JvmStringHookInfo>();
     }
 
     private static final class ThreadRow {

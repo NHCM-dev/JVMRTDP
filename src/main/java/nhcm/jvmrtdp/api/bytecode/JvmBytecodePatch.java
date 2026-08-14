@@ -5,7 +5,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Immutable, transactionally applied set of bytecode edits for one loaded class.
+ * Immutable set of bytecode edits for one loaded class. It may be staged or applied immediately.
  * BCI anchors refer to the class bytes captured before the transaction starts.
  */
 public final class JvmBytecodePatch {
@@ -15,7 +15,9 @@ public final class JvmBytecodePatch {
         REPLACE,
         DELETE,
         INSERT_BEFORE_RETURNS,
-        REPLACE_RETURNS
+        REPLACE_RETURNS,
+        ADD_EXCEPTION_HANDLER,
+        DELETE_EXCEPTION_HANDLER
     }
 
     public static final class Operation {
@@ -37,7 +39,8 @@ public final class JvmBytecodePatch {
             if (fromBci < -1 || toBci < -1 || (fromBci >= 0 && toBci < fromBci)) {
                 throw new IllegalArgumentException("Invalid BCI range " + fromBci + ".." + toBci);
             }
-            if (kind != Kind.DELETE && this.assembly.isEmpty()) {
+            if (kind != Kind.DELETE && kind != Kind.DELETE_EXCEPTION_HANDLER
+                    && this.assembly.isEmpty()) {
                 throw new IllegalArgumentException("assembly must not be empty for " + kind);
             }
         }
@@ -110,6 +113,19 @@ public final class JvmBytecodePatch {
          */
         public Builder replaceReturns(String method, String descriptor, String assembly) {
             return add(Kind.REPLACE_RETURNS, method, descriptor, -1, -1, assembly);
+        }
+
+        /** Adds a staged try/catch entry. End BCI is exclusive; type may be null for finally/catch-all. */
+        public Builder addExceptionHandler(String method, String descriptor, int startBci,
+                int endBci, int handlerBci, String type) {
+            String exceptionType = type == null || type.trim().isEmpty() ? "*" : type.trim();
+            return add(Kind.ADD_EXCEPTION_HANDLER, method, descriptor, startBci, endBci,
+                    handlerBci + "|" + exceptionType);
+        }
+
+        /** Removes a try/catch table entry by the index shown by the handler-list command. */
+        public Builder deleteExceptionHandler(String method, String descriptor, int index) {
+            return add(Kind.DELETE_EXCEPTION_HANDLER, method, descriptor, index, index, "");
         }
 
         public Builder add(Kind kind, String method, String descriptor,

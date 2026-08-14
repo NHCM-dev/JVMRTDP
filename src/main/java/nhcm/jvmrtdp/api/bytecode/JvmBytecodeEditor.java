@@ -17,11 +17,14 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -30,8 +33,8 @@ import java.util.Set;
 import java.util.function.Consumer;
 
 /**
- * ASM-backed live bytecode editor. Each patch rewrites one complete class and installs it
- * through JVMTI RedefineClasses only after every requested operation has succeeded.
+ * ASM-backed live bytecode editor. CLI/TUI edits share a staged class transaction and install
+ * it through JVMTI RedefineClasses only when the caller explicitly flushes it.
  */
 public final class JvmBytecodeEditor {
     private static final int HISTORY_LIMIT = 16;
@@ -42,6 +45,9 @@ public final class JvmBytecodeEditor {
             new LinkedHashMap<String, Deque<HistoryEntry>>();
     private final Map<String, Deque<HistoryEntry>> redo =
             new LinkedHashMap<String, Deque<HistoryEntry>>();
+    private final Map<String, StagedClass> staged =
+            new LinkedHashMap<String, StagedClass>();
+    private long revision;
 
     public JvmBytecodeEditor(RemoteJVMTIEnv jvmti) {
         if (jvmti == null) throw new IllegalArgumentException("jvmti must not be null");
@@ -52,19 +58,228 @@ public final class JvmBytecodeEditor {
     /** Validates and emits class bytes without modifying the target JVM. */
     public synchronized JvmBytecodePatchResult preview(JvmBytecodePatch patch) {
         if (patch == null) throw new IllegalArgumentException("patch must not be null");
-        byte[] original = jvmti.getClassBytes(patch.className());
-        return rewrite(original, patch, false);
+        byte[] original = classBytes(patch.className());
+        return rewrite(original, patch, false, true);
+    }
+
+    /**
+     * Adds a patch to the in-memory edit transaction for its class. No target code is
+     * redefined until {@link #flush(String)} (or {@link #flushAll()}) is called. Staged
+     * class bytes intentionally keep provisional frames so several temporarily
+     * unverifiable instruction edits can be completed as one final transaction.
+     */
+    public synchronized JvmBytecodePatchResult stage(JvmBytecodePatch patch) {
+        if (patch == null) throw new IllegalArgumentException("patch must not be null");
+        String className = normalize(patch.className());
+        StagedClass previous = staged.get(className);
+        byte[] input = previous == null ? jvmti.getClassBytes(className) : previous.current;
+        JvmBytecodePatchResult generated = rewrite(input, patch, false, false);
+        recordStage(className, input, generated);
+        return new JvmBytecodePatchResult(className, input, generated.patchedBytes(),
+                generated.operationCount(), generated.changedMethods(), generated.relocations(), false);
+    }
+
+    /** Returns staged bytes when present, otherwise the current target class bytes. */
+    public synchronized byte[] classBytes(String className) {
+        StagedClass value = staged.get(normalize(className));
+        return value == null ? jvmti.getClassBytes(className) : value.current.clone();
+    }
+
+    public synchronized boolean hasStaged(String className) {
+        return staged.containsKey(normalize(className));
+    }
+
+    public synchronized Set<String> stagedClasses() {
+        return Collections.unmodifiableSet(new LinkedHashSet<String>(staged.keySet()));
+    }
+
+    public synchronized int stagedOperationCount(String className) {
+        StagedClass value = staged.get(normalize(className));
+        return value == null ? 0 : value.operationCount;
+    }
+
+    public synchronized long revision() { return revision; }
+
+    /** Advanced Library API equivalent of {@link #stage(JvmBytecodePatch)} for ASM users. */
+    public synchronized JvmBytecodePatchResult stageMethod(String className, String methodName,
+            String descriptor, Consumer<MethodNode> editor) {
+        if (editor == null) throw new IllegalArgumentException("editor must not be null");
+        String normalized = normalize(className);
+        byte[] input = classBytes(normalized);
+        ClassReader reader = new ClassReader(input);
+        ClassNode type = new ClassNode();
+        reader.accept(type, ClassReader.EXPAND_FRAMES);
+        MethodNode method = method(type, methodName, descriptor);
+        RewriteContext context = new RewriteContext(input, type, methodName, descriptor);
+        editor.accept(method);
+        sanitizeExceptionHandlers(method);
+        JvmBytecodePatchResult generated = emit(normalized, input, reader, type, 1,
+                Collections.singletonList(methodName + descriptor),
+                Collections.singletonList(context), false, false);
+        recordStage(normalized, input, generated);
+        return generated;
+    }
+
+    /** Stages a static return interceptor; call {@link #flush(String)} when the transaction is complete. */
+    public JvmBytecodePatchResult stageInterceptReturns(String className, String methodName,
+            String descriptor, final String hookClass, final String hookMethod) {
+        final Type returnType = Type.getReturnType(descriptor);
+        final String hookDescriptor = returnType.getSort() == Type.VOID
+                ? "()V" : "(" + returnType.getDescriptor() + ")" + returnType.getDescriptor();
+        return stageMethod(className, methodName, descriptor, new Consumer<MethodNode>() {
+            @Override public void accept(MethodNode method) {
+                for (AbstractInsnNode instruction : returnInstructions(method)) {
+                    method.instructions.insertBefore(instruction, new MethodInsnNode(
+                            Opcodes.INVOKESTATIC, hookClass.replace('.', '/'), hookMethod,
+                            hookDescriptor, false));
+                }
+            }
+        });
+    }
+
+    public synchronized List<JvmExceptionHandlerInfo> exceptionHandlers(String className,
+            String methodName, String descriptor) {
+        byte[] bytes = classBytes(className);
+        ClassNode type = new ClassNode();
+        new ClassReader(bytes).accept(type, ClassReader.EXPAND_FRAMES);
+        MethodNode method = method(type, methodName, descriptor);
+        List<AbstractInsnNode> real = realInstructions(method);
+        List<BytecodeInstruction> decoded = new JvmClassFileParser().parse(bytes)
+                .method(methodName, descriptor).instructions();
+        int codeEnd = codeEnd(decoded);
+        Map<AbstractInsnNode, Integer> bcis = new IdentityHashMap<AbstractInsnNode, Integer>();
+        for (int index = 0; index < Math.min(real.size(), decoded.size()); index++) {
+            bcis.put(real.get(index), Integer.valueOf(decoded.get(index).offset()));
+        }
+        List<JvmExceptionHandlerInfo> result = new ArrayList<JvmExceptionHandlerInfo>();
+        for (int index = 0; index < method.tryCatchBlocks.size(); index++) {
+            TryCatchBlockNode block = method.tryCatchBlocks.get(index);
+            result.add(new JvmExceptionHandlerInfo(index, bciAtOrAfter(block.start, bcis, codeEnd),
+                    bciAtOrAfter(block.end, bcis, codeEnd),
+                    bciAtOrAfter(block.handler, bcis, codeEnd), block.type));
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    /** Recomputes frames once and atomically installs every staged edit for one class. */
+    public synchronized JvmBytecodePatchResult flush(String className) {
+        String normalized = normalize(className);
+        StagedClass value = staged.get(normalized);
+        if (value == null) throw new IllegalStateException("No staged bytecode edits for " + normalized);
+        byte[] finalized = finalizeFrames(normalized, value.current);
+        Map<String, Map<Long, Long>> finalRelocations = relocateBetween(
+                value.current, finalized, value.changedMethods);
+        Map<String, Map<Long, Long>> forward = compose(value.forward, finalRelocations);
+        jvmti.redefineClass(normalized, finalized, forward);
+        staged.remove(normalized);
+        remember(undo, normalized, new HistoryEntry(value.original, finalized, forward));
+        deque(redo, normalized).clear();
+        revision++;
+        return new JvmBytecodePatchResult(normalized, value.original, finalized,
+                value.operationCount, new ArrayList<String>(value.changedMethods), forward, true);
+    }
+
+    /** Flushes all staged classes, rolling back already installed classes on failure. */
+    public synchronized List<JvmBytecodePatchResult> flushAll() {
+        if (staged.isEmpty()) throw new IllegalStateException("No staged bytecode edits");
+        List<JvmBytecodePatchResult> generated = new ArrayList<JvmBytecodePatchResult>();
+        for (Map.Entry<String, StagedClass> entry : staged.entrySet()) {
+            StagedClass value = entry.getValue();
+            byte[] finalized = finalizeFrames(entry.getKey(), value.current);
+            Map<String, Map<Long, Long>> finalRelocations = relocateBetween(
+                    value.current, finalized, value.changedMethods);
+            Map<String, Map<Long, Long>> forward = compose(value.forward, finalRelocations);
+            generated.add(new JvmBytecodePatchResult(entry.getKey(), value.original, finalized,
+                    value.operationCount, new ArrayList<String>(value.changedMethods), forward, true));
+        }
+        int installedCount = 0;
+        try {
+            for (JvmBytecodePatchResult value : generated) {
+                jvmti.redefineClass(value.className(), value.patchedBytes(), value.relocations());
+                installedCount++;
+            }
+        } catch (RuntimeException failure) {
+            for (int index = installedCount - 1; index >= 0; index--) {
+                JvmBytecodePatchResult value = generated.get(index);
+                try { jvmti.redefineClass(value.className(), value.originalBytes(),
+                        inverse(value.relocations())); }
+                catch (RuntimeException rollback) { failure.addSuppressed(rollback); }
+            }
+            throw failure;
+        }
+        for (JvmBytecodePatchResult value : generated) {
+            staged.remove(value.className());
+            remember(undo, value.className(), new HistoryEntry(value.originalBytes(),
+                    value.patchedBytes(), value.relocations()));
+            deque(redo, value.className()).clear();
+        }
+        revision++;
+        return Collections.unmodifiableList(generated);
+    }
+
+    public synchronized void discard(String className) {
+        String normalized = normalize(className);
+        if (staged.remove(normalized) == null) {
+            throw new IllegalStateException("No staged bytecode edits for " + normalized);
+        }
+        revision++;
+    }
+
+    public synchronized void discardAll() {
+        if (!staged.isEmpty()) {
+            staged.clear();
+            revision++;
+        }
+    }
+
+    /** Installs externally produced bytes while keeping staged/history/view state coherent. */
+    public synchronized void redefineExternal(String className, byte[] classBytes) {
+        if (classBytes == null || classBytes.length < 4) {
+            throw new IllegalArgumentException("classBytes are invalid");
+        }
+        String normalized = normalize(className);
+        requireNoStaged(normalized);
+        jvmti.redefineClass(normalized, classBytes);
+        deque(undo, normalized).clear();
+        deque(redo, normalized).clear();
+        revision++;
+    }
+
+    public synchronized void retransformExternal(String className) {
+        String normalized = normalize(className);
+        requireNoStaged(normalized);
+        jvmti.retransformClass(normalized);
+        deque(undo, normalized).clear();
+        deque(redo, normalized).clear();
+        revision++;
+    }
+
+    private void recordStage(String className, byte[] input, JvmBytecodePatchResult generated) {
+        StagedClass previous = staged.get(className);
+        if (previous == null) {
+            previous = new StagedClass(input, generated.patchedBytes(),
+                    generated.operationCount(), generated.changedMethods(), generated.relocations());
+            staged.put(className, previous);
+        } else {
+            previous.current = generated.patchedBytes().clone();
+            previous.operationCount += generated.operationCount();
+            previous.changedMethods.addAll(generated.changedMethods());
+            previous.forward = compose(previous.forward, generated.relocations());
+        }
+        revision++;
     }
 
     /** Applies all operations as one class redefinition and records one undo entry. */
     public synchronized JvmBytecodePatchResult apply(JvmBytecodePatch patch) {
         if (patch == null) throw new IllegalArgumentException("patch must not be null");
+        requireNoStaged(patch.className());
         byte[] original = jvmti.getClassBytes(patch.className());
-        JvmBytecodePatchResult generated = rewrite(original, patch, false);
+        JvmBytecodePatchResult generated = rewrite(original, patch, false, true);
         jvmti.redefineClass(patch.className(), generated.patchedBytes(), generated.relocations());
         remember(undo, patch.className(), new HistoryEntry(original,
                 generated.patchedBytes(), generated.relocations()));
         deque(redo, patch.className()).clear();
+        revision++;
         return installed(generated);
     }
 
@@ -79,9 +294,11 @@ public final class JvmBytecodeEditor {
         List<JvmBytecodePatchResult> generated = new ArrayList<JvmBytecodePatchResult>();
         Set<String> classes = new LinkedHashSet<String>();
         for (JvmBytecodePatch patch : patches) {
+            requireNoStaged(patch.className());
             if (!classes.add(patch.className())) throw new IllegalArgumentException(
                     "A batch may contain only one transaction per class: " + patch.className());
-            generated.add(preview(patch));
+            byte[] original = jvmti.getClassBytes(patch.className());
+            generated.add(rewrite(original, patch, false, true));
         }
         int installed = 0;
         try {
@@ -112,6 +329,7 @@ public final class JvmBytecodeEditor {
     public synchronized JvmBytecodePatchResult editMethod(String className, String methodName,
             String descriptor, Consumer<MethodNode> editor) {
         if (editor == null) throw new IllegalArgumentException("editor must not be null");
+        requireNoStaged(className);
         byte[] original = jvmti.getClassBytes(className);
         ClassReader reader = new ClassReader(original);
         ClassNode type = new ClassNode();
@@ -126,6 +344,7 @@ public final class JvmBytecodeEditor {
         remember(undo, className, new HistoryEntry(original,
                 generated.patchedBytes(), generated.relocations()));
         deque(redo, className).clear();
+        revision++;
         return installed(generated);
     }
 
@@ -154,22 +373,27 @@ public final class JvmBytecodeEditor {
     public synchronized boolean canRedo(String className) { return !deque(redo, className).isEmpty(); }
 
     public synchronized void undo(String className) {
+        requireNoStaged(className);
         HistoryEntry entry = deque(undo, className).pollFirst();
         if (entry == null) throw new IllegalStateException("No bytecode edit to undo for " + className);
         try { jvmti.redefineClass(className, entry.previous, inverse(entry.forward)); }
         catch (RuntimeException failure) { deque(undo, className).addFirst(entry); throw failure; }
         remember(redo, className, entry);
+        revision++;
     }
 
     public synchronized void redo(String className) {
+        requireNoStaged(className);
         HistoryEntry entry = deque(redo, className).pollFirst();
         if (entry == null) throw new IllegalStateException("No bytecode edit to redo for " + className);
         try { jvmti.redefineClass(className, entry.next, entry.forward); }
         catch (RuntimeException failure) { deque(redo, className).addFirst(entry); throw failure; }
         remember(undo, className, entry);
+        revision++;
     }
 
-    private JvmBytecodePatchResult rewrite(byte[] original, JvmBytecodePatch patch, boolean installed) {
+    private JvmBytecodePatchResult rewrite(byte[] original, JvmBytecodePatch patch,
+            boolean installed, boolean computeFrames) {
         ClassReader reader = new ClassReader(original);
         ClassNode type = new ClassNode();
         reader.accept(type, ClassReader.EXPAND_FRAMES);
@@ -192,9 +416,10 @@ public final class JvmBytecodeEditor {
             apply(context, operation);
             changedMethods.add(operation.methodName() + operation.descriptor());
         }
+        for (RewriteContext context : contexts.values()) sanitizeExceptionHandlers(context.method);
         return emit(patch.className(), original, reader, type, patch.operations().size(),
                 new ArrayList<String>(changedMethods),
-                new ArrayList<RewriteContext>(contexts.values()), installed);
+                new ArrayList<RewriteContext>(contexts.values()), installed, computeFrames);
     }
 
     private void apply(RewriteContext context, JvmBytecodePatch.Operation operation) {
@@ -250,6 +475,34 @@ public final class JvmBytecodeEditor {
                 method.instructions.remove(instruction);
             }
             break;
+        case ADD_EXCEPTION_HANDLER: {
+            String[] specification = operation.assembly().split("\\|", 2);
+            if (specification.length != 2) throw new IllegalArgumentException(
+                    "Invalid exception-handler specification: " + operation.assembly());
+            final int handlerBci;
+            try { handlerBci = Integer.decode(specification[0]).intValue(); }
+            catch (NumberFormatException failure) { throw new IllegalArgumentException(
+                    "Invalid exception handler BCI: " + specification[0], failure); }
+            LabelNode start = context.labelAt(operation.fromBci(), "try start");
+            LabelNode end = context.labelAt(operation.toBci(), "try end (exclusive)");
+            LabelNode handler = context.labelAt(handlerBci, "handler");
+            String type = specification[1].trim();
+            if (type.isEmpty() || "*".equals(type) || "any".equalsIgnoreCase(type)
+                    || "finally".equalsIgnoreCase(type)) type = null;
+            else type = type.replace('.', '/');
+            method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, type));
+            break;
+        }
+        case DELETE_EXCEPTION_HANDLER: {
+            int index = operation.fromBci();
+            if (index < 0 || index >= method.tryCatchBlocks.size()) {
+                throw new IllegalArgumentException("Exception handler index " + index
+                        + " is outside 0.." + Math.max(-1, method.tryCatchBlocks.size() - 1)
+                        + " for " + method.name + method.desc);
+            }
+            method.tryCatchBlocks.remove(index);
+            break;
+        }
         default:
             throw new IllegalArgumentException("Unsupported patch operation " + operation.kind());
         }
@@ -258,20 +511,56 @@ public final class JvmBytecodeEditor {
     private JvmBytecodePatchResult emit(String className, byte[] original, ClassReader reader,
             ClassNode type, int operationCount, List<String> changedMethods,
             List<RewriteContext> contexts, boolean installed) {
+        return emit(className, original, reader, type, operationCount, changedMethods,
+                contexts, installed, true);
+    }
+
+    private JvmBytecodePatchResult emit(String className, byte[] original, ClassReader reader,
+            ClassNode type, int operationCount, List<String> changedMethods,
+            List<RewriteContext> contexts, boolean installed, boolean computeFrames) {
         TargetClassWriter writer = new TargetClassWriter(reader,
-                ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS, jni);
-        type.accept(writer);
+                computeFrames ? ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS : 0, jni);
+        try { type.accept(writer); }
+        catch (RuntimeException failure) {
+            throw bytecodeFailure(className, changedMethods, failure);
+        }
         byte[] patched = writer.toByteArray();
         // A second parse validates bounds and provides actual post-write BCI values.
-        ClassFileView output = new JvmClassFileParser().parse(patched);
+        final ClassFileView output;
+        try { output = new JvmClassFileParser().parse(patched); }
+        catch (RuntimeException failure) {
+            throw bytecodeFailure(className, changedMethods, failure);
+        }
         Map<String, Map<Long, Long>> relocations = new LinkedHashMap<String, Map<Long, Long>>();
-        for (RewriteContext context : contexts) {
-            ClassFileMethod outputMethod = output.method(context.method.name, context.method.desc);
-            relocations.put(JvmBytecodePatchResult.methodKey(context.method.name, context.method.desc),
-                    context.relocations(outputMethod.instructions()));
+        try {
+            for (RewriteContext context : contexts) {
+                ClassFileMethod outputMethod = output.method(context.method.name, context.method.desc);
+                relocations.put(JvmBytecodePatchResult.methodKey(context.method.name, context.method.desc),
+                        context.relocations(outputMethod.instructions()));
+            }
+        } catch (RuntimeException failure) {
+            throw bytecodeFailure(className, changedMethods, failure);
         }
         return new JvmBytecodePatchResult(className, original, patched, operationCount,
                 changedMethods, relocations, installed);
+    }
+
+    private byte[] finalizeFrames(String className, byte[] provisional) {
+        try {
+            ClassReader reader = new ClassReader(provisional);
+            ClassNode type = new ClassNode();
+            // Provisional edits deliberately retain stale frames. Drop them before the
+            // one final verifier-grade frame/max calculation.
+            reader.accept(type, ClassReader.SKIP_FRAMES);
+            TargetClassWriter writer = new TargetClassWriter(reader,
+                    ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS, jni);
+            type.accept(writer);
+            byte[] result = writer.toByteArray();
+            new JvmClassFileParser().parse(result);
+            return result;
+        } catch (RuntimeException failure) {
+            throw bytecodeFailure(className, Collections.singletonList("flush"), failure);
+        }
     }
 
     private static JvmBytecodePatchResult installed(JvmBytecodePatchResult value) {
@@ -297,6 +586,28 @@ public final class JvmBytecodeEditor {
         if (result.isEmpty()) throw new IllegalArgumentException(
                 "Method has no normal return instructions: " + method.name + method.desc);
         return result;
+    }
+
+    /** Keeps handler labels attached and removes protected ranges made empty by deletion. */
+    private static void sanitizeExceptionHandlers(MethodNode method) {
+        List<TryCatchBlockNode> valid = new ArrayList<TryCatchBlockNode>();
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            int start = method.instructions.indexOf(block.start);
+            int end = method.instructions.indexOf(block.end);
+            int handler = method.instructions.indexOf(block.handler);
+            if (start < 0 || end < 0 || handler < 0 || start >= end) continue;
+            boolean protectedInstruction = false;
+            for (AbstractInsnNode value = block.start.getNext(); value != null && value != block.end;
+                    value = value.getNext()) {
+                if (value.getOpcode() >= 0) { protectedInstruction = true; break; }
+            }
+            if (!protectedInstruction) continue;
+            valid.add(block);
+        }
+        if (valid.size() != method.tryCatchBlocks.size()) {
+            method.tryCatchBlocks.clear();
+            method.tryCatchBlocks.addAll(valid);
+        }
     }
 
     private static void requireAttached(MethodNode method, AbstractInsnNode node,
@@ -342,6 +653,104 @@ public final class JvmBytecodeEditor {
         return result;
     }
 
+    private static Map<String, Map<Long, Long>> compose(
+            Map<String, Map<Long, Long>> first,
+            Map<String, Map<Long, Long>> second) {
+        Map<String, Map<Long, Long>> result =
+                new LinkedHashMap<String, Map<Long, Long>>();
+        Set<String> methods = new LinkedHashSet<String>();
+        methods.addAll(first.keySet());
+        methods.addAll(second.keySet());
+        for (String method : methods) {
+            Map<Long, Long> left = first.get(method);
+            Map<Long, Long> right = second.get(method);
+            Map<Long, Long> values = new LinkedHashMap<Long, Long>();
+            if (left == null) {
+                if (right != null) values.putAll(right);
+            } else if (right == null) values.putAll(left);
+            else {
+                for (Map.Entry<Long, Long> value : left.entrySet()) {
+                    Long target = right.get(value.getValue());
+                    values.put(value.getKey(), target == null ? value.getValue() : target);
+                }
+            }
+            result.put(method, values);
+        }
+        return result;
+    }
+
+    private static Map<String, Map<Long, Long>> relocateBetween(byte[] before, byte[] after,
+            Collection<String> changedMethods) {
+        ClassFileView left = new JvmClassFileParser().parse(before);
+        ClassFileView right = new JvmClassFileParser().parse(after);
+        Map<String, Map<Long, Long>> result =
+                new LinkedHashMap<String, Map<Long, Long>>();
+        for (ClassFileMethod leftMethod : left.methods()) {
+            String display = leftMethod.name() + leftMethod.descriptor();
+            if (!changedMethods.contains(display)) continue;
+            ClassFileMethod rightMethod = right.method(leftMethod.name(), leftMethod.descriptor());
+            List<BytecodeInstruction> leftCode = leftMethod.instructions();
+            List<BytecodeInstruction> rightCode = rightMethod.instructions();
+            Map<Long, Long> method = new LinkedHashMap<Long, Long>();
+            int count = Math.min(leftCode.size(), rightCode.size());
+            for (int index = 0; index < count; index++) {
+                method.put(Long.valueOf(leftCode.get(index).offset()),
+                        Long.valueOf(rightCode.get(index).offset()));
+            }
+            result.put(JvmBytecodePatchResult.methodKey(
+                    leftMethod.name(), leftMethod.descriptor()), method);
+        }
+        return result;
+    }
+
+    private static IllegalArgumentException bytecodeFailure(String className,
+            Collection<String> methods, RuntimeException failure) {
+        Throwable root = failure;
+        while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+        String message = root.getMessage();
+        if (message == null || message.trim().isEmpty()) message = root.getClass().getSimpleName();
+        if (message.contains("Index -1") || message.contains("Index -2")
+                || message.contains("out of bounds")) {
+            message = "the provisional operand stack/control flow is incomplete; stage the "
+                    + "remaining edits and flush only after the method is verifier-valid (ASM: "
+                    + message + ")";
+        }
+        return new IllegalArgumentException("Unable to emit bytecode for " + className + " "
+                + methods + ": " + message, failure);
+    }
+
+    private static String normalize(String className) {
+        if (className == null || className.trim().isEmpty()) {
+            throw new IllegalArgumentException("className must not be empty");
+        }
+        return className.trim().replace('/', '.');
+    }
+
+    private void requireNoStaged(String className) {
+        String normalized = normalize(className);
+        if (staged.containsKey(normalized)) throw new IllegalStateException(
+                "Class " + normalized + " has staged bytecode edits; flush or discard them "
+                        + "before using an immediate apply/undo operation");
+    }
+
+    private static final class StagedClass {
+        private final byte[] original;
+        private byte[] current;
+        private int operationCount;
+        private final Set<String> changedMethods = new LinkedHashSet<String>();
+        private Map<String, Map<Long, Long>> forward;
+
+        private StagedClass(byte[] original, byte[] current, int operationCount,
+                Collection<String> changedMethods,
+                Map<String, Map<Long, Long>> forward) {
+            this.original = original.clone();
+            this.current = current.clone();
+            this.operationCount = operationCount;
+            this.changedMethods.addAll(changedMethods);
+            this.forward = new LinkedHashMap<String, Map<Long, Long>>(forward);
+        }
+    }
+
     private static final class HistoryEntry {
         private final byte[] previous;
         private final byte[] next;
@@ -378,6 +787,17 @@ public final class JvmBytecodeEditor {
                 originalByBci.put(Integer.valueOf(bci), instruction);
                 labels.put("@" + bci, ensureLabelBefore(method.instructions, instruction));
             }
+            if (!decoded.isEmpty()) {
+                int end = codeEnd(decoded);
+                AbstractInsnNode last = method.instructions.getLast();
+                LabelNode endLabel;
+                if (last instanceof LabelNode) endLabel = (LabelNode) last;
+                else {
+                    endLabel = new LabelNode();
+                    method.instructions.add(endLabel);
+                }
+                labels.put("@" + end, endLabel);
+            }
         }
 
         private AbstractInsnNode anchor(int bci) {
@@ -387,6 +807,16 @@ public final class JvmBytecodeEditor {
             if (method.instructions.indexOf(result) < 0) {
                 throw new IllegalArgumentException("BCI " + bci
                         + " anchor was removed by an earlier operation in "
+                        + method.name + method.desc);
+            }
+            return result;
+        }
+
+        private LabelNode labelAt(int bci, String role) {
+            LabelNode result = labels.get("@" + bci);
+            if (result == null || method.instructions.indexOf(result) < 0) {
+                throw new IllegalArgumentException(role + " BCI " + bci
+                        + " is not an attached instruction boundary in "
                         + method.name + method.desc);
             }
             return result;
@@ -423,6 +853,21 @@ public final class JvmBytecodeEditor {
             if (instruction.getOpcode() >= 0) result.add(instruction);
         }
         return result;
+    }
+
+    private static int bciAtOrAfter(AbstractInsnNode node,
+            Map<AbstractInsnNode, Integer> bcis, int codeEnd) {
+        for (AbstractInsnNode current = node; current != null; current = current.getNext()) {
+            Integer value = bcis.get(current);
+            if (value != null) return value.intValue();
+        }
+        return codeEnd;
+    }
+
+    private static int codeEnd(List<BytecodeInstruction> instructions) {
+        if (instructions.isEmpty()) return 0;
+        BytecodeInstruction last = instructions.get(instructions.size() - 1);
+        return last.offset() + last.bytes().length;
     }
 
     private static LabelNode ensureLabelBefore(InsnList instructions, AbstractInsnNode instruction) {

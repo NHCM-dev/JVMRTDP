@@ -1,6 +1,8 @@
 package nhcm.jvmrtdp.controllerside;
 
 import nhcm.jvmrtdp.api.JvmInstrumentation;
+import nhcm.jvmrtdp.api.hook.JvmStringHookManager;
+import nhcm.jvmrtdp.api.reference.JvmReferenceManager;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
 import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.handles.ServerHandle;
@@ -20,6 +22,8 @@ public class TargetSession implements AutoCloseable {
     private final RemoteJNIEnv jni;
     private final RemoteJVMTIEnv jvmti;
     private final JvmInstrumentation instrumentation;
+    private final JvmReferenceManager references;
+    private final JvmStringHookManager stringHooks;
     private final PrintStream baseOutput;
     private PrintStream output;
     private PrintStream error;
@@ -36,6 +40,8 @@ public class TargetSession implements AutoCloseable {
         this.jni = server.javaVM().jniEnv();
         this.jvmti = server.javaVM().jvmtiEnv();
         this.instrumentation = new JvmInstrumentation(jvmti);
+        this.references = new JvmReferenceManager(jni);
+        this.stringHooks = new JvmStringHookManager(jni, jvmti);
         this.baseOutput = Objects.requireNonNull(output, "output");
         this.output = this.baseOutput;
         this.error = Objects.requireNonNull(error, "error");
@@ -59,6 +65,12 @@ public class TargetSession implements AutoCloseable {
 
     /** Shared instrumentation state used by CLI, TUI, and the Java Library facade. */
     public JvmInstrumentation instrumentation() { return instrumentation; }
+
+    /** Shared object/field reference registry used by CLI, TUI, and the Java API. */
+    public JvmReferenceManager references() { return references; }
+
+    /** Shared precise String watch/method-hook registry. */
+    public JvmStringHookManager stringHooks() { return stringHooks; }
 
     public RemoteClass findClass(String className) {
         return jni.findClass(className);
@@ -169,12 +181,20 @@ public class TargetSession implements AutoCloseable {
     @Override
     public void close() {
         try {
-            debugger.close();
+            stringHooks.close();
         } finally {
             try {
-                context.close();
+                references.close();
             } finally {
-                workspace.close();
+                try {
+                    debugger.close();
+                } finally {
+                    try {
+                        context.close();
+                    } finally {
+                        workspace.close();
+                    }
+                }
             }
         }
     }

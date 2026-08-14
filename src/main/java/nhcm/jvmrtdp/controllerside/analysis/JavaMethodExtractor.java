@@ -15,6 +15,13 @@ final class JavaMethodExtractor {
 
     static Extraction extractDetails(
             String source, String simpleClassName, String methodName, String descriptor) {
+        Extraction exact = extractDetails(source, simpleClassName, methodName, descriptor, true);
+        return exact == null
+                ? extractDetails(source, simpleClassName, methodName, descriptor, false) : exact;
+    }
+
+    private static Extraction extractDetails(String source, String simpleClassName,
+            String methodName, String descriptor, boolean strictParameterTypes) {
         List<String> parameterTypes = descriptorParameterTypes(descriptor);
         if (parameterTypes == null) return null;
         if ("<clinit>".equals(methodName)) return extractStaticInitializer(source);
@@ -30,7 +37,8 @@ final class JavaMethodExtractor {
             }
             int closeParen = matching(source, openParen, '(', ')');
             if (closeParen < 0 || !parametersMatch(
-                    source.substring(openParen + 1, closeParen), parameterTypes)) {
+                    source.substring(openParen + 1, closeParen), parameterTypes,
+                    strictParameterTypes)) {
                 search = openParen + 1;
                 continue;
             }
@@ -246,9 +254,10 @@ final class JavaMethodExtractor {
         return line + 1;
     }
 
-    private static boolean parametersMatch(String source, List<String> expected) {
+    private static boolean parametersMatch(String source, List<String> expected, boolean strict) {
         List<String> actual = splitParameters(source);
         if (actual.size() != expected.size()) return false;
+        if (!strict) return true;
         for (int index = 0; index < expected.size(); index++) {
             String sourceType = sourceParameterType(actual.get(index));
             String descriptorType = expected.get(index);
