@@ -183,6 +183,8 @@ session.stringHooks().breakAllocation("secret-created",
                 .contentGlob("*secret-token*")
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
+                .mode(JvmStringAllocationMode.FAST)
+                .oneShot()
                 .build());
 
 try (RemoteObject value = session.stringHooks().acquireValue("message-write")) {
@@ -194,8 +196,10 @@ session.stringHooks().trackValue("message-write", session.references(),
 
 字段 Hook 使用 JVMTI 字段访问/修改监视点，可选择所有实例或精确接收者。方法 Hook 使用托管 `METHOD_ENTRY`/`METHOD_EXIT` 事件断点。内置 CLI/TUI 会自动把 Hook 命中与共享调试器关联；自定义界面可将 `debuggerStates()` 传给 `observe(...)`。String 不可变，`replaceValue` 替换字段引用，而不是改写 String 内部数组。
 
-Allocation Hook 会在目标端组合 `VM_OBJECT_ALLOC` 与完成后的 `String.<init>`，按内容和创建栈
-过滤后才暂停。最近一次命中可读取、调用、加入引用或作为 Context 使用；String 本身不可变，
+Allocation Hook 默认使用低开销 `FAST`，临时在 `String.<init>` 构造器返回处加入轻量探针，
+并在进入 native/JVMTI 前先做内容预过滤；需要覆盖 VM/native 或已被 JIT intrinsic 化的 String 时才选 `COMPLETE`，它会开启
+高频全局分配事件。`oneShot`、`maximumHits`、`sampleEvery` 可限制停止频率，并在没有 armed Hook
+时关闭热路径。最近一次命中可读取、调用、加入引用或作为 Context 使用；String 本身不可变，
 要修改程序状态应替换拥有它的字段/local。引用与 Hook 会随 session 关闭而清理，并写入调试器
 JSON/JSONL 快照 schema v5。部署回调仍使用 `JvmtiEventHandler`/`JvmtiMethodEvent`；同步
 class-file transformer 仅适合需要返回字节码的场景，普通观察 Hook 应使用异步事件分发。

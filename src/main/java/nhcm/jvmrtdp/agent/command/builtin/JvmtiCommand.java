@@ -10,6 +10,7 @@ import nhcm.jvmrtdp.protocol.CommandReply;
 import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 import nhcm.jvmrtdp.protocol.TextWireCodec;
 import nhcm.jvmrtdp.remoteside.StringAllocationHookService;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationMode;
 
 import java.util.ArrayList;
 import java.util.Base64;
@@ -58,9 +59,11 @@ public class JvmtiCommand implements RemoteCommand {
             if ("clear".equals(action)) {
                 return success(Boolean.toString(StringAllocationHookService.remove(id)));
             }
-            if ("set".equals(action) && arguments.size() == 8) {
+            if ("set".equals(action) && arguments.size() == 11) {
                 StringAllocationHookService.set(id, arguments.get(3), arguments.get(4),
-                        arguments.get(5), arguments.get(6), Boolean.parseBoolean(arguments.get(7)));
+                        arguments.get(5), arguments.get(6), Boolean.parseBoolean(arguments.get(7)),
+                        JvmStringAllocationMode.parse(arguments.get(8)),
+                        Long.parseLong(arguments.get(9)), Integer.parseInt(arguments.get(10)));
                 return success("ok");
             }
             return invalid();

@@ -67,6 +67,9 @@ jmethodID gDispatchMethod = nullptr;
 jmethodID gTransformMethod = nullptr;
 jclass gObjectClass = nullptr;
 jclass gStringClass = nullptr;
+jclass gStringHookBridgeClass = nullptr;
+jmethodID gStringHookSetActiveMethod = nullptr;
+jmethodID gStringHookConfigureMethod = nullptr;
 
 struct BoxingType {
     const char* className;
@@ -115,6 +118,8 @@ std::atomic<bool> gStartupClassPrepareOwned{false};
 std::atomic<bool> gJavaMethodEntryDispatchEnabled{false};
 std::atomic<bool> gJavaMethodExitDispatchEnabled{false};
 std::atomic<bool> gJavaExceptionDispatchEnabled{false};
+std::atomic<bool> gJavaBreakpointDispatchEnabled{false};
+std::atomic<bool> gJavaVmObjectAllocDispatchEnabled{false};
 jmethodID gStartupMainMethod = nullptr;
 jlocation gStartupMainLocation = 0;
 jmethodID gStartupClinitMethod = nullptr;
@@ -168,12 +173,26 @@ struct StringAllocationHook {
     std::string creatorMethodPattern;
     std::string creatorDescriptorPattern;
     bool caseSensitive = true;
+    bool complete = false;
+    std::uint64_t maximumHits = 0;
+    std::uint64_t sampleEvery = 1;
+    std::uint64_t seenMatches = 0;
+    std::uint64_t emittedHits = 0;
 };
 
 std::mutex gStringAllocationHookMutex;
 std::vector<StringAllocationHook> gStringAllocationHooks;
-std::vector<jweak> gMatchedStringAllocations;
+struct MatchedStringAllocation {
+    jweak reference = nullptr;
+    jint identityHash = 0;
+};
+std::vector<MatchedStringAllocation> gMatchedStringAllocations;
 std::atomic<std::size_t> gStringAllocationHookCount{0};
+std::atomic<std::size_t> gCompleteStringAllocationHookCount{0};
+std::atomic<std::size_t> gArmedStringAllocationHookCount{0};
+std::atomic<std::size_t> gArmedCompleteStringAllocationHookCount{0};
+char gJvmrtdpServiceThreadMarker;
+char gJvmrtdpApplicationThreadMarker;
 
 // Step-out is completed at the first bytecode in the caller. A FramePop event
 // alone fires while the returning frame is still visible and is therefore too early.
@@ -382,6 +401,8 @@ jobjectArray NewStringArray(JNIEnv* env, const std::vector<std::string>& values)
 bool InitializeJavaBridge(JavaVM* vm, JNIEnv* env, bool preloadedAgent, jobject classLoader = nullptr);
 void ReleaseCallbackTypes(JNIEnv* env);
 void InstallPendingDebugRegistrations(JNIEnv* env, jclass klass);
+void SetStringHookBridgeActive(JNIEnv* env, bool active);
+void ConfigureStringHookBridge(JNIEnv* env);
 
 std::string JStringToUtf8(JNIEnv* env, jstring value) {
     if (value == nullptr) return {};
@@ -399,6 +420,48 @@ void ThrowJava(JNIEnv* env, const char* className, const std::string& message) {
     if (exceptionClass == nullptr) return;
     env->ThrowNew(exceptionClass, message.c_str());
     env->DeleteLocalRef(exceptionClass);
+}
+
+void SetStringHookBridgeActive(JNIEnv* env, bool active) {
+    if (env == nullptr || gStringHookBridgeClass == nullptr
+            || gStringHookSetActiveMethod == nullptr) return;
+    env->CallStaticVoidMethod(gStringHookBridgeClass, gStringHookSetActiveMethod,
+        active ? JNI_TRUE : JNI_FALSE);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+void ConfigureStringHookBridge(JNIEnv* env) {
+    if (env == nullptr || gStringHookBridgeClass == nullptr
+            || gStringHookConfigureMethod == nullptr) return;
+    std::vector<std::string> patterns;
+    std::vector<jboolean> sensitivity;
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        patterns.reserve(gStringAllocationHooks.size());
+        sensitivity.reserve(gStringAllocationHooks.size());
+        for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+            patterns.push_back(hook.contentPattern);
+            sensitivity.push_back(hook.caseSensitive ? JNI_TRUE : JNI_FALSE);
+        }
+    }
+    jobjectArray javaPatterns = NewStringArray(env, patterns);
+    jbooleanArray javaSensitivity = env->NewBooleanArray(
+        static_cast<jsize>(sensitivity.size()));
+    if (javaPatterns == nullptr || javaSensitivity == nullptr) {
+        if (javaPatterns != nullptr) env->DeleteLocalRef(javaPatterns);
+        if (javaSensitivity != nullptr) env->DeleteLocalRef(javaSensitivity);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
+    if (!sensitivity.empty()) env->SetBooleanArrayRegion(javaSensitivity, 0,
+        static_cast<jsize>(sensitivity.size()), sensitivity.data());
+    env->CallStaticVoidMethod(gStringHookBridgeClass, gStringHookConfigureMethod,
+        javaPatterns, javaSensitivity,
+        gArmedStringAllocationHookCount.load() == 0 ? JNI_FALSE : JNI_TRUE);
+    env->DeleteLocalRef(javaPatterns);
+    env->DeleteLocalRef(javaSensitivity);
+    if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
 std::string ConsumeJavaException(JNIEnv* env) {
@@ -954,15 +1017,29 @@ bool IsJvmrtdpServiceThread(JNIEnv* env, jthread thread) {
     return name.rfind("jvmrtdp", 0) == 0;
 }
 
-void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation location,
+bool IsJvmrtdpServiceThreadCached(JNIEnv* env, jthread thread) {
+    if (env == nullptr || thread == nullptr || gJvmti == nullptr) return false;
+    void* marker = nullptr;
+    if (gJvmti->GetThreadLocalStorage(thread, &marker) == JVMTI_ERROR_NONE) {
+        if (marker == &gJvmrtdpServiceThreadMarker) return true;
+        if (marker == &gJvmrtdpApplicationThreadMarker) return false;
+    }
+    const bool service = IsJvmrtdpServiceThread(env, thread);
+    gJvmti->SetThreadLocalStorage(thread, service
+        ? static_cast<void*>(&gJvmrtdpServiceThreadMarker)
+        : static_cast<void*>(&gJvmrtdpApplicationThreadMarker));
+    return service;
+}
+
+bool DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation location,
         const char* reason, jobject returnValue = nullptr, const char* returnState = nullptr) {
-    if (env == nullptr || thread == nullptr || method == nullptr) return;
+    if (env == nullptr || thread == nullptr || method == nullptr) return false;
     // Breakpoints in java.lang.String/collections can also be reached by the agent's
     // protocol implementation. Never stop the only threads capable of resuming a target.
-    if (IsJvmrtdpServiceThread(env, thread)) return;
+    if (IsJvmrtdpServiceThread(env, thread)) return false;
     const MethodDetails details = DescribeMethod(env, method);
     jobject threadReference = env->NewGlobalRef(thread);
-    if (threadReference == nullptr) return;
+    if (threadReference == nullptr) return false;
     std::shared_ptr<DebuggerStop> stop = std::make_shared<DebuggerStop>();
     stop->thread = threadReference;
     stop->returnValue = returnValue == nullptr ? nullptr : env->NewGlobalRef(returnValue);
@@ -978,7 +1055,7 @@ void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation locat
         lock.unlock();
         if (stop->returnValue != nullptr) env->DeleteGlobalRef(stop->returnValue);
         env->DeleteGlobalRef(threadReference);
-        return;
+        return false;
     }
     stop->sequence = ++gDebuggerSequence;
     gDebuggerStops.push_back(stop);
@@ -988,6 +1065,7 @@ void DebuggerTrap(JNIEnv* env, jthread thread, jmethodID method, jlocation locat
     lock.unlock();
     if (stop->returnValue != nullptr) env->DeleteGlobalRef(stop->returnValue);
     env->DeleteGlobalRef(threadReference);
+    return true;
 }
 
 std::string FoldAscii(std::string value) {
@@ -1004,16 +1082,22 @@ bool StringAllocationPatternMatches(const std::string& pattern,
 }
 
 bool WasMatchedStringAllocation(JNIEnv* env, jobject value) {
+    jint identityHash = 0;
+    if (gJvmti->GetObjectHashCode(value, &identityHash) != JVMTI_ERROR_NONE) return false;
     std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
     bool matched = false;
     for (auto iterator = gMatchedStringAllocations.begin();
             iterator != gMatchedStringAllocations.end();) {
-        if (env->IsSameObject(*iterator, nullptr) == JNI_TRUE) {
-            env->DeleteWeakGlobalRef(*iterator);
+        if (iterator->identityHash != identityHash) {
+            ++iterator;
+            continue;
+        }
+        if (env->IsSameObject(iterator->reference, nullptr) == JNI_TRUE) {
+            env->DeleteWeakGlobalRef(iterator->reference);
             iterator = gMatchedStringAllocations.erase(iterator);
             continue;
         }
-        if (env->IsSameObject(*iterator, value) == JNI_TRUE) matched = true;
+        if (env->IsSameObject(iterator->reference, value) == JNI_TRUE) matched = true;
         ++iterator;
     }
     return matched;
@@ -1022,8 +1106,24 @@ bool WasMatchedStringAllocation(JNIEnv* env, jobject value) {
 void RememberMatchedStringAllocation(JNIEnv* env, jobject value) {
     jweak reference = env->NewWeakGlobalRef(value);
     if (reference == nullptr) return;
+    jint identityHash = 0;
+    if (gJvmti->GetObjectHashCode(value, &identityHash) != JVMTI_ERROR_NONE) {
+        env->DeleteWeakGlobalRef(reference);
+        return;
+    }
     std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
-    gMatchedStringAllocations.push_back(reference);
+    // Constructor chaining needs only a short de-duplication window. Keep this bounded so a
+    // long-running unlimited hook never turns each new String into an O(total hits) scan.
+    constexpr std::size_t kMaximumRememberedStrings = 256;
+    if (gMatchedStringAllocations.size() >= kMaximumRememberedStrings) {
+        const std::size_t releaseCount = kMaximumRememberedStrings / 4;
+        for (std::size_t index = 0; index < releaseCount; ++index) {
+            env->DeleteWeakGlobalRef(gMatchedStringAllocations[index].reference);
+        }
+        gMatchedStringAllocations.erase(gMatchedStringAllocations.begin(),
+            gMatchedStringAllocations.begin() + releaseCount);
+    }
+    gMatchedStringAllocations.push_back({reference, identityHash});
 }
 
 bool AllocatedByNewInstruction(jmethodID method, jlocation location) {
@@ -1037,55 +1137,196 @@ bool AllocatedByNewInstruction(jmethodID method, jlocation location) {
     return result;
 }
 
-bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringValue) {
+// Returns -1 when a creator-stack/complete-mode evaluation is required, 0 when no hook emits,
+// and 1 when matchedIds should stop. Content-only fast hooks are resolved before the expensive
+// JVMTI current-thread and frame calls, which is the usual interactive String-search path.
+int MatchFastStringHooksWithoutStack(JNIEnv* env, jstring value,
+        std::vector<std::string>& matchedIds) {
+    if (gCompleteStringAllocationHookCount.load() != 0) return -1;
+    bool needsContent = false;
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+            if (hook.creatorClassPattern != "*" || hook.creatorMethodPattern != "*"
+                    || hook.creatorDescriptorPattern != "*") return -1;
+            if (hook.contentPattern != "*") needsContent = true;
+        }
+    }
+    std::string content;
+    if (needsContent) {
+        const char* characters = env->GetStringUTFChars(value, nullptr);
+        if (characters == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return 0;
+        }
+        const jsize contentLength = env->GetStringUTFLength(value);
+        content.assign(characters, static_cast<std::size_t>(contentLength));
+        env->ReleaseStringUTFChars(value, characters);
+    }
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        // A controller may replace a hook while the content is being read. Fall back rather
+        // than evaluating a newly-added creator constraint without its stack.
+        for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+            if (hook.creatorClassPattern != "*" || hook.creatorMethodPattern != "*"
+                    || hook.creatorDescriptorPattern != "*") return -1;
+        }
+        for (StringAllocationHook& hook : gStringAllocationHooks) {
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+            if (hook.contentPattern != "*" && !StringAllocationPatternMatches(
+                    hook.contentPattern, content, hook.caseSensitive)) continue;
+            ++hook.seenMatches;
+            if (hook.sampleEvery > 1 && hook.seenMatches % hook.sampleEvery != 0) continue;
+            ++hook.emittedHits;
+            matchedIds.push_back(hook.id);
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) {
+                gArmedStringAllocationHookCount.fetch_sub(1);
+            }
+        }
+    }
+    if (gArmedStringAllocationHookCount.load() == 0) {
+        SetStringHookBridgeActive(env, false);
+    }
+    return matchedIds.empty() ? 0 : 1;
+}
+
+void RollBackFastStringHookEmission(JNIEnv* env, const std::vector<std::string>& matchedIds) {
+    if (matchedIds.empty()) return;
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        for (StringAllocationHook& hook : gStringAllocationHooks) {
+            if (std::find(matchedIds.begin(), matchedIds.end(), hook.id) == matchedIds.end()
+                    || hook.emittedHits == 0) continue;
+            const bool wasExhausted = hook.maximumHits != 0
+                && hook.emittedHits >= hook.maximumHits;
+            --hook.emittedHits;
+            if (wasExhausted) gArmedStringAllocationHookCount.fetch_add(1);
+        }
+    }
+    SetStringHookBridgeActive(env, gArmedStringAllocationHookCount.load() != 0);
+}
+
+bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringValue,
+        bool completeOnly = false, jmethodID currentMethod = nullptr,
+        jlocation currentLocation = 0, jint stackStartDepth = 0) {
     if (env == nullptr || thread == nullptr || stringValue == nullptr
-            || gStringAllocationHookCount.load() == 0 || tMatchingStringAllocation) return false;
-    if (WasMatchedStringAllocation(env, stringValue)) return false;
+            || gArmedStringAllocationHookCount.load() == 0 || tMatchingStringAllocation) return false;
+    if (IsJvmrtdpServiceThreadCached(env, thread)) return false;
+    const bool deduplicate = gCompleteStringAllocationHookCount.load() != 0;
+    if (deduplicate && WasMatchedStringAllocation(env, stringValue)) return false;
     ThreadFlagGuard matchingGuard(tMatchingStringAllocation);
-    const char* characters = env->GetStringUTFChars(static_cast<jstring>(stringValue), nullptr);
-    if (characters == nullptr) {
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        return false;
-    }
-    const jsize contentLength = env->GetStringUTFLength(static_cast<jstring>(stringValue));
-    const std::string content(characters, static_cast<std::size_t>(contentLength));
-    env->ReleaseStringUTFChars(static_cast<jstring>(stringValue), characters);
-
-    constexpr jint kMaximumFrames = 64;
-    jvmtiFrameInfo frames[kMaximumFrames]{};
-    jint frameCount = 0;
-    if (gJvmti->GetStackTrace(thread, 0, kMaximumFrames, frames, &frameCount)
-            != JVMTI_ERROR_NONE || frameCount == 0) {
-        return false;
-    }
-    std::vector<MethodDetails> details;
-    details.reserve(static_cast<std::size_t>(frameCount));
-    for (jint index = 0; index < frameCount; ++index) {
-        details.push_back(DescribeMethod(env, frames[index].method));
-    }
-
     std::vector<StringAllocationHook> hooks;
     {
         std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
         hooks = gStringAllocationHooks;
     }
-    std::vector<std::string> matchedIds;
+    bool needsContent = false;
     for (const StringAllocationHook& hook : hooks) {
-        if (!StringAllocationPatternMatches(
+        if (completeOnly && !hook.complete) continue;
+        if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+        if (hook.contentPattern != "*") { needsContent = true; break; }
+    }
+    std::string content;
+    if (needsContent) {
+        const char* characters = env->GetStringUTFChars(
+            static_cast<jstring>(stringValue), nullptr);
+        if (characters == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return false;
+        }
+        const jsize contentLength = env->GetStringUTFLength(static_cast<jstring>(stringValue));
+        content.assign(characters, static_cast<std::size_t>(contentLength));
+        env->ReleaseStringUTFChars(static_cast<jstring>(stringValue), characters);
+    }
+    std::vector<StringAllocationHook> contentMatches;
+    bool needsCreatorStack = false;
+    for (const StringAllocationHook& hook : hooks) {
+        if (completeOnly && !hook.complete) continue;
+        if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+        if (hook.contentPattern != "*" && !StringAllocationPatternMatches(
                 hook.contentPattern, content, hook.caseSensitive)) continue;
-        bool creatorMatched = false;
-        for (const MethodDetails& frame : details) {
-            if (StringAllocationPatternMatches(hook.creatorClassPattern,
-                        frame.className, hook.caseSensitive)
-                    && StringAllocationPatternMatches(hook.creatorMethodPattern,
-                        frame.name, hook.caseSensitive)
-                    && StringAllocationPatternMatches(hook.creatorDescriptorPattern,
-                        frame.descriptor, hook.caseSensitive)) {
-                creatorMatched = true;
-                break;
+        contentMatches.push_back(hook);
+        if (hook.creatorClassPattern != "*" || hook.creatorMethodPattern != "*"
+                || hook.creatorDescriptorPattern != "*") needsCreatorStack = true;
+    }
+    if (contentMatches.empty()) return false;
+
+    constexpr jint kMaximumFrames = 64;
+    jvmtiFrameInfo frames[kMaximumFrames]{};
+    jint frameCount = 0;
+    if (needsCreatorStack) {
+        if (gJvmti->GetStackTrace(thread, stackStartDepth,
+                kMaximumFrames, frames, &frameCount)
+                != JVMTI_ERROR_NONE || frameCount == 0) return false;
+    } else {
+        frames[0].method = currentMethod;
+        frames[0].location = currentLocation;
+        if (frames[0].method == nullptr
+                && gJvmti->GetFrameLocation(thread, 0, &frames[0].method,
+                    &frames[0].location) != JVMTI_ERROR_NONE) return false;
+        frameCount = frames[0].method == nullptr ? 0 : 1;
+        if (frameCount == 0) return false;
+    }
+    std::vector<MethodDetails> details;
+    if (needsCreatorStack) {
+        details.reserve(static_cast<std::size_t>(frameCount));
+        for (jint index = 0; index < frameCount; ++index) {
+            details.push_back(DescribeMethod(env, frames[index].method));
+        }
+    }
+
+    std::vector<std::string> candidates;
+    for (const StringAllocationHook& hook : contentMatches) {
+        bool creatorMatched = !needsCreatorStack
+            || (hook.creatorClassPattern == "*" && hook.creatorMethodPattern == "*"
+                && hook.creatorDescriptorPattern == "*");
+        if (!creatorMatched) {
+            for (const MethodDetails& frame : details) {
+                if (StringAllocationPatternMatches(hook.creatorClassPattern,
+                            frame.className, hook.caseSensitive)
+                        && StringAllocationPatternMatches(hook.creatorMethodPattern,
+                            frame.name, hook.caseSensitive)
+                        && StringAllocationPatternMatches(hook.creatorDescriptorPattern,
+                            frame.descriptor, hook.caseSensitive)) {
+                    creatorMatched = true;
+                    break;
+                }
             }
         }
-        if (creatorMatched) matchedIds.push_back(hook.id);
+        if (creatorMatched) candidates.push_back(hook.id);
+    }
+    if (candidates.empty()) return false;
+    if (deduplicate) RememberMatchedStringAllocation(env, stringValue);
+
+    std::vector<std::string> matchedIds;
+    bool disableCompleteAllocationEvent = false;
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        for (StringAllocationHook& hook : gStringAllocationHooks) {
+            if (std::find(candidates.begin(), candidates.end(), hook.id) == candidates.end()) continue;
+            ++hook.seenMatches;
+            if (hook.sampleEvery > 1 && hook.seenMatches % hook.sampleEvery != 0) continue;
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) continue;
+            ++hook.emittedHits;
+            matchedIds.push_back(hook.id);
+            if (hook.maximumHits != 0 && hook.emittedHits >= hook.maximumHits) {
+                gArmedStringAllocationHookCount.fetch_sub(1);
+                if (hook.complete
+                        && gArmedCompleteStringAllocationHookCount.fetch_sub(1) == 1
+                        && !gJavaVmObjectAllocDispatchEnabled.load()) {
+                    disableCompleteAllocationEvent = true;
+                }
+            }
+        }
+    }
+    if (disableCompleteAllocationEvent) {
+        gJvmti->SetEventNotificationMode(JVMTI_DISABLE,
+            JVMTI_EVENT_VM_OBJECT_ALLOC, nullptr);
+    }
+    if (gArmedStringAllocationHookCount.load() == 0) {
+        SetStringHookBridgeActive(env, false);
     }
     if (matchedIds.empty()) {
         return false;
@@ -1096,34 +1337,41 @@ bool TrapMatchingStringAllocation(JNIEnv* env, jthread thread, jobject stringVal
         if (index != 0) reason.push_back(',');
         reason += matchedIds[index];
     }
-    RememberMatchedStringAllocation(env, stringValue);
     DebuggerTrap(env, thread, frames[0].method, frames[0].location,
         reason.c_str(), stringValue, "allocation");
     return true;
 }
 
-bool TrapCompletedStringConstructor(JNIEnv* env, jthread thread, jmethodID method,
-        jboolean poppedByException) {
-    if (poppedByException == JNI_TRUE || gStringAllocationHookCount.load() == 0) return false;
-    jclass declaringClass = nullptr;
-    if (gJvmti->GetMethodDeclaringClass(method, &declaringClass) != JVMTI_ERROR_NONE
-            || declaringClass == nullptr) return false;
-    const bool stringMethod = gStringClass != nullptr
-        && env->IsSameObject(declaringClass, gStringClass) == JNI_TRUE;
-    env->DeleteLocalRef(declaringClass);
-    if (!stringMethod) return false;
-    char* methodName = nullptr;
-    const jvmtiError nameError = gJvmti->GetMethodName(method, &methodName, nullptr, nullptr);
-    const bool constructor = nameError == JVMTI_ERROR_NONE && methodName != nullptr
-        && std::strcmp(methodName, "<init>") == 0;
-    if (methodName != nullptr) gJvmti->Deallocate(reinterpret_cast<unsigned char*>(methodName));
-    if (!constructor) return false;
-    jobject receiver = nullptr;
-    if (gJvmti->GetLocalInstance(thread, 0, &receiver) != JVMTI_ERROR_NONE
-            || receiver == nullptr) return false;
-    const bool stopped = TrapMatchingStringAllocation(env, thread, receiver);
-    env->DeleteLocalRef(receiver);
-    return stopped;
+void JNICALL BootstrapStringObserved(JNIEnv* env, jclass, jstring value) {
+    if (env == nullptr || value == nullptr || gArmedStringAllocationHookCount.load() == 0
+            || tMatchingStringAllocation) return;
+    std::vector<std::string> fastMatches;
+    const int fastMatch = MatchFastStringHooksWithoutStack(env, value, fastMatches);
+    if (fastMatch == 0) return;
+    jthread thread = nullptr;
+    if (gJvmti->GetCurrentThread(&thread) != JVMTI_ERROR_NONE || thread == nullptr) return;
+    jmethodID method = nullptr;
+    jlocation location = 0;
+    // depth 0 is observed0 (native), depth 1 is the Java prefilter wrapper, and depth 2 is
+    // the terminal java.lang.String constructor containing the injected probe.
+    if (gJvmti->GetFrameLocation(thread, 2, &method, &location) != JVMTI_ERROR_NONE) {
+        method = nullptr;
+        location = 0;
+    }
+    if (fastMatch > 0) {
+        std::string reason = "string_alloc:";
+        for (std::size_t index = 0; index < fastMatches.size(); ++index) {
+            if (index != 0) reason.push_back(',');
+            reason += fastMatches[index];
+        }
+        if (!DebuggerTrap(env, thread, method, location,
+                reason.c_str(), value, "allocation")) {
+            RollBackFastStringHookEmission(env, fastMatches);
+        }
+    } else {
+        TrapMatchingStringAllocation(env, thread, value, false, method, location, 2);
+    }
+    env->DeleteLocalRef(thread);
 }
 
 void ConfigureStartupDebugger(const char* options) {
@@ -1645,7 +1893,9 @@ void JNICALL FramePop(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
 }
 
 void JNICALL Breakpoint(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method, jlocation location) {
-    DispatchEvent(env, "breakpoint", thread, nullptr, method, location, nullptr, 0);
+    if (gJavaBreakpointDispatchEnabled.load()) {
+        DispatchEvent(env, "breakpoint", thread, nullptr, method, location, nullptr, 0);
+    }
     const bool startupMain = gStartupBreakpointInstalled && method == gStartupMainMethod
         && location == gStartupMainLocation;
     const bool startupClinit = gStartupClinitBreakpointInstalled && method == gStartupClinitMethod
@@ -1719,15 +1969,7 @@ void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
     if (tInJavaCallback || tCapturingMethodEvent) return;
     const bool shouldStop = MatchesDebugMethodEvent(env, DebugEventKind::METHOD_EXIT, method);
     const bool dispatchEvent = gJavaMethodExitDispatchEnabled.load();
-    const bool allocationInterest = gStringAllocationHookCount.load() != 0
-        && poppedByException != JNI_TRUE;
-    if (!shouldStop && !dispatchEvent) {
-        if (!allocationInterest) return;
-        ThreadFlagGuard capturingGuard(tCapturingMethodEvent);
-        try { TrapCompletedStringConstructor(env, thread, method, poppedByException); }
-        catch (...) { gNativeDropped.fetch_add(1); }
-        return;
-    }
+    if (!shouldStop && !dispatchEvent) return;
     // Always suppress recursive method events caused by boxing the return value.
     ThreadFlagGuard capturingGuard(tCapturingMethodEvent);
     try {
@@ -1747,9 +1989,7 @@ void JNICALL MethodExit(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method
         DispatchMethodEvent(env, "method_exit", thread, method, poppedByException == JNI_TRUE,
             subject, bits, boxedReturn);
     }
-    const bool stringAllocationStop = TrapCompletedStringConstructor(
-        env, thread, method, poppedByException);
-    if (shouldStop && !stringAllocationStop) DebuggerTrap(env, thread, method, -1,
+    if (shouldStop) DebuggerTrap(env, thread, method, -1,
         poppedByException == JNI_TRUE ? "method_exit_exception" : "method_exit",
         boxedReturn, poppedByException == JNI_TRUE ? "exception"
             : returnKind == 'V' ? "void" : "value");
@@ -1794,9 +2034,11 @@ void JNICALL MonitorWaited(jvmtiEnv*, JNIEnv* env, jthread thread, jobject objec
 }
 
 void JNICALL VmObjectAlloc(jvmtiEnv*, JNIEnv* env, jthread thread, jobject object, jclass klass, jlong size) {
-    DispatchEvent(env, "vm_object_alloc", thread, klass, nullptr, 0, object, size);
-    if (gStringAllocationHookCount.load() == 0
-            || BinaryClassName(klass) != "java.lang.String") return;
+    if (gJavaVmObjectAllocDispatchEnabled.load()) {
+        DispatchEvent(env, "vm_object_alloc", thread, klass, nullptr, 0, object, size);
+    }
+    if (gArmedCompleteStringAllocationHookCount.load() == 0 || gStringClass == nullptr
+            || env->IsSameObject(klass, gStringClass) != JNI_TRUE) return;
     jmethodID method = nullptr;
     jlocation location = 0;
     if (gJvmti->GetFrameLocation(thread, 0, &method, &location) == JVMTI_ERROR_NONE
@@ -1804,7 +2046,7 @@ void JNICALL VmObjectAlloc(jvmtiEnv*, JNIEnv* env, jthread thread, jobject objec
         // The String is not initialized until its constructor exits; match it there.
         return;
     }
-    TrapMatchingStringAllocation(env, thread, object);
+    TrapMatchingStringAllocation(env, thread, object, true, method, location);
 }
 
 void JNICALL NativeMethodBind(jvmtiEnv*, JNIEnv* env, jthread thread, jmethodID method,
@@ -2465,6 +2707,14 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
         gJavaMethodExitDispatchEnabled.store(enabled == JNI_TRUE);
     } else if (event == JVMTI_EVENT_EXCEPTION) {
         gJavaExceptionDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_BREAKPOINT) {
+        gJavaBreakpointDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_VM_OBJECT_ALLOC) {
+        gJavaVmObjectAllocDispatchEnabled.store(enabled == JNI_TRUE);
+    }
+    if (enabled != JNI_TRUE && event == JVMTI_EVENT_BREAKPOINT) {
+        std::lock_guard<std::mutex> debuggerGuard(gDebuggerMutex);
+        if (gDebuggerEnabled) return;
     }
     if (enabled != JNI_TRUE && (event == JVMTI_EVENT_METHOD_ENTRY
             || event == JVMTI_EVENT_METHOD_EXIT || event == JVMTI_EVENT_EXCEPTION)) {
@@ -2485,6 +2735,73 @@ void JNICALL NativeSetEventNotification(JNIEnv* env, jclass, jstring eventNameVa
     }
     if (event == JVMTI_EVENT_CLASS_PREPARE) gStartupClassPrepareOwned.store(false);
     ThrowJvmti(env, "SetEventNotificationMode", error);
+}
+
+void JNICALL NativeSetEventCallbackDispatch(JNIEnv* env, jclass,
+        jstring eventNameValue, jboolean enabled) {
+    const std::string eventName = JStringToUtf8(env, eventNameValue);
+    jvmtiEvent event{};
+    if (!ResolveEvent(eventName, &event)) {
+        ThrowJava(env, "java/lang/IllegalArgumentException", "Unsupported JVMTI event: " + eventName);
+        return;
+    }
+    if (event == JVMTI_EVENT_METHOD_ENTRY) {
+        gJavaMethodEntryDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_METHOD_EXIT) {
+        gJavaMethodExitDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_EXCEPTION) {
+        gJavaExceptionDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_BREAKPOINT) {
+        gJavaBreakpointDispatchEnabled.store(enabled == JNI_TRUE);
+    } else if (event == JVMTI_EVENT_VM_OBJECT_ALLOC) {
+        gJavaVmObjectAllocDispatchEnabled.store(enabled == JNI_TRUE);
+    }
+    if (enabled == JNI_TRUE) {
+        ThrowJvmti(env, "Enable JVMTI callback event",
+            gJvmti->SetEventNotificationMode(JVMTI_ENABLE, event, nullptr));
+    } else if (event == JVMTI_EVENT_VM_OBJECT_ALLOC
+            && gArmedCompleteStringAllocationHookCount.load() == 0) {
+        ThrowJvmti(env, "Disable unused VM object-allocation event",
+            gJvmti->SetEventNotificationMode(JVMTI_DISABLE, event, nullptr));
+    }
+}
+
+void JNICALL NativeRegisterStringHookBridge(JNIEnv* env, jclass, jclass bridgeClass) {
+    if (bridgeClass == nullptr) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "String hook bootstrap bridge class must not be null");
+        return;
+    }
+    jmethodID setActive = env->GetStaticMethodID(bridgeClass, "setActive", "(Z)V");
+    if (setActive == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "String hook bootstrap bridge has no setActive(boolean) method");
+        return;
+    }
+    jmethodID configure = env->GetStaticMethodID(bridgeClass, "configure",
+        "([Ljava/lang/String;[ZZ)V");
+    if (configure == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "String hook bootstrap bridge has no configure method");
+        return;
+    }
+    JNINativeMethod methods[] = {
+        {const_cast<char*>("observed0"), const_cast<char*>("(Ljava/lang/String;)V"),
+            reinterpret_cast<void*>(&BootstrapStringObserved)}
+    };
+    if (env->RegisterNatives(bridgeClass, methods, 1) != JNI_OK) {
+        ThrowJava(env, "java/lang/IllegalStateException",
+            "Cannot register the bootstrap String hook native bridge");
+        return;
+    }
+    jclass reference = static_cast<jclass>(env->NewGlobalRef(bridgeClass));
+    if (reference == nullptr) return;
+    if (gStringHookBridgeClass != nullptr) env->DeleteGlobalRef(gStringHookBridgeClass);
+    gStringHookBridgeClass = reference;
+    gStringHookSetActiveMethod = setActive;
+    gStringHookConfigureMethod = configure;
 }
 
 void JNICALL NativeSetBreakpoint(JNIEnv* env, jclass, jclass klass, jstring methodNameValue,
@@ -2693,38 +3010,76 @@ void JNICALL NativeSetDebugEventBreakpoint(JNIEnv* env, jclass, jint kindValue,
 void JNICALL NativeSetStringAllocationHook(JNIEnv* env, jclass,
         jstring registrationIdValue, jstring contentPatternValue,
         jstring creatorClassPatternValue, jstring creatorMethodPatternValue,
-        jstring creatorDescriptorPatternValue, jboolean caseSensitive, jboolean enabled) {
+        jstring creatorDescriptorPatternValue, jboolean caseSensitive, jint mode,
+        jlong maximumHits, jint sampleEvery, jboolean enabled) {
     const std::string registrationId = JStringToUtf8(env, registrationIdValue);
     if (registrationId.empty()) {
         ThrowJava(env, "java/lang/IllegalArgumentException",
             "String allocation registration ID must not be empty");
         return;
     }
-    std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
-    for (auto iterator = gStringAllocationHooks.begin();
-            iterator != gStringAllocationHooks.end();) {
-        if (iterator->id == registrationId) iterator = gStringAllocationHooks.erase(iterator);
-        else ++iterator;
+    if (mode < 0 || mode > 1 || maximumHits < 0 || sampleEvery < 1) {
+        ThrowJava(env, "java/lang/IllegalArgumentException",
+            "String allocation mode, maximum hits or sampling interval is invalid");
+        return;
     }
-    if (enabled == JNI_TRUE) {
-        StringAllocationHook hook;
-        hook.id = registrationId;
-        hook.contentPattern = JStringToUtf8(env, contentPatternValue);
-        hook.creatorClassPattern = JStringToUtf8(env, creatorClassPatternValue);
-        hook.creatorMethodPattern = JStringToUtf8(env, creatorMethodPatternValue);
-        hook.creatorDescriptorPattern = JStringToUtf8(env, creatorDescriptorPatternValue);
-        if (hook.contentPattern.empty()) hook.contentPattern = "*";
-        if (hook.creatorClassPattern.empty()) hook.creatorClassPattern = "*";
-        if (hook.creatorMethodPattern.empty()) hook.creatorMethodPattern = "*";
-        if (hook.creatorDescriptorPattern.empty()) hook.creatorDescriptorPattern = "*";
-        hook.caseSensitive = caseSensitive == JNI_TRUE;
-        gStringAllocationHooks.push_back(std::move(hook));
+    {
+        std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
+        for (auto iterator = gStringAllocationHooks.begin();
+                iterator != gStringAllocationHooks.end();) {
+            if (iterator->id == registrationId) iterator = gStringAllocationHooks.erase(iterator);
+            else ++iterator;
+        }
+        if (enabled == JNI_TRUE) {
+            StringAllocationHook hook;
+            hook.id = registrationId;
+            hook.contentPattern = JStringToUtf8(env, contentPatternValue);
+            hook.creatorClassPattern = JStringToUtf8(env, creatorClassPatternValue);
+            hook.creatorMethodPattern = JStringToUtf8(env, creatorMethodPatternValue);
+            hook.creatorDescriptorPattern = JStringToUtf8(env, creatorDescriptorPatternValue);
+            if (hook.contentPattern.empty()) hook.contentPattern = "*";
+            if (hook.creatorClassPattern.empty()) hook.creatorClassPattern = "*";
+            if (hook.creatorMethodPattern.empty()) hook.creatorMethodPattern = "*";
+            if (hook.creatorDescriptorPattern.empty()) hook.creatorDescriptorPattern = "*";
+            hook.caseSensitive = caseSensitive == JNI_TRUE;
+            hook.complete = mode == 1;
+            hook.maximumHits = static_cast<std::uint64_t>(maximumHits);
+            hook.sampleEvery = static_cast<std::uint64_t>(sampleEvery);
+            gStringAllocationHooks.push_back(std::move(hook));
+        }
+        std::size_t completeCount = 0;
+        std::size_t armedCount = 0;
+        std::size_t armedCompleteCount = 0;
+        for (const StringAllocationHook& hook : gStringAllocationHooks) {
+            if (hook.complete) ++completeCount;
+            if (hook.maximumHits == 0 || hook.emittedHits < hook.maximumHits) {
+                ++armedCount;
+                if (hook.complete) ++armedCompleteCount;
+            }
+        }
+        gStringAllocationHookCount.store(gStringAllocationHooks.size());
+        gCompleteStringAllocationHookCount.store(completeCount);
+        gArmedStringAllocationHookCount.store(armedCount);
+        gArmedCompleteStringAllocationHookCount.store(armedCompleteCount);
+        if (gStringAllocationHooks.empty()) {
+            for (const MatchedStringAllocation& value : gMatchedStringAllocations) {
+                env->DeleteWeakGlobalRef(value.reference);
+            }
+            gMatchedStringAllocations.clear();
+        }
     }
-    gStringAllocationHookCount.store(gStringAllocationHooks.size());
-    if (gStringAllocationHooks.empty()) {
-        for (jweak reference : gMatchedStringAllocations) env->DeleteWeakGlobalRef(reference);
-        gMatchedStringAllocations.clear();
+    if (gArmedCompleteStringAllocationHookCount.load() != 0) {
+        const jvmtiError error = gJvmti->SetEventNotificationMode(
+            JVMTI_ENABLE, JVMTI_EVENT_VM_OBJECT_ALLOC, nullptr);
+        if (error != JVMTI_ERROR_NONE) {
+            ThrowJvmti(env, "Enable complete String allocation events", error);
+            return;
+        }
     }
+    ConfigureStringHookBridge(env);
+    // Keep activation independent from optional Java-side prefilter configuration. Native
+    // matching remains authoritative if a VM rejects or delays the array configuration call.
+    SetStringHookBridgeActive(env, gArmedStringAllocationHookCount.load() != 0);
 }
 
 void JNICALL NativeDebuggerPauseThread(JNIEnv* env, jclass, jobject requestedThread,
@@ -4423,6 +4778,12 @@ JNINativeMethod kJvmtiMethods[] = {
     {const_cast<char*>("setEventNotification"),
      const_cast<char*>("(Ljava/lang/String;Z)V"),
      reinterpret_cast<void*>(&NativeSetEventNotification)},
+    {const_cast<char*>("setEventCallbackDispatch"),
+     const_cast<char*>("(Ljava/lang/String;Z)V"),
+     reinterpret_cast<void*>(&NativeSetEventCallbackDispatch)},
+    {const_cast<char*>("registerStringHookBridge"),
+     const_cast<char*>("(Ljava/lang/Class;)V"),
+     reinterpret_cast<void*>(&NativeRegisterStringHookBridge)},
     {const_cast<char*>("setBreakpoint"),
      const_cast<char*>("(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;JZLjava/lang/String;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetBreakpoint)},
@@ -4460,7 +4821,7 @@ JNINativeMethod kJvmtiMethods[] = {
      const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;)V"),
      reinterpret_cast<void*>(&NativeSetFieldWatchByName)},
     {const_cast<char*>("setStringAllocationHook"),
-     const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZ)V"),
+     const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZIJIZ)V"),
      reinterpret_cast<void*>(&NativeSetStringAllocationHook)},
     {const_cast<char*>("notifyFramePop"), const_cast<char*>("(Ljava/lang/Thread;I)V"),
      reinterpret_cast<void*>(&NativeNotifyFramePop)},
@@ -4837,23 +5198,32 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
         {
             std::lock_guard<std::mutex> guard(gStringAllocationHookMutex);
             gStringAllocationHooks.clear();
-            for (jweak reference : gMatchedStringAllocations) {
-                env->DeleteWeakGlobalRef(reference);
+            for (const MatchedStringAllocation& value : gMatchedStringAllocations) {
+                env->DeleteWeakGlobalRef(value.reference);
             }
             gMatchedStringAllocations.clear();
             gStringAllocationHookCount.store(0);
+            gCompleteStringAllocationHookCount.store(0);
+            gArmedStringAllocationHookCount.store(0);
+            gArmedCompleteStringAllocationHookCount.store(0);
         }
         RemoveStepOutState(env, nullptr);
         if (gDispatcherClass != nullptr) env->DeleteGlobalRef(gDispatcherClass);
+        if (gStringHookBridgeClass != nullptr) env->DeleteGlobalRef(gStringHookBridgeClass);
         ReleaseCallbackTypes(env);
     }
     gDispatcherClass = nullptr;
     gDispatchMethod = nullptr;
     gTransformMethod = nullptr;
+    gStringHookBridgeClass = nullptr;
+    gStringHookSetActiveMethod = nullptr;
+    gStringHookConfigureMethod = nullptr;
     gClassFileHookEnabled.store(false);
     gJavaMethodEntryDispatchEnabled.store(false);
     gJavaMethodExitDispatchEnabled.store(false);
     gJavaExceptionDispatchEnabled.store(false);
+    gJavaBreakpointDispatchEnabled.store(false);
+    gJavaVmObjectAllocDispatchEnabled.store(false);
     gStartupBreakpointInstalled = false;
     gStartupClinitBreakpointInstalled = false;
     gStartupMainMethod = nullptr;

@@ -153,11 +153,14 @@ TUI 的 `references` 页中，`Enter` 打开为 Context，`S`/`Shift+S` 强/弱�
 
 ```text
 strings list
-strings allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]
+strings allocation <name> <content-glob> [creator-class creator-method descriptor]
+                   [fast|complete] [ignore-case|case-sensitive]
+                   [once|max=N] [sample=N]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
 strings on <name>
 strings off <name>
+strings rearm <name>
 strings read <name>
 strings use <name>
 strings set <name> <value>
@@ -167,16 +170,23 @@ strings remove <name>
 strings clear
 ```
 
-Allocation Hook 组合 `VM_OBJECT_ALLOC` 与成功完成的 `java.lang.String.<init>`。内容 glob 和
-创建者 class/method/descriptor 会在目标 JVM 内对完整分配调用栈进行匹配，只有命中才暂停。
-默认 pattern 为 `*` 且区分大小写；填满三个创建者 pattern 后追加 `ignore-case` 可忽略大小写。
-构造器产生的 String 会在初始化完成后读取；VM/native 直接产生且内容可见的 String 也可捕获，
-同一物理对象不会因两条事件路径重复命中。
+Allocation Hook 默认使用 `fast`：临时在 `java.lang.String.<init>` 的构造器返回处加入
+轻量 bootstrap 探针，不开启全局方法退出或对象分配回调；删除最后一个 Allocation Hook 时会
+还原该探针。`complete` 额外开启 `VM_OBJECT_ALLOC`，用于捕获没有
+可见构造器退出的 VM/native 或已被 JIT intrinsic 化的 String；该模式会产生 JVM 全局分配事件开销。同一物理对象不会因
+两条路径重复命中。
+
+内容先在 Java bootstrap 桥中预过滤，未匹配时不会进入 native/JVMTI；之后再按需读取创建栈。
+三个 creator pattern 都是 `*` 时不会做完整栈遍历。
+创建者 class/method/descriptor 必须在同一帧匹配。`once` 等价于 `max=1`，`max=N` 限制停止
+次数，`sample=N` 每 N 次语义命中停止一次。高分配程序应优先使用窄内容条件、`fast` 和有界策略；
+没有仍处于 armed 状态的 Hook 时桥接热路径会自动关闭。
+达到上限的 Hook 显示 `DONE`；`rearm` 会重置原生计数并重新启用。
 
 字段 Hook 仅接受 `Ljava/lang/String;` 字段，分别映射到 JVMTI 字段读取/修改监视点。可选的 `object` 使用当前对象 Context，只匹配该实例；省略时匹配所有实例。方法 Hook 映射到进入/退出事件断点。命中记录和 Frames/Locals 由共享调试器提供。
 
 `read`、`use`、`track` 和 `call` 也可操作最近一次 Allocation 命中的 String；`set` 仅用于字段型
-Hook，因为字符串对象不可变。TUI 的 `strings` 页使用 `A` 添加、`Enter` 打开、`F9` 启用/禁用、`=` 替换、`&` 加入 References、`Delete` 删除。
+Hook，因为字符串对象不可变。TUI 的 `strings` 页使用 `A` 添加、`Enter` 打开、`F9` 启用/禁用/重新启用、`=` 替换、`&` 加入 References、`Delete` 删除。
 
 ## 5. 值表达式
 

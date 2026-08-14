@@ -215,6 +215,7 @@ high-volume callback for every String operation:
 ```java
 import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
 import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationMode;
 import nhcm.jvmrtdp.handles.java.RemoteField;
 
 RemoteClass config = session.findClass("com.example.Config");
@@ -229,6 +230,8 @@ session.stringHooks().breakAllocation("secret-created",
                 .contentGlob("*secret-token*")
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
+                .mode(JvmStringAllocationMode.FAST)
+                .oneShot()
                 .build());
 
 try (RemoteObject current = session.stringHooks().acquireValue("message-write");
@@ -252,11 +255,14 @@ object; passing `null` watches every instance. Method hooks map to managed `METH
 `METHOD_EXIT` event breakpoints and may target `java.lang.String` methods or signatures containing
 `Ljava/lang/String;`.
 
-Allocation hooks evaluate content and creator-stack patterns inside the target. They combine
-`VM_OBJECT_ALLOC` with completed `String.<init>` exits so ordinary Java Strings are inspected after
-initialization while VM/native-created Strings can still be observed. The latest match is retained
-by the manager and supports `acquireValue`, `trackValue`, and method invocation. It cannot be
-mutated in place; track it or modify the owning field/local instead.
+Allocation hooks evaluate content before optional creator-stack patterns inside the target.
+Default `FAST` mode temporarily adds lightweight probes to `String.<init>` returns and
+prefilters content in the bootstrap bridge before native/JVMTI work. Select `COMPLETE` only when
+VM/native-created or already JIT-intrinsified Strings must be observed; it adds the high-volume global
+allocation event. `oneShot`, `maximumHits`, and `sampleEvery` bound stops and allow the hot path to
+turn off when no hook remains armed. The latest match is
+retained by the manager and supports `acquireValue`, `trackValue`, and method invocation. It cannot
+be mutated in place; track it or modify the owning field/local instead.
 
 Hook hits use the shared debugger. Call `observe(debuggerStates)` when building a custom UI, or use
 the built-in TUI/CLI, which observes stops automatically. A field-backed hook can read, replace,

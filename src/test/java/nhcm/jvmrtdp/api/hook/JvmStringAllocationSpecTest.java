@@ -16,6 +16,9 @@ class JvmStringAllocationSpecTest {
         assertEquals("*", spec.creatorMethodPattern());
         assertEquals("*", spec.creatorDescriptorPattern());
         assertTrue(spec.caseSensitive());
+        assertEquals(JvmStringAllocationMode.FAST, spec.mode());
+        assertEquals(0L, spec.maximumHits());
+        assertEquals(1, spec.sampleEvery());
     }
 
     @Test void normalizesClassSeparatorsAndRetainsGlobFilters() {
@@ -36,5 +39,26 @@ class JvmStringAllocationSpecTest {
         assertEquals("*token*", JvmStringAllocationSpec.containing("token").contentPattern());
         assertThrows(IllegalArgumentException.class,
                 () -> JvmStringAllocationSpec.containing(null));
+    }
+
+    @Test void supportsCompleteModeAndBoundedSampling() {
+        JvmStringAllocationSpec spec = JvmStringAllocationSpec.builder()
+                .mode(JvmStringAllocationMode.COMPLETE)
+                .maximumHits(4L)
+                .sampleEvery(3)
+                .build();
+
+        assertEquals(JvmStringAllocationMode.COMPLETE, spec.mode());
+        assertEquals(4L, spec.maximumHits());
+        assertEquals(3, spec.sampleEvery());
+        assertTrue(spec.summary().contains("mode=complete"));
+        assertTrue(spec.summary().contains("max-hits=4"));
+    }
+
+    @Test void rejectsInvalidHitPolicies() {
+        assertThrows(IllegalArgumentException.class,
+                () -> JvmStringAllocationSpec.builder().maximumHits(-1L).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> JvmStringAllocationSpec.builder().sampleEvery(0).build());
     }
 }

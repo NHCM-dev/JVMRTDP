@@ -59,3 +59,12 @@ Thumbs.db
 Desktop.ini
 /run.cmd
 /workspace/
+
+# Local test runs and disposable integration fixtures
+/.jvmrtdp-test/
+/test-work/
+/test-output/
+/test-results/
+*.jfr
+hs_err_pid*.log
+replay_pid*.log

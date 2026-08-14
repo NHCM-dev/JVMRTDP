@@ -24,9 +24,9 @@ import java.util.Map;
 /**
  * Precise, session-scoped String hook registry shared by the library, CLI and TUI.
  * Field hooks are JVMTI access/modification watchpoints. Method hooks are JVMTI
- * entry/exit event breakpoints. Allocation hooks combine VM object-allocation events with
- * completed {@code String.<init>} exits, filter content and creator frames in the target, and
- * expose the matched String through the normal debugger.
+ * entry/exit event breakpoints. Fast allocation hooks use lightweight completed
+ * {@code String.<init>} probes; complete hooks add VM object-allocation events. Both filter
+ * content and optional creator frames in the target and expose the match through the debugger.
  */
 public final class JvmStringHookManager implements AutoCloseable {
     private static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
@@ -108,7 +108,22 @@ public final class JvmStringHookManager implements AutoCloseable {
 
     public synchronized JvmStringHookInfo setEnabled(String name, boolean enabled) {
         Entry entry = require(name);
+        if (enabled && entry.enabled && exhausted(entry)) return rearm(name);
         setEnabled(entry, enabled);
+        return entry.info();
+    }
+
+    /** Resets native sampling/hit limits and arms an allocation hook again. */
+    public synchronized JvmStringHookInfo rearm(String name) {
+        Entry entry = require(name);
+        if (entry.kind != JvmStringHookKind.ALLOCATION) {
+            throw new IllegalStateException("Only allocation hooks can be rearmed");
+        }
+        if (!entry.enabled) setEnabled(entry, true);
+        else jvmti.setStringAllocationHook(entry.registrationId, entry.allocationSpec, true);
+        entry.hitCount = 0L;
+        entry.lastHit = "";
+        revision++;
         return entry.info();
     }
 
@@ -277,6 +292,11 @@ public final class JvmStringHookManager implements AutoCloseable {
         return reason.contains(precise) || reason.contains(legacy)
                 || reason.contains("field") && reason.contains(expected)
                 && reason.contains(entry.memberName.toLowerCase(Locale.ROOT));
+    }
+
+    private static boolean exhausted(Entry entry) {
+        return entry.allocationSpec != null && entry.allocationSpec.maximumHits() > 0L
+                && entry.hitCount >= entry.allocationSpec.maximumHits();
     }
 
     private static boolean reasonContainsRegistration(String reason, String registrationId) {

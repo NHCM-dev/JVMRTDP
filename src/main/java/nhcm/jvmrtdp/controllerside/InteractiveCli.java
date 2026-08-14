@@ -310,8 +310,9 @@ public class InteractiveCli {
             super("strings",
                     "strings [list|field <name> <read|write> <class> <field> [object]|"
                             + "method <name> <entry|exit> <class> <method> <descriptor>|"
-                            + "allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]|"
-                            + "on <name>|off <name>|read <name>|use <name>|set <name> <value>|"
+                            + "allocation <name> <content-glob> [creator-class creator-method descriptor] "
+                            + "[fast|complete] [ignore-case] [once|max=N] [sample=N]|"
+                            + "on <name>|off <name>|rearm <name>|read <name>|use <name>|set <name> <value>|"
                             + "track <hook> <reference> [strong|weak]|call <hook> <method> <descriptor> [args...]|"
                             + "remove <name>|clear]",
                     "Manages String allocations, field watches, and String-bearing method hooks.",
@@ -348,21 +349,8 @@ public class InteractiveCli {
                         arguments.get(3), arguments.get(4), arguments.get(5)));
                 return true;
             }
-            if ("allocation".equals(operation)
-                    && arguments.size() >= 3 && arguments.size() <= 7) {
-                boolean caseSensitive = arguments.size() < 7
-                        || !"ignore-case".equalsIgnoreCase(arguments.get(6));
-                if (arguments.size() == 7 && caseSensitive
-                        && !"case-sensitive".equalsIgnoreCase(arguments.get(6))) {
-                    return InteractiveCli.usage(session, this);
-                }
-                JvmStringAllocationSpec spec = JvmStringAllocationSpec.builder()
-                        .contentGlob(arguments.get(2))
-                        .createdFrom(arguments.size() > 3 ? arguments.get(3) : "*",
-                                arguments.size() > 4 ? arguments.get(4) : "*",
-                                arguments.size() > 5 ? arguments.get(5) : "*")
-                        .caseSensitive(caseSensitive)
-                        .build();
+            if ("allocation".equals(operation) && arguments.size() >= 3) {
+                JvmStringAllocationSpec spec = StringAllocationSpecParser.parse(arguments, 2);
                 session.output().println(session.stringHooks().breakAllocation(
                         arguments.get(1), spec));
                 return true;
@@ -370,6 +358,11 @@ public class InteractiveCli {
             if (("on".equals(operation) || "off".equals(operation)) && arguments.size() == 2) {
                 session.output().println(session.stringHooks().setEnabled(
                         arguments.get(1), "on".equals(operation)));
+                return true;
+            }
+            if (("rearm".equals(operation) || "reset".equals(operation))
+                    && arguments.size() == 2) {
+                session.output().println(session.stringHooks().rearm(arguments.get(1)));
                 return true;
             }
             if (("read".equals(operation) || "use".equals(operation)) && arguments.size() == 2) {

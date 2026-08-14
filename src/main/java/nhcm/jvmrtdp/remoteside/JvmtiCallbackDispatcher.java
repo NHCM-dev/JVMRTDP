@@ -36,6 +36,7 @@ public class JvmtiCallbackDispatcher {
     private static final Map<String, Registration> REGISTRATIONS = new ConcurrentHashMap<String, Registration>();
     private static final CopyOnWriteArrayList<Registration> ORDERED = new CopyOnWriteArrayList<Registration>();
     private static final Map<JvmtiEventType, AtomicLong> ENABLE_COUNTS = new ConcurrentHashMap<JvmtiEventType, AtomicLong>();
+    private static final Map<JvmtiEventType, AtomicLong> CALLBACK_COUNTS = new ConcurrentHashMap<JvmtiEventType, AtomicLong>();
     private static final ThreadPoolExecutor ASYNC = new ThreadPoolExecutor(1, 1, 0L,
             TimeUnit.MILLISECONDS, new ArrayBlockingQueue<Runnable>(8192), new ThreadFactory() {
                 @Override
@@ -288,24 +289,47 @@ public class JvmtiCallbackDispatcher {
     }
 
     private static synchronized void retain(JvmtiEventType event) {
+        retain(event, true);
+    }
+
+    private static void retain(JvmtiEventType event, boolean callback) {
         AtomicLong count = ENABLE_COUNTS.get(event);
         if (count == null) {
             count = new AtomicLong();
             ENABLE_COUNTS.put(event, count);
         }
-        if (count.getAndIncrement() == 0) {
-            try {
+        AtomicLong callbacks = CALLBACK_COUNTS.get(event);
+        if (callbacks == null) {
+            callbacks = new AtomicLong();
+            CALLBACK_COUNTS.put(event, callbacks);
+        }
+        long previousCallbacks = callback ? callbacks.getAndIncrement() : callbacks.get();
+        boolean firstLease = count.getAndIncrement() == 0;
+        try {
+            if (firstLease) {
                 requireCapability(event);
                 NativeAgent.setEventNotification(event.wireName(), true);
-            } catch (RuntimeException failure) {
-                count.decrementAndGet();
-                throw failure;
             }
+            if (callback && previousCallbacks == 0L) {
+                NativeAgent.setEventCallbackDispatch(event.wireName(), true);
+            } else if (!callback && firstLease && callbacks.get() == 0L) {
+                NativeAgent.setEventCallbackDispatch(event.wireName(), false);
+            }
+        } catch (RuntimeException failure) {
+            count.decrementAndGet();
+            if (callback) callbacks.decrementAndGet();
+            if (firstLease) {
+                try { NativeAgent.setEventNotification(event.wireName(), false); }
+                catch (RuntimeException ignored) { }
+            }
+            throw failure;
         }
     }
 
     /** Shares native event-notification ownership with built-in target-side services. */
-    static void retainInfrastructureEvent(JvmtiEventType event) { retain(event); }
+    static synchronized void retainInfrastructureEvent(JvmtiEventType event) {
+        retain(event, false);
+    }
 
     private static void requireCapability(JvmtiEventType event) {
         JvmtiCapability required = event.requiredCapability();
@@ -322,8 +346,18 @@ public class JvmtiCallbackDispatcher {
     }
 
     private static synchronized void release(JvmtiEventType event) {
+        release(event, true);
+    }
+
+    private static void release(JvmtiEventType event, boolean callback) {
         AtomicLong count = ENABLE_COUNTS.get(event);
         if (count == null || count.get() == 0) return;
+        AtomicLong callbacks = CALLBACK_COUNTS.get(event);
+        if (callback && callbacks != null && callbacks.get() > 0
+                && callbacks.decrementAndGet() == 0) {
+            try { NativeAgent.setEventCallbackDispatch(event.wireName(), false); }
+            catch (RuntimeException ignored) { }
+        }
         if (count.decrementAndGet() == 0) {
             try { NativeAgent.setEventNotification(event.wireName(), false); }
             catch (RuntimeException ignored) { }
@@ -331,7 +365,9 @@ public class JvmtiCallbackDispatcher {
     }
 
     /** Releases an event previously retained by a built-in target-side service. */
-    static void releaseInfrastructureEvent(JvmtiEventType event) { release(event); }
+    static synchronized void releaseInfrastructureEvent(JvmtiEventType event) {
+        release(event, false);
+    }
 
     private static String eventNames(Set<JvmtiEventType> events) {
         StringBuilder result = new StringBuilder();

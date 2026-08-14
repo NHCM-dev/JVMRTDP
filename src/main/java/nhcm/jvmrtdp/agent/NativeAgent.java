@@ -87,6 +87,17 @@ public class NativeAgent {
         NativeJvmtiBridge.setEventNotification(eventName, enabled);
     }
 
+    public static void setEventCallbackDispatch(String eventName, boolean enabled) {
+        requireAvailable();
+        NativeJvmtiBridge.setEventCallbackDispatch(eventName, enabled);
+    }
+
+    public static void registerStringHookBridge(Class<?> bridgeClass) {
+        requireAvailable();
+        if (bridgeClass == null) throw new IllegalArgumentException("bridgeClass must not be null");
+        NativeJvmtiBridge.registerStringHookBridge(bridgeClass);
+    }
+
     public static void setBreakpoint(Class<?> type, String methodName, String descriptor,
             long location, boolean enabled) {
         if (type == null) throw new IllegalArgumentException("type must not be null");
@@ -242,6 +253,15 @@ public class NativeAgent {
     public static void setStringAllocationHook(String registrationId,
             String contentPattern, String creatorClassPattern, String creatorMethodPattern,
             String creatorDescriptorPattern, boolean caseSensitive, boolean enabled) {
+        setStringAllocationHook(registrationId, contentPattern, creatorClassPattern,
+                creatorMethodPattern, creatorDescriptorPattern, caseSensitive,
+                0, 0L, 1, enabled);
+    }
+
+    public static void setStringAllocationHook(String registrationId,
+            String contentPattern, String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive, int mode,
+            long maximumHits, int sampleEvery, boolean enabled) {
         requireAvailable();
         if (registrationId == null || registrationId.isEmpty()) {
             throw new IllegalArgumentException("registrationId must not be empty");
@@ -252,7 +272,7 @@ public class NativeAgent {
                 creatorMethodPattern == null || creatorMethodPattern.isEmpty() ? "*" : creatorMethodPattern,
                 creatorDescriptorPattern == null || creatorDescriptorPattern.isEmpty()
                         ? "*" : creatorDescriptorPattern,
-                caseSensitive, enabled);
+                caseSensitive, mode, maximumHits, sampleEvery, enabled);
     }
 
     public static void setFieldWatch(String className, String fieldName, String descriptor,

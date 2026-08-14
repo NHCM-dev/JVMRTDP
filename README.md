@@ -300,7 +300,7 @@ refs release service
 strings field display-write write com.example.Config displayName
 strings field user-name-write write com.example.User name object
 strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
-strings allocation token-created "*secret-token*" "com.example.*" "*" "*" ignore-case
+strings allocation token-created "*secret-token*" "com.example.*" "*" "*" fast ignore-case once
 strings track display-write displayValue
 strings use display-write
 strings call display-write length ()I
@@ -311,11 +311,17 @@ normal GC. A tracked field reports `NULL` when its current value is Java `null`;
 from a collected weak receiver. String replacement updates the owning field/reference/local—Java
 `String` instances remain immutable.
 
-Allocation hooks use `VM_OBJECT_ALLOC` plus completed `String.<init>` exits. Content and creator
-stack patterns are evaluated in the target before pausing, so unrelated allocations never stop.
-The latest match supports `read`, `use`, `call`, and `track`, while Debug exposes its complete
-creator stack. Use `-agentpath` when dynamic attach cannot acquire the object-allocation or
-method-exit capabilities, or local-instance access needed after constructor completion.
+Allocation hooks default to `fast`: JVMRTDP temporarily adds lightweight probes to
+`String.<init>` returns, so unrelated allocations and method exits do not enter a global JVMTI
+callback. Content is prefiltered in the bootstrap bridge before native/JVMTI work; an all-wildcard
+creator skips full stack capture.
+Use `complete` only when VM/native-created or already JIT-intrinsified String paths without an
+observable constructor return must also be covered, because it enables the JVM-wide
+`VM_OBJECT_ALLOC` event. `once`, `max=N`, and `sample=N`
+bound stop frequency. The latest match supports `read`, `use`, `call`, and `track`, while Debug
+exposes its creator stack. Use `-agentpath` when the required breakpoint/bytecode/local-variable
+retransform/redefine capabilities (and allocation capability in `complete` mode) are unavailable
+after dynamic attach. The probe is removed when the last allocation hook is removed.
 
 Batch mode executes target commands directly:
 

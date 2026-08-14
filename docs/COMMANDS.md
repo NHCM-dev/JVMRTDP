@@ -175,11 +175,14 @@ strongly/weakly, `=` to replace, `X` to write null, `Delete` to release, and `F5
 
 ```text
 strings list
-strings allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]
+strings allocation <name> <content-glob> [creator-class creator-method descriptor]
+                   [fast|complete] [ignore-case|case-sensitive]
+                   [once|max=N] [sample=N]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
 strings on <name>
 strings off <name>
+strings rearm <name>
 strings read <name>
 strings use <name>
 strings set <name> <value>
@@ -189,12 +192,22 @@ strings remove <name>
 strings clear
 ```
 
-Allocation hooks combine `VM_OBJECT_ALLOC` with successful `java.lang.String.<init>` exits. The
-content glob and creator class/method/descriptor patterns are matched inside the target against
-the complete allocation stack before pausing. Defaults are `*` and case-sensitive; append
-`ignore-case` after all three creator patterns to ignore case. Constructor-created Strings are
-read after initialization, VM/native-created Strings are caught when their content is observable,
-and one physical String is de-duplicated across both event paths.
+Allocation hooks default to `fast`, which temporarily instruments
+`java.lang.String.<init>` returns with a lightweight bootstrap probe. It does not enable global
+method-exit or allocation callbacks, and the probe is removed with the last allocation hook.
+`complete` additionally enables `VM_OBJECT_ALLOC` to cover VM/native-created and already
+JIT-intrinsified Strings without an observable constructor return; this mode has JVM-wide
+allocation-event overhead. A physical
+String is de-duplicated across both paths.
+
+Content is prefiltered in Java before entering native/JVMTI code, then confirmed before creator
+frames are captured. Creator class/method/descriptor patterns
+must match one frame, while any frame may satisfy them; leaving all three as `*` avoids the full
+stack walk. Patterns default to `*` and case-sensitive. `once` is `max=1`, `max=N` limits emitted
+stops, and `sample=N` emits every Nth semantic match. Narrow filters and bounded policies are
+recommended for high-allocation workloads. `once` and bounded hooks also turn off the bridge hot
+path when no armed allocation hook remains. A bounded hook is shown as `DONE` after reaching its
+limit; `rearm` resets its native counters without recreating the logical hook.
 
 Field hooks require descriptor `Ljava/lang/String;` and use JVMTI field access/modification
 watchpoints. The optional `object` scope uses the current object Context; otherwise the watch
@@ -206,7 +219,8 @@ to field-backed hooks because String objects are immutable. Method hook hits app
 Debug, where Frames/Locals expose the receiver, arguments, and return value. Replacing a String
 updates its owning reference; Java String instances are not mutated internally.
 
-The TUI `strings` tab uses `A` to add, `Enter` to open a value or last hit, `F9` to enable/disable,
+The TUI `strings` tab uses `A` to add, `Enter` to open a value or last hit, `F9` to
+enable/disable/rearm,
 `=` to replace a field value, `&` to add it to References, and `Delete` to remove the hook.
 
 ## 5. Value Expressions

@@ -13,6 +13,7 @@ import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
 import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
 import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
 import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
+import nhcm.jvmrtdp.controllerside.StringAllocationSpecParser;
 import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
 import nhcm.jvmrtdp.api.reference.JvmReferenceStrength;
 import nhcm.jvmrtdp.controllerside.TargetSession;
@@ -1449,7 +1450,7 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void addStringHook() throws IOException {
-        String source = editText("String hook: allocation <name> <content-glob> [class method descriptor ignore-case] | field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
+        String source = editText("String hook: allocation <name> <content-glob> [class method descriptor] [fast|complete] [ignore-case] [once|max=N] [sample=N] | field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
         if (source == null || source.trim().isEmpty()) return;
         final CommandLine line = CommandLine.parse(source);
         final List<String> arguments = line.arguments();
@@ -1477,22 +1478,8 @@ public final class TargetTui implements AutoCloseable {
                     return session.stringHooks().breakMethod(arguments.get(0), kind,
                             arguments.get(2), arguments.get(3), arguments.get(4));
                 }
-                if ("allocation".equals(operation)
-                        && arguments.size() >= 2 && arguments.size() <= 6) {
-                    boolean caseSensitive = arguments.size() < 6
-                            || !"ignore-case".equalsIgnoreCase(arguments.get(5));
-                    if (arguments.size() == 6 && caseSensitive
-                            && !"case-sensitive".equalsIgnoreCase(arguments.get(5))) {
-                        throw new IllegalArgumentException(
-                                "Allocation case mode must be ignore-case or case-sensitive");
-                    }
-                    JvmStringAllocationSpec spec = JvmStringAllocationSpec.builder()
-                            .contentGlob(arguments.get(1))
-                            .createdFrom(arguments.size() > 2 ? arguments.get(2) : "*",
-                                    arguments.size() > 3 ? arguments.get(3) : "*",
-                                    arguments.size() > 4 ? arguments.get(4) : "*")
-                            .caseSensitive(caseSensitive)
-                            .build();
+                if ("allocation".equals(operation) && arguments.size() >= 2) {
+                    JvmStringAllocationSpec spec = StringAllocationSpecParser.parse(arguments, 1);
                     return session.stringHooks().breakAllocation(arguments.get(0), spec);
                 }
                 throw new IllegalArgumentException(
@@ -1557,10 +1544,13 @@ public final class TargetTui implements AutoCloseable {
     private void toggleSelectedStringHook() {
         final JvmStringHookInfo selected = selectedStringHook();
         if (selected == null) return;
-        submit((selected.enabled() ? "Disabling " : "Enabling ") + selected.name() + "...",
+        final boolean rearm = selected.exhausted();
+        submit((rearm ? "Rearming " : selected.enabled() ? "Disabling " : "Enabling ")
+                        + selected.name() + "...",
                 new Callable<JvmStringHookInfo>() {
                     @Override public JvmStringHookInfo call() {
-                        return session.stringHooks().setEnabled(selected.name(), !selected.enabled());
+                        return rearm ? session.stringHooks().rearm(selected.name())
+                                : session.stringHooks().setEnabled(selected.name(), !selected.enabled());
                     }
                 }, new Consumer<JvmStringHookInfo>() {
                     @Override public void accept(JvmStringHookInfo value) { status = value.toString(); }
@@ -5547,7 +5537,7 @@ public final class TargetTui implements AutoCloseable {
                 "F3 Flush Edits", "Shift+F3 Discard Edits", "F4 Live Follow", "F9 Break", "Shift+F9 Object Break", "F7 Step", "Shift+F7 Step Out", "F8 Run", "Ctrl+R Force Return", "Ctrl+X Exceptions", "Y Run All", "* Freeze/Thaw",
                 "/ Search", "S Method Decompile", "V Range Decompile", "A Class Decompile", "I Info");
         else if (tab == Tab.STRINGS) Collections.addAll(result,
-                "A Add Hook", "Enter Open", "F9 Enable/Disable", "= Replace Field",
+                "A Add Hook", "Enter Open", "F9 Enable/Disable/Rearm", "= Replace Field",
                 "& Track Value", "Delete Remove", "F5 Refresh Hits");
         else if (tab == Tab.FRAMES) Collections.addAll(result,
                 "Enter Debug Frame", "B Frame Bytecode", "S Frame Decompile", "G Frame BCI",

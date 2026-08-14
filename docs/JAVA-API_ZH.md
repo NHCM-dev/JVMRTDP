@@ -344,22 +344,26 @@ session.stringHooks().breakAllocation("secret-created",
                 .contentGlob("*secret-token*")
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
+                .mode(JvmStringAllocationMode.FAST)
+                .maximumHits(10)
+                .sampleEvery(2)
                 .build());
 ```
 
-Allocation 条件会在目标端同步匹配后才产生调试停止。内容 glob 必须命中，创建者
-class/method/descriptor 必须在同一个栈帧命中，但可以是完整创建栈中的任意帧。实现组合
-`VM_OBJECT_ALLOC` 和成功完成的 `String.<init>`，普通 `new String` 会延迟到初始化完成再读取，
-同一物理对象不会重复命中。停止状态的 `returnState()` 为 `allocation`，匹配对象从
-`eventValue()` 获取。
+Allocation 条件会在目标端同步匹配后才产生调试停止。实现先匹配内容；creator 条件全为 `*`
+时不遍历完整栈。默认 `FAST` 临时在 `String.<init>` 构造器返回处加入轻量探针，并在进入
+native/JVMTI 前先于 Java bootstrap 桥中过滤内容；它不监听所有方法退出或所有对象分配。
+`COMPLETE` 才额外开启 `VM_OBJECT_ALLOC` 来覆盖 VM/native 或已被 JIT intrinsic 化的 String，因此会有
+JVM 全局分配事件开销。同一对象会去重；`oneShot()`、`maximumHits(...)`、`sampleEvery(...)`
+可限制停止频率；没有 armed Hook 后热路径会自动关闭。停止状态的 `returnState()` 为
+`allocation`，匹配对象从 `eventValue()` 获取。
 
 引用状态为 `LIVE`、`NULL`、`COLLECTED`、`RELEASED`、`ERROR`。弱引用不占用 JVMTI tag。
 字段型 String Hook 可读取、替换和加入引用管理器；Allocation Hook 可读取和追踪最近命中值；
 自定义 UI 将 `debuggerStates()` 传入 `observe(...)` 可更新最后命中信息。
 
-该功能需要 `CAN_GENERATE_VM_OBJECT_ALLOC_EVENTS`、`CAN_GENERATE_METHOD_EXIT_EVENTS` 与
-`CAN_ACCESS_LOCAL_VARIABLES`。JVMRTDP 会尝试获取仍为 potential 的能力；动态 attach 后不可再
-获得时应使用 `-agentpath`。对象分配事件频率很高，应尽量缩小内容和创建者条件，并在完成分析后关闭 Hook。
+Fast 模式需要 retransform/redefine capability；Complete 还需要
+`CAN_GENERATE_VM_OBJECT_ALLOC_EVENTS`。动态 attach 后不可再获得时应使用 `-agentpath`。
 
 ## 15. 其他 JVMTI 类型化能力
 

@@ -14,6 +14,12 @@ public final class NativeJvmtiBridge {
 
     public static native void setEventNotification(String eventName, boolean enabled);
 
+    /** Changes Java callback delivery without changing the underlying JVMTI event lease. */
+    public static native void setEventCallbackDispatch(String eventName, boolean enabled);
+
+    /** Registers the bootstrap String-constructor probe native on its defining class. */
+    public static native void registerStringHookBridge(Class<?> bridgeClass);
+
     public static native void setBreakpoint(Class<?> type, String methodName,
             String descriptor, long location, boolean enabled, String registrationId,
             Object receiver, String callerClass, String callerMethod, String callerDescriptor);
@@ -64,7 +70,8 @@ public final class NativeJvmtiBridge {
     /** Registers or removes one native String allocation/content/creator filter. */
     public static native void setStringAllocationHook(String registrationId,
             String contentPattern, String creatorClassPattern, String creatorMethodPattern,
-            String creatorDescriptorPattern, boolean caseSensitive, boolean enabled);
+            String creatorDescriptorPattern, boolean caseSensitive, int mode,
+            long maximumHits, int sampleEvery, boolean enabled);
 
     public static native void notifyFramePop(Thread thread, int depth);
 

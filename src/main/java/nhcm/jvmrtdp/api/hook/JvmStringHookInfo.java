@@ -53,12 +53,16 @@ public final class JvmStringHookInfo {
     public long hitCount() { return hitCount; }
     public String lastValue() { return lastValue; }
     public boolean allocationHook() { return kind == JvmStringHookKind.ALLOCATION; }
+    public boolean exhausted() {
+        return allocationSpec != null && allocationSpec.maximumHits() > 0L
+                && hitCount >= allocationSpec.maximumHits();
+    }
     public boolean fieldHook() {
         return kind == JvmStringHookKind.FIELD_READ || kind == JvmStringHookKind.FIELD_WRITE;
     }
 
     @Override public String toString() {
-        return name + " [" + (enabled ? "ON" : "off") + "] " + kind + " "
+        return name + " [" + (exhausted() ? "DONE" : enabled ? "ON" : "off") + "] " + kind + " "
                 + className + "." + memberName + descriptor
                 + (objectSpecific ? " [object]" : "")
                 + (allocationSpec == null ? "" : " [" + allocationSpec.summary() + "]")

@@ -490,14 +490,22 @@ session.stringHooks().breakAllocation("secret-created",
                 .contentGlob("*secret-token*")
                 .createdFrom("com.example.*", "*", "*")
                 .caseSensitive(false)
+                .mode(JvmStringAllocationMode.FAST)
+                .maximumHits(10)
+                .sampleEvery(2)
                 .build());
 ```
 
 Allocation filtering happens synchronously in the target before a debugger stop. The content glob
-and all creator patterns must match; creator components match one frame, but any frame in the
-allocation stack may satisfy them. JVMRTDP combines `VM_OBJECT_ALLOC` with successful
-`java.lang.String.<init>` exits, defers ordinary `new String` matching until initialization, and
-de-duplicates one object across both paths. A hit has reason `string_alloc:<registration>`,
+is evaluated first. Creator components match one frame, but any frame may satisfy them; no full
+stack walk is performed when all creator patterns are wildcards. `FAST` (the default) temporarily
+adds lightweight probes to `String.<init>` returns and prefilters content in Java before
+native/JVMTI work; it does not subscribe to global method-exit or allocation events. `COMPLETE`
+adds `VM_OBJECT_ALLOC` for VM/native-created or already JIT-intrinsified Strings and therefore
+has JVM-wide allocation-event overhead. One physical object is de-duplicated across both paths.
+`oneShot()`, `maximumHits(long)`, and `sampleEvery(int)` bound stop frequency; the hot path is
+disabled when no allocation hook remains armed. A hit has reason
+`string_alloc:<registration>`,
 `returnState() == "allocation"`, and exposes the matched String through `eventValue()`.
 
 Field-backed hooks support `acquireValue`, `replaceValue`, and `trackValue`. Allocation hooks
@@ -505,11 +513,10 @@ support `acquireValue` and `trackValue` for the latest match. Pass debugger stat
 to `observe(...)` in a custom UI to update last-hit metadata. Replacing a String changes the owning
 field reference; it does not mutate String internals.
 
-Allocation hooks require `CAN_GENERATE_VM_OBJECT_ALLOC_EVENTS`,
-`CAN_GENERATE_METHOD_EXIT_EVENTS`, and `CAN_ACCESS_LOCAL_VARIABLES`. JVMRTDP acquires them when
-they remain potential; start with `-agentpath` when HotSpot no longer reports one as potential
-after dynamic attach. Allocation events are high-volume; narrow content and creator patterns
-whenever possible and disable the hook after collecting the required sample.
+Fast hooks require breakpoint, bytecode-reading, and local-variable capabilities. Complete hooks
+also require `CAN_GENERATE_VM_OBJECT_ALLOC_EVENTS`. JVMRTDP acquires capabilities while they remain
+potential; start with `-agentpath` when HotSpot no longer reports one as potential after dynamic
+attach. Prefer fast mode, narrow patterns, sampling, and hit limits for production-like targets.
 
 ## 15. Remaining typed JVMTI services
 
