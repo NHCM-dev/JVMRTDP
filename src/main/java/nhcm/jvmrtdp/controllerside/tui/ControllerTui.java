@@ -63,13 +63,20 @@ public final class ControllerTui {
                 tasks.poll();
                 if (state.attached != null) return Selection.handle(state.attached);
 
-                int width = screen.width();
+                int width = Math.max(1, screen.width() - 1);
                 int height = screen.height();
                 boolean columnsVisible = height >= 5;
                 boolean statusVisible = height >= 3;
                 boolean helpVisible = height >= 7;
                 int headerRows = 1 + (columnsVisible ? 1 : 0);
-                int footerRows = (statusVisible ? 1 : 0) + (helpVisible ? 1 : 0);
+                String activity = tasks.activity();
+                String message = activity.isEmpty() ? status : activity;
+                int helpRows = helpVisible ? 1 : 0;
+                int maximumStatusRows = Math.max(1, height - headerRows - helpRows - 1);
+                List<String> statusRows = statusVisible
+                        ? TuiFooter.statusRows(" " + message, width, maximumStatusRows, 0)
+                        : Collections.<String>emptyList();
+                int footerRows = statusRows.size() + helpRows;
                 int body = Math.max(0, height - headerRows - footerRows);
                 state.selected = clamp(state.selected, 0, Math.max(0, state.processes.size() - 1));
                 if (state.selected < state.scroll) state.scroll = state.selected;
@@ -98,10 +105,9 @@ public final class ControllerTui {
                     lines.add(index == state.selected && index < state.processes.size()
                             ? TerminalScreen.REVERSE + rendered + TerminalScreen.RESET : rendered);
                 }
-                String activity = tasks.activity();
-                String message = activity.isEmpty() ? status : activity;
-                if (statusVisible) {
-                    lines.add(TerminalScreen.REVERSE + TerminalScreen.pad(" " + message, width) + TerminalScreen.RESET);
+                for (String statusRow : statusRows) {
+                    lines.add(TerminalScreen.REVERSE
+                            + TerminalScreen.pad(statusRow, width) + TerminalScreen.RESET);
                 }
                 if (helpVisible) {
                     String help = width < 65 ? "Up/Down select  Enter attach  R refresh  Q quit"

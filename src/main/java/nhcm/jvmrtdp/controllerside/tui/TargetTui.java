@@ -4539,13 +4539,7 @@ public final class TargetTui implements AutoCloseable {
                 ? TuiFooter.allRows(helpTokens(), width)
                 : Collections.<String>emptyList();
         if (tabsVisible) output.add(tabsLine(width));
-        int reservedFooterRows = (statusVisible ? 1 : 0) + shortcuts.size();
-        int bodyRows = Math.max(0, height - output.size() - reservedFooterRows);
-        if (bodyRows > 0) {
-            if (tab == Tab.SOURCE) renderSource(output, width, bodyRows);
-            else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) renderWorkbench(output, width, bodyRows);
-            else renderBrowserPane(output, width, bodyRows);
-        }
+        List<String> statusRows = Collections.emptyList();
         if (statusVisible) {
             String taskActivity = tasks.activity();
             String activity = taskActivity.isEmpty() ? status : taskActivity;
@@ -4556,9 +4550,21 @@ public final class TargetTui implements AutoCloseable {
                 pagedStatus = activity;
                 statusPage = 0;
             }
-            output.add(TerminalScreen.REVERSE + TerminalScreen.pad(
-                    TuiFooter.page(Collections.singletonList(activity), width, statusPage), width)
-                    + TerminalScreen.RESET);
+            int maximumStatusRows = Math.max(1,
+                    height - output.size() - shortcuts.size() - 1);
+            statusRows = TuiFooter.statusRows(
+                    activity, width, maximumStatusRows, statusPage);
+        }
+        int reservedFooterRows = statusRows.size() + shortcuts.size();
+        int bodyRows = Math.max(0, height - output.size() - reservedFooterRows);
+        if (bodyRows > 0) {
+            if (tab == Tab.SOURCE) renderSource(output, width, bodyRows);
+            else if (tab == Tab.BYTECODE || tab == Tab.DEBUG) renderWorkbench(output, width, bodyRows);
+            else renderBrowserPane(output, width, bodyRows);
+        }
+        for (String statusRow : statusRows) {
+            output.add(TerminalScreen.REVERSE
+                    + TerminalScreen.pad(statusRow, width) + TerminalScreen.RESET);
         }
         for (String shortcut : shortcuts) output.add(TerminalScreen.pad(shortcut, width));
         screen.draw(output);
