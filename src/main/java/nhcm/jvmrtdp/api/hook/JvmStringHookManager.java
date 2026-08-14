@@ -13,6 +13,8 @@ import nhcm.jvmrtdp.handles.jvm.RemoteJNIEnv;
 import nhcm.jvmrtdp.handles.jvm.RemoteJVMTIEnv;
 
 import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -22,7 +24,9 @@ import java.util.Map;
 /**
  * Precise, session-scoped String hook registry shared by the library, CLI and TUI.
  * Field hooks are JVMTI access/modification watchpoints. Method hooks are JVMTI
- * entry/exit event breakpoints. Hook hits are inspected through the normal debugger.
+ * entry/exit event breakpoints. Allocation hooks combine VM object-allocation events with
+ * completed {@code String.<init>} exits, filter content and creator frames in the target, and
+ * expose the matched String through the normal debugger.
  */
 public final class JvmStringHookManager implements AutoCloseable {
     private static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
@@ -81,6 +85,17 @@ public final class JvmStringHookManager implements AutoCloseable {
         return entry.info();
     }
 
+    /** Stops the allocating thread when a newly observable String matches the supplied filter. */
+    public synchronized JvmStringHookInfo breakAllocation(String name,
+            JvmStringAllocationSpec spec) {
+        String key = normalize(name);
+        if (spec == null) throw new IllegalArgumentException("allocation spec must not be null");
+        Entry entry = Entry.allocation(key, spec);
+        replaceEntry(key, entry);
+        enableOrRemove(entry);
+        return entry.info();
+    }
+
     public synchronized List<JvmStringHookInfo> snapshot() {
         List<JvmStringHookInfo> result = new ArrayList<JvmStringHookInfo>();
         for (Entry entry : entries.values()) result.add(entry.info());
@@ -108,6 +123,13 @@ public final class JvmStringHookManager implements AutoCloseable {
                 entry.lastHitSequence = state.sequence();
                 entry.lastHit = state.reason() + " at " + state.className() + "."
                         + state.methodName() + state.descriptor() + "@" + state.location();
+                if (entry.kind == JvmStringHookKind.ALLOCATION) {
+                    entry.hitCount++;
+                    close(entry.lastValue);
+                    entry.lastValue = state.eventValue() == null
+                            ? null : jni.retain(state.eventValue(), false);
+                    entry.lastValueText = readString(entry.lastValue);
+                }
                 revision++;
             }
         }
@@ -115,7 +137,15 @@ public final class JvmStringHookManager implements AutoCloseable {
 
     /** Reads the String field behind a field hook; the caller owns the returned handle. */
     public synchronized RemoteObject acquireValue(String name) {
-        Entry entry = requireField(name);
+        Entry entry = require(name);
+        if (entry.kind == JvmStringHookKind.ALLOCATION) {
+            if (entry.lastValue == null) {
+                throw new IllegalStateException("String allocation hook " + entry.name
+                        + " has not matched a live value yet");
+            }
+            return jni.retain(entry.lastValue, false);
+        }
+        entry = requireField(name);
         return entry.field.isStatic() ? entry.field.readStatic() : entry.field.read(entry.receiver);
     }
 
@@ -131,12 +161,19 @@ public final class JvmStringHookManager implements AutoCloseable {
         revision++;
     }
 
-    /** Adds the hook's field value to the shared reference manager for continued inspection. */
+    /** Adds a field value or the most recent allocation match to the shared reference manager. */
     public synchronized JvmReferenceInfo trackValue(String hookName,
             JvmReferenceManager references, String referenceName,
             JvmReferenceStrength receiverStrength) {
         if (references == null) throw new IllegalArgumentException("references must not be null");
-        Entry entry = requireField(hookName);
+        Entry entry = require(hookName);
+        if (entry.kind == JvmStringHookKind.ALLOCATION) {
+            try (RemoteObject value = acquireValue(hookName)) {
+                return references.trackObject(referenceName, value,
+                        receiverStrength == null ? JvmReferenceStrength.STRONG : receiverStrength);
+            }
+        }
+        entry = requireField(hookName);
         return entry.field.isStatic()
                 ? references.trackStaticField(referenceName, entry.field)
                 : references.trackField(referenceName, entry.field, entry.receiver,
@@ -148,6 +185,7 @@ public final class JvmStringHookManager implements AutoCloseable {
         if (entry == null) throw new IllegalArgumentException("Unknown String hook: " + name);
         disableQuietly(entry);
         close(entry.receiver);
+        close(entry.lastValue);
         revision++;
     }
 
@@ -155,6 +193,7 @@ public final class JvmStringHookManager implements AutoCloseable {
         for (Entry entry : entries.values()) {
             disableQuietly(entry);
             close(entry.receiver);
+            close(entry.lastValue);
         }
         entries.clear();
         revision++;
@@ -166,7 +205,9 @@ public final class JvmStringHookManager implements AutoCloseable {
         if (entry.enabled == enabled) return;
         if (enabled) {
             jvmti.configureDebugger(true);
-            if (entry.field != null) {
+            if (entry.kind == JvmStringHookKind.ALLOCATION) {
+                jvmti.setStringAllocationHook(entry.registrationId, entry.allocationSpec, true);
+            } else if (entry.field != null) {
                 jvmti.setFieldWatch(entry.className, entry.memberName, entry.descriptor,
                         entry.kind == JvmStringHookKind.FIELD_WRITE, entry.receiver, true);
                 entry.fieldWatch = findFieldWatch(entry);
@@ -177,6 +218,9 @@ public final class JvmStringHookManager implements AutoCloseable {
             }
             entry.enabled = true;
         } else {
+            if (entry.kind == JvmStringHookKind.ALLOCATION) {
+                jvmti.setStringAllocationHook(entry.registrationId, entry.allocationSpec, false);
+            }
             if (entry.fieldWatch != null) jvmti.clearFieldWatch(entry.fieldWatch);
             if (entry.eventBreakpoint != null) jvmti.clearEventBreakpoint(entry.eventBreakpoint);
             entry.fieldWatch = null;
@@ -193,6 +237,7 @@ public final class JvmStringHookManager implements AutoCloseable {
             if (entries.get(entry.name) == entry) entries.remove(entry.name);
             disableQuietly(entry);
             close(entry.receiver);
+            close(entry.lastValue);
             revision++;
             throw failure;
         }
@@ -211,6 +256,10 @@ public final class JvmStringHookManager implements AutoCloseable {
 
     private static boolean matches(Entry entry, JvmDebuggerState state) {
         String reason = state.reason().toLowerCase(Locale.ROOT);
+        if (entry.kind == JvmStringHookKind.ALLOCATION) {
+            return "allocation".equals(state.returnState())
+                    && reasonContainsRegistration(reason, entry.registrationId);
+        }
         if (entry.kind == JvmStringHookKind.METHOD_ENTRY) {
             return reason.contains("method_entry") && exactMethod(entry, state);
         }
@@ -228,6 +277,15 @@ public final class JvmStringHookManager implements AutoCloseable {
         return reason.contains(precise) || reason.contains(legacy)
                 || reason.contains("field") && reason.contains(expected)
                 && reason.contains(entry.memberName.toLowerCase(Locale.ROOT));
+    }
+
+    private static boolean reasonContainsRegistration(String reason, String registrationId) {
+        String marker = registrationId.toLowerCase(Locale.ROOT);
+        int start = reason.indexOf("string_alloc:");
+        if (start < 0) return false;
+        String[] ids = reason.substring(start + "string_alloc:".length()).split(",");
+        for (String id : ids) if (marker.equals(id)) return true;
+        return false;
     }
 
     private static boolean exactMethod(Entry entry, JvmDebuggerState state) {
@@ -256,6 +314,7 @@ public final class JvmStringHookManager implements AutoCloseable {
         if (previous != null) {
             disableQuietly(previous);
             close(previous.receiver);
+            close(previous.lastValue);
         }
         entries.put(key, entry);
         revision++;
@@ -297,6 +356,32 @@ public final class JvmStringHookManager implements AutoCloseable {
         return name.trim().replace('/', '.');
     }
 
+    private static String allocationId(String name) {
+        return "string-allocation-" + Base64.getUrlEncoder().withoutPadding().encodeToString(
+                name.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String readString(RemoteObject value) {
+        if (value == null) return "";
+        try { return preview(value.asObject(String.class)); }
+        catch (RuntimeException failure) { return preview(value.displayValue()); }
+    }
+
+    private static String preview(String value) {
+        if (value == null) return "null";
+        StringBuilder result = new StringBuilder(Math.min(value.length(), 160));
+        for (int index = 0; index < value.length() && result.length() < 160; ++index) {
+            char character = value.charAt(index);
+            if (character == '\n') result.append("\\n");
+            else if (character == '\r') result.append("\\r");
+            else if (character == '\t') result.append("\\t");
+            else if (Character.isISOControl(character)) result.append('?');
+            else result.append(character);
+        }
+        if (result.length() >= 160 || value.length() > result.length()) result.append("...");
+        return result.toString();
+    }
+
     private static final class Entry {
         private final String name;
         private final JvmStringHookKind kind;
@@ -305,14 +390,20 @@ public final class JvmStringHookManager implements AutoCloseable {
         private final String descriptor;
         private final RemoteField field;
         private final RemoteObject receiver;
+        private final String registrationId;
+        private final JvmStringAllocationSpec allocationSpec;
         private boolean enabled;
         private JvmFieldWatchInfo fieldWatch;
         private JvmEventBreakpointInfo eventBreakpoint;
         private long lastHitSequence = -1L;
         private String lastHit = "";
+        private long hitCount;
+        private RemoteObject lastValue;
+        private String lastValueText = "";
 
         private Entry(String name, JvmStringHookKind kind, String className,
-                String memberName, String descriptor, RemoteField field, RemoteObject receiver) {
+                String memberName, String descriptor, RemoteField field, RemoteObject receiver,
+                String registrationId, JvmStringAllocationSpec allocationSpec) {
             this.name = name;
             this.kind = kind;
             this.className = className;
@@ -320,22 +411,32 @@ public final class JvmStringHookManager implements AutoCloseable {
             this.descriptor = descriptor;
             this.field = field;
             this.receiver = receiver;
+            this.registrationId = registrationId;
+            this.allocationSpec = allocationSpec;
         }
 
         private static Entry field(String name, JvmStringHookKind kind,
                 RemoteField field, RemoteObject receiver) {
             return new Entry(name, kind, field.declaringClass(), field.name(),
-                    field.descriptor(), field, receiver);
+                    field.descriptor(), field, receiver, "", null);
         }
 
         private static Entry method(String name, JvmStringHookKind kind,
                 String className, String methodName, String descriptor) {
-            return new Entry(name, kind, className, methodName, descriptor, null, null);
+            return new Entry(name, kind, className, methodName, descriptor,
+                    null, null, "", null);
+        }
+
+        private static Entry allocation(String name, JvmStringAllocationSpec spec) {
+            return new Entry(name, JvmStringHookKind.ALLOCATION, "java.lang.String",
+                    "<allocation>", STRING_DESCRIPTOR, null, null,
+                    allocationId(name), spec);
         }
 
         private JvmStringHookInfo info() {
             return new JvmStringHookInfo(name, kind, className, memberName, descriptor,
-                    receiver != null, enabled, lastHitSequence, lastHit);
+                    receiver != null, enabled, lastHitSequence, lastHit,
+                    allocationSpec, hitCount, lastValueText);
         }
     }
 }

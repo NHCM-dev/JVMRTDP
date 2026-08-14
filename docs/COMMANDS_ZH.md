@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-本文档说明 JVMRTDP 2.1.1 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
+本文档说明 JVMRTDP 2.2.0 的 TUI、命令行和调试命令。示例中的 `<pid>`、`<class>`、`<method>` 和 `<file>` 均为占位符。
 
 ## 1. 基本约定
 
@@ -16,8 +16,8 @@
 ## 2. 启动与会话
 
 ```powershell
-java -jar JVMRTDP-2.1.1.jar
-java -jar JVMRTDP-2.1.1.jar --cli
+java -jar JVMRTDP-2.2.0.jar
+java -jar JVMRTDP-2.2.0.jar --cli
 ```
 
 控制端命令：
@@ -153,6 +153,7 @@ TUI 的 `references` 页中，`Enter` 打开为 Context，`S`/`Shift+S` 强/弱�
 
 ```text
 strings list
+strings allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
 strings on <name>
@@ -166,9 +167,16 @@ strings remove <name>
 strings clear
 ```
 
+Allocation Hook 组合 `VM_OBJECT_ALLOC` 与成功完成的 `java.lang.String.<init>`。内容 glob 和
+创建者 class/method/descriptor 会在目标 JVM 内对完整分配调用栈进行匹配，只有命中才暂停。
+默认 pattern 为 `*` 且区分大小写；填满三个创建者 pattern 后追加 `ignore-case` 可忽略大小写。
+构造器产生的 String 会在初始化完成后读取；VM/native 直接产生且内容可见的 String 也可捕获，
+同一物理对象不会因两条事件路径重复命中。
+
 字段 Hook 仅接受 `Ljava/lang/String;` 字段，分别映射到 JVMTI 字段读取/修改监视点。可选的 `object` 使用当前对象 Context，只匹配该实例；省略时匹配所有实例。方法 Hook 映射到进入/退出事件断点。命中记录和 Frames/Locals 由共享调试器提供。
 
-`read`、`use`、`set`、`track` 和 `call` 用于字段型 Hook。字符串不可变，因此 `set` 替换字段持有的引用，不直接修改 String 内部存储。TUI 的 `strings` 页使用 `A` 添加、`Enter` 打开、`F9` 启用/禁用、`=` 替换、`&` 加入 References、`Delete` 删除。
+`read`、`use`、`track` 和 `call` 也可操作最近一次 Allocation 命中的 String；`set` 仅用于字段型
+Hook，因为字符串对象不可变。TUI 的 `strings` 页使用 `A` 添加、`Enter` 打开、`F9` 启用/禁用、`=` 替换、`&` 加入 References、`Delete` 删除。
 
 ## 5. 值表达式
 
@@ -400,7 +408,7 @@ debugger thaw
 debugger snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]
 ```
 
-冻结会保存线程原状态，排除代理服务、Attach Listener 等敏感线程，并只恢复本次冻结暂停的线程。快照 schema v4 包含断点、监视点、托管引用、String Hook、暂停栈帧/local 和方法退出返回值，供离线分析或其他程序读取。
+冻结会保存线程原状态，排除代理服务、Attach Listener 等敏感线程，并只恢复本次冻结暂停的线程。快照 schema v5 包含断点、监视点、托管引用、String Allocation 条件与命中、暂停栈帧/local、方法退出返回值和事件对象，供离线分析或其他程序读取。
 
 ### 9.7 调试限制
 

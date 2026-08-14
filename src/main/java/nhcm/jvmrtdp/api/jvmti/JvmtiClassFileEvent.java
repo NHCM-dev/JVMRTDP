@@ -2,7 +2,11 @@ package nhcm.jvmrtdp.api.jvmti;
 
 import java.security.ProtectionDomain;
 
-/** Class-load parameters supplied to a bytecode transformer. */
+/**
+ * Class-load parameters supplied to a bytecode transformer. The byte array is defensively copied.
+ * {@link #classBeingRedefined()} is null for initial definition and non-null during
+ * redefine/retransform. {@link #className()} uses a binary dot name.
+ */
 public class JvmtiClassFileEvent {
     private ClassLoader loader;
     private final String className;

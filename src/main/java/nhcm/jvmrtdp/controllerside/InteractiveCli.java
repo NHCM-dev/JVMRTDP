@@ -52,6 +52,7 @@ import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
 import nhcm.jvmrtdp.api.bytecode.JvmExceptionHandlerInfo;
 import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
 import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
 import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
 import nhcm.jvmrtdp.api.reference.JvmReferenceStrength;
 import nhcm.jvmrtdp.handles.search.RemoteClassQuery;
@@ -309,10 +310,11 @@ public class InteractiveCli {
             super("strings",
                     "strings [list|field <name> <read|write> <class> <field> [object]|"
                             + "method <name> <entry|exit> <class> <method> <descriptor>|"
+                            + "allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]|"
                             + "on <name>|off <name>|read <name>|use <name>|set <name> <value>|"
                             + "track <hook> <reference> [strong|weak]|call <hook> <method> <descriptor> [args...]|"
                             + "remove <name>|clear]",
-                    "Manages precise String field watches and String-bearing method entry/exit hooks.",
+                    "Manages String allocations, field watches, and String-bearing method hooks.",
                     "string-hooks");
         }
 
@@ -344,6 +346,25 @@ public class InteractiveCli {
                 if (kind == null) return InteractiveCli.usage(session, this);
                 session.output().println(session.stringHooks().breakMethod(arguments.get(1), kind,
                         arguments.get(3), arguments.get(4), arguments.get(5)));
+                return true;
+            }
+            if ("allocation".equals(operation)
+                    && arguments.size() >= 3 && arguments.size() <= 7) {
+                boolean caseSensitive = arguments.size() < 7
+                        || !"ignore-case".equalsIgnoreCase(arguments.get(6));
+                if (arguments.size() == 7 && caseSensitive
+                        && !"case-sensitive".equalsIgnoreCase(arguments.get(6))) {
+                    return InteractiveCli.usage(session, this);
+                }
+                JvmStringAllocationSpec spec = JvmStringAllocationSpec.builder()
+                        .contentGlob(arguments.get(2))
+                        .createdFrom(arguments.size() > 3 ? arguments.get(3) : "*",
+                                arguments.size() > 4 ? arguments.get(4) : "*",
+                                arguments.size() > 5 ? arguments.get(5) : "*")
+                        .caseSensitive(caseSensitive)
+                        .build();
+                session.output().println(session.stringHooks().breakAllocation(
+                        arguments.get(1), spec));
                 return true;
             }
             if (("on".equals(operation) || "off".equals(operation)) && arguments.size() == 2) {

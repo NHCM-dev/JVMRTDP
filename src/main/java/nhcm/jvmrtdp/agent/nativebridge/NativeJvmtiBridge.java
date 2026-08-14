@@ -61,6 +61,11 @@ public final class NativeJvmtiBridge {
     public static native void setFieldWatchByName(String className, String fieldName,
             String descriptor, boolean modification, boolean enabled, String registrationId);
 
+    /** Registers or removes one native String allocation/content/creator filter. */
+    public static native void setStringAllocationHook(String registrationId,
+            String contentPattern, String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive, boolean enabled);
+
     public static native void notifyFramePop(Thread thread, int depth);
 
     public static native long[] eventQueueStatistics();

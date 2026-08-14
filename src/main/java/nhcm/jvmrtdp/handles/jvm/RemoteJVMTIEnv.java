@@ -19,6 +19,7 @@ import nhcm.jvmrtdp.api.jvmti.JvmtiMethodInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiThreadInfo;
 import nhcm.jvmrtdp.api.jvmti.JvmtiMonitorUsage;
 import nhcm.jvmrtdp.api.jvmti.JvmtiTimerInfo;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
 import nhcm.jvmrtdp.api.jvmti.JvmtiEventType;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerState;
 import nhcm.jvmrtdp.api.jvmti.JvmDebuggerLocal;
@@ -278,13 +279,23 @@ public class RemoteJVMTIEnv extends RemoteHandle {
                 ? Collections.<String, Map<Long, Long>>emptyMap() : relocations);
     }
 
+    /**
+     * Installs or clears a persistent BCI breakpoint. {@code location} is a bytecode index, not
+     * a source line or instruction ordinal. A symbolic registration can be retained until an
+     * unloaded class is prepared; native and abstract methods require an event breakpoint.
+     */
     public void setBreakpoint(String className, String methodName, String descriptor,
             long location, boolean enabled) {
         setBreakpoint(className, methodName, descriptor, location,
                 JvmBreakpointCondition.any(), enabled);
     }
 
-    /** Installs a persistent conditional breakpoint; conditions are evaluated before pausing. */
+    /**
+     * Installs or clears a persistent conditional BCI breakpoint. Conditions are evaluated before
+     * pausing. Receiver conditions use object identity and require the receiver handle to remain
+     * alive; caller components accept {@code *}/{@code ?} patterns. Prefer
+     * {@link #clearBreakpoint(JvmBreakpointInfo)} for removal.
+     */
     public void setBreakpoint(String className, String methodName, String descriptor,
             long location, JvmBreakpointCondition condition, boolean enabled) {
         if (condition == null) condition = JvmBreakpointCondition.any();
@@ -481,7 +492,11 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         executeForOutput(CommandLine.of("jvmti", enabled ? "debug.enable" : "debug.disable"));
     }
 
-    /** Installs a method-entry, method-exit, or exception event breakpoint. */
+    /**
+     * Installs a method-entry, method-exit, or exception event breakpoint. Event breakpoints do
+     * not require a Code attribute, so they can stop native and abstract methods. Close object
+     * values returned by the resulting debugger state when they are no longer needed.
+     */
     public JvmEventBreakpointInfo setEventBreakpoint(JvmEventBreakpointSpec spec) {
         if (spec == null) throw new IllegalArgumentException("spec must not be null");
         String raw = spec.kind().wireName() + '|' + spec.classPattern() + '|'
@@ -520,10 +535,12 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         }
     }
 
+    /** Returns the current/last debugger state. The returned state owns remote handles. */
     public JvmDebuggerState debuggerState() {
         return decodeDebuggerState(executeForOutput(CommandLine.of("jvmti", "debug.status")));
     }
 
+    /** Returns all current/last debugger states. Close every returned state. */
     public List<JvmDebuggerState> debuggerStates() {
         String output = executeForOutput(CommandLine.of("jvmti", "debug.status-all"));
         if (output.isEmpty()) return Collections.emptyList();
@@ -634,12 +651,21 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         executeForOutput(CommandLine.of("jvmti", "debug.force-return-void", objectId(thread)));
     }
 
+    /**
+     * Installs or clears a read ({@code modification=false}) or write
+     * ({@code modification=true}) watch for all receivers. Symbolic watches can remain pending
+     * until an unloaded class is prepared.
+     */
     public void setFieldWatch(String className, String fieldName, String descriptor,
             boolean modification, boolean enabled) {
         setFieldWatch(className, fieldName, descriptor, modification, null, enabled);
     }
 
-    /** A non-null receiver limits an instance-field watch to that exact object. */
+    /**
+     * Installs or clears a field watch. A non-null receiver limits an instance-field watch to
+     * that exact object identity; pass null for all instances and for static fields. Keep a
+     * receiver handle alive until the watch is cleared.
+     */
     public void setFieldWatch(String className, String fieldName, String descriptor,
             boolean modification, RemoteObject receiver, boolean enabled) {
         String normalized = normalizeClassName(className);
@@ -680,6 +706,25 @@ public class RemoteJVMTIEnv extends RemoteHandle {
         for (JvmFieldWatchInfo watch : snapshot) {
             clearFieldWatch(watch);
         }
+    }
+
+    /**
+     * Installs or clears a target-side String allocation filter. Matching combines
+     * {@code VM_OBJECT_ALLOC} with completed {@code java.lang.String.<init>} exits so content is
+     * evaluated after initialization whenever a constructor exists. A hit pauses the allocating
+     * thread and exposes the String as {@link JvmDebuggerState#eventValue()}.
+     */
+    public void setStringAllocationHook(String registrationId,
+            JvmStringAllocationSpec spec, boolean enabled) {
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        if (spec == null) throw new IllegalArgumentException("spec must not be null");
+        executeForOutput(CommandLine.of("jvmti", "string.alloc",
+                enabled ? "set" : "clear", registrationId,
+                spec.contentPattern(), spec.creatorClassPattern(),
+                spec.creatorMethodPattern(), spec.creatorDescriptorPattern(),
+                Boolean.toString(spec.caseSensitive())));
     }
 
     public RemoteCodeDeployment deployClasses(String name, Map<String, byte[]> classes) {

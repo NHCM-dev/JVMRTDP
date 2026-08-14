@@ -2,7 +2,7 @@
 
 [English](COMMANDS.md) | [中文](COMMANDS_ZH.md)
 
-This document describes the TUI, command line, and debugger commands in JVMRTDP 2.1.1. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
+This document describes the TUI, command line, and debugger commands in JVMRTDP 2.2.0. Values such as `<pid>`, `<class>`, `<method>`, and `<file>` are placeholders.
 
 ## 1. Conventions
 
@@ -16,8 +16,8 @@ This document describes the TUI, command line, and debugger commands in JVMRTDP 
 ## 2. Startup and Sessions
 
 ```powershell
-java -jar JVMRTDP-2.1.1.jar
-java -jar JVMRTDP-2.1.1.jar --cli
+java -jar JVMRTDP-2.2.0.jar
+java -jar JVMRTDP-2.2.0.jar --cli
 ```
 
 Controller commands:
@@ -175,6 +175,7 @@ strongly/weakly, `=` to replace, `X` to write null, `Delete` to release, and `F5
 
 ```text
 strings list
+strings allocation <name> <content-glob> [creator-class [creator-method [descriptor [ignore-case]]]]
 strings field <name> <read|write> <class> <field> [object]
 strings method <name> <entry|exit> <class> <method> <descriptor>
 strings on <name>
@@ -188,12 +189,20 @@ strings remove <name>
 strings clear
 ```
 
+Allocation hooks combine `VM_OBJECT_ALLOC` with successful `java.lang.String.<init>` exits. The
+content glob and creator class/method/descriptor patterns are matched inside the target against
+the complete allocation stack before pausing. Defaults are `*` and case-sensitive; append
+`ignore-case` after all three creator patterns to ignore case. Constructor-created Strings are
+read after initialization, VM/native-created Strings are caught when their content is observable,
+and one physical String is de-duplicated across both event paths.
+
 Field hooks require descriptor `Ljava/lang/String;` and use JVMTI field access/modification
 watchpoints. The optional `object` scope uses the current object Context; otherwise the watch
 applies to every matching instance. Method hooks use managed entry/exit event breakpoints and
 target either `java.lang.String` or a signature containing `Ljava/lang/String;`.
 
-`read`, `use`, `set`, `track`, and `call` operate on field-backed hooks. Method hook hits appear in
+`read`, `use`, `track`, and `call` also operate on the latest allocation match. `set` applies only
+to field-backed hooks because String objects are immutable. Method hook hits appear in
 Debug, where Frames/Locals expose the receiver, arguments, and return value. Replacing a String
 updates its owning reference; Java String instances are not mutated internally.
 
@@ -479,7 +488,7 @@ debugger thaw
 debugger snapshot <file|-> [json|jsonl] [max-frames] [locals-depth]
 ```
 
-Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshot schema version 4 includes bytecode breakpoints, event breakpoints, field watches, tracked references, String hooks, paused frames/locals, and captured method-exit return values for offline analysis and external tools.
+Freeze records the original thread states, excludes sensitive threads such as agent services and the Attach Listener, and resumes only threads suspended by the active freeze. Snapshot schema version 5 includes bytecode breakpoints, event breakpoints, field watches, tracked references, String allocation filters/hits, paused frames/locals, method-exit return values, and matched event objects for offline analysis and external tools.
 
 ### 9.7 Debugging Limits
 

@@ -4,6 +4,9 @@
 
 JVMRTDP can be embedded in another Java application through the public API in `nhcm.jvmrtdp.api`. The build also continues to produce the standalone executable JAR used by the CLI and TUI.
 
+For task-oriented examples and the complete callback, breakpoint, field-watch, debugger, and
+instrumentation reference, see the [Java API Reference](JAVA-API.md).
+
 ## 1. Install
 
 Publish a development build to the local Maven repository:
@@ -20,7 +23,7 @@ repositories {
 }
 
 dependencies {
-    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1")
+    implementation("nhcm.jvmrtdp:jvmrtdp:2.2.0")
 }
 ```
 
@@ -30,11 +33,11 @@ Maven:
 <dependency>
   <groupId>nhcm.jvmrtdp</groupId>
   <artifactId>jvmrtdp</artifactId>
-  <version>2.1.1</version>
+  <version>2.2.0</version>
 </dependency>
 ```
 
-For a local file dependency, use `build/libs/jvmrtdp-2.1.1-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies ASM and JLine; file-based consumers must add `asm-tree` and `asm-util` when using bytecode APIs and JLine when using terminal controller classes. The standalone `build/libs/JVMRTDP-2.1.1.jar` remains a self-contained executable.
+For a local file dependency, use `build/libs/jvmrtdp-2.2.0-library.jar`. The library artifact contains JVMRTDP classes, native Windows x64 components, and decompiler implementations. Maven/Gradle metadata supplies ASM and JLine; file-based consumers must add `asm-tree` and `asm-util` when using bytecode APIs and JLine when using terminal controller classes. The standalone `build/libs/JVMRTDP-2.2.0.jar` remains a self-contained executable.
 
 Published artifacts include the library JAR, sources, Javadocs, and Maven POM. The automatic module name is `nhcm.jvmrtdp`.
 
@@ -144,7 +147,7 @@ Important accessors:
 | `session.jvmti()` | Capabilities, threads, stacks, locals, events, breakpoints, tags, and class operations |
 | `session.instrumentation()` | Source/JAR deployment, hooks, transformers, retransform, and redefine |
 | `session.references()` | Strong/weak object snapshots and live instance/static field slots |
-| `session.stringHooks()` | String field watches and String-bearing method entry/exit hooks |
+| `session.stringHooks()` | Conditional String allocations, field watches, and method entry/exit hooks |
 | `session.operations()` | Workspace-oriented construct/call/get/set helpers |
 | `session.context()` | Context stack used by embedded CLI commands |
 | `session.workspace()` | Named class and object handles |
@@ -211,6 +214,7 @@ high-volume callback for every String operation:
 
 ```java
 import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
 import nhcm.jvmrtdp.handles.java.RemoteField;
 
 RemoteClass config = session.findClass("com.example.Config");
@@ -220,6 +224,12 @@ session.stringHooks().watchField("message-write", message, true, null);
 session.stringHooks().breakMethod("parse-exit", JvmStringHookKind.METHOD_EXIT,
         "com.example.Parser", "parse",
         "(Ljava/lang/String;)Ljava/lang/String;");
+session.stringHooks().breakAllocation("secret-created",
+        JvmStringAllocationSpec.builder()
+                .contentGlob("*secret-token*")
+                .createdFrom("com.example.*", "*", "*")
+                .caseSensitive(false)
+                .build());
 
 try (RemoteObject current = session.stringHooks().acquireValue("message-write");
      RemoteObject length = current.call("length", "()I")) {
@@ -242,6 +252,12 @@ object; passing `null` watches every instance. Method hooks map to managed `METH
 `METHOD_EXIT` event breakpoints and may target `java.lang.String` methods or signatures containing
 `Ljava/lang/String;`.
 
+Allocation hooks evaluate content and creator-stack patterns inside the target. They combine
+`VM_OBJECT_ALLOC` with completed `String.<init>` exits so ordinary Java Strings are inspected after
+initialization while VM/native-created Strings can still be observed. The latest match is retained
+by the manager and supports `acquireValue`, `trackValue`, and method invocation. It cannot be
+mutated in place; track it or modify the owning field/local instead.
+
 Hook hits use the shared debugger. Call `observe(debuggerStates)` when building a custom UI, or use
 the built-in TUI/CLI, which observes stops automatically. A field-backed hook can read, replace,
 track, and invoke methods on its current String. Method hook arguments, receivers, and return values
@@ -251,7 +267,7 @@ Java Strings remain immutable: `replaceValue` replaces the owning field referenc
 modify a String object's internal byte/char storage. Paused locals can be replaced with
 `setDebuggerLocal`, and an assignable Context local can be updated through the existing Context API.
 
-Tracked references and String hook state are included in debugger JSON/JSONL snapshot schema v4.
+Tracked references and String hook state are included in debugger JSON/JSONL snapshot schema v5.
 Both managers are session-owned and release their target-side handles and installed JVMTI events
 when the session closes.
 

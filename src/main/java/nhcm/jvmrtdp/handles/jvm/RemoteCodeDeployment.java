@@ -43,11 +43,18 @@ public class RemoteCodeDeployment implements AutoCloseable {
         return jvmti.execute(this, className, methodName, descriptor, receiver, arguments);
     }
 
+    /**
+     * Registers a public target-side {@code JvmtiEventHandler} or class-file transformer with a
+     * public no-argument constructor. {@code events} is a comma-separated list of wire names such
+     * as {@code method_entry,method_exit}. Prefer the typed set overload. Close the returned handle
+     * to unregister it.
+     */
     public RemoteJvmtiCallback registerCallback(String handlerClass, String events, boolean synchronous) {
         ensureOpen();
         return jvmti.registerCallback(this, handlerClass, events, synchronous);
     }
 
+    /** Registers a callback for the exact event set; asynchronous delivery is recommended for observation. */
     public RemoteJvmtiCallback registerCallback(String handlerClass, Set<JvmtiEventType> events,
             boolean synchronous) {
         StringBuilder names = new StringBuilder();

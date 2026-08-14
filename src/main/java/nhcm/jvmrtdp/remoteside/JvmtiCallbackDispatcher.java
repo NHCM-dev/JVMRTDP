@@ -304,6 +304,9 @@ public class JvmtiCallbackDispatcher {
         }
     }
 
+    /** Shares native event-notification ownership with built-in target-side services. */
+    static void retainInfrastructureEvent(JvmtiEventType event) { retain(event); }
+
     private static void requireCapability(JvmtiEventType event) {
         JvmtiCapability required = event.requiredCapability();
         if (required == null) return;
@@ -326,6 +329,9 @@ public class JvmtiCallbackDispatcher {
             catch (RuntimeException ignored) { }
         }
     }
+
+    /** Releases an event previously retained by a built-in target-side service. */
+    static void releaseInfrastructureEvent(JvmtiEventType event) { release(event); }
 
     private static String eventNames(Set<JvmtiEventType> events) {
         StringBuilder result = new StringBuilder();

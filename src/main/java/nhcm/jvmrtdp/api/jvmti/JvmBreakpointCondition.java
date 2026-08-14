@@ -5,7 +5,9 @@ import nhcm.jvmrtdp.handles.java.RemoteObject;
 /**
  * Optional persistent-breakpoint predicate shared by the Java library, CLI and TUI.
  * Empty caller components are wildcards; {@code *} and {@code ?} are supported by
- * target-side matching.
+ * target-side matching. Receiver matching uses target-JVM object identity, not
+ * {@code equals}. The receiver handle (or a strong tracked reference) must remain alive until
+ * the breakpoint is removed, including across redefinition-driven breakpoint relocation.
  */
 public final class JvmBreakpointCondition {
     private static final JvmBreakpointCondition ANY =

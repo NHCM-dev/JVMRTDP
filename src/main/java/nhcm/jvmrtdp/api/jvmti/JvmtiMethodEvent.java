@@ -4,7 +4,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-/** Strongly typed METHOD_ENTRY/METHOD_EXIT event including receiver, arguments and return value. */
+/**
+ * Strongly typed METHOD_ENTRY/METHOD_EXIT event including best-effort receiver, arguments, and
+ * return value capture. Native/opaque frames, unavailable local access, or missing debug metadata
+ * can make individual values unavailable; callers must inspect the corresponding availability
+ * flag or argument error. A Java null is a valid available object value.
+ */
 public class JvmtiMethodEvent extends JvmtiEvent {
     private final Object receiver;
     private final boolean receiverAvailable;
@@ -46,6 +51,7 @@ public class JvmtiMethodEvent extends JvmtiEvent {
     /** True for a successfully captured receiver and for a static method, which has no receiver. */
     public boolean receiverAvailable() { return receiverAvailable; }
     public String receiverError() { return receiverError; }
+    /** Arguments in descriptor order, including JVM slot, optional source name, value, and error. */
     public List<JvmtiMethodArgument> arguments() { return arguments; }
     public boolean argumentsAvailable() {
         for (JvmtiMethodArgument argument : arguments) if (!argument.available()) return false;

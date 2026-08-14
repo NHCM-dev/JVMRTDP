@@ -12,6 +12,7 @@ import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatch;
 import nhcm.jvmrtdp.api.bytecode.JvmBytecodePatchResult;
 import nhcm.jvmrtdp.api.hook.JvmStringHookInfo;
 import nhcm.jvmrtdp.api.hook.JvmStringHookKind;
+import nhcm.jvmrtdp.api.hook.JvmStringAllocationSpec;
 import nhcm.jvmrtdp.api.reference.JvmReferenceInfo;
 import nhcm.jvmrtdp.api.reference.JvmReferenceStrength;
 import nhcm.jvmrtdp.controllerside.TargetSession;
@@ -1448,7 +1449,7 @@ public final class TargetTui implements AutoCloseable {
     }
 
     private void addStringHook() throws IOException {
-        String source = editText("String hook: field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
+        String source = editText("String hook: allocation <name> <content-glob> [class method descriptor ignore-case] | field <name> <read|write> <class> <field> [object] | method <name> <entry|exit> <class> <method> <descriptor>", "");
         if (source == null || source.trim().isEmpty()) return;
         final CommandLine line = CommandLine.parse(source);
         final List<String> arguments = line.arguments();
@@ -1476,7 +1477,26 @@ public final class TargetTui implements AutoCloseable {
                     return session.stringHooks().breakMethod(arguments.get(0), kind,
                             arguments.get(2), arguments.get(3), arguments.get(4));
                 }
-                throw new IllegalArgumentException("Expected field ... or method ... String hook syntax");
+                if ("allocation".equals(operation)
+                        && arguments.size() >= 2 && arguments.size() <= 6) {
+                    boolean caseSensitive = arguments.size() < 6
+                            || !"ignore-case".equalsIgnoreCase(arguments.get(5));
+                    if (arguments.size() == 6 && caseSensitive
+                            && !"case-sensitive".equalsIgnoreCase(arguments.get(5))) {
+                        throw new IllegalArgumentException(
+                                "Allocation case mode must be ignore-case or case-sensitive");
+                    }
+                    JvmStringAllocationSpec spec = JvmStringAllocationSpec.builder()
+                            .contentGlob(arguments.get(1))
+                            .createdFrom(arguments.size() > 2 ? arguments.get(2) : "*",
+                                    arguments.size() > 3 ? arguments.get(3) : "*",
+                                    arguments.size() > 4 ? arguments.get(4) : "*")
+                            .caseSensitive(caseSensitive)
+                            .build();
+                    return session.stringHooks().breakAllocation(arguments.get(0), spec);
+                }
+                throw new IllegalArgumentException(
+                        "Expected allocation ..., field ..., or method ... String hook syntax");
             }
         }, new Consumer<JvmStringHookInfo>() {
             @Override public void accept(JvmStringHookInfo value) {
@@ -1564,7 +1584,7 @@ public final class TargetTui implements AutoCloseable {
     private void openSelectedStringHook() {
         final JvmStringHookInfo selected = selectedStringHook();
         if (selected == null) return;
-        if (!selected.fieldHook()) {
+        if (!selected.fieldHook() && !selected.allocationHook()) {
             if (selected.lastHitSequence() < 0) {
                 status = "This method hook has not fired yet; its next hit will appear in Debug.";
             } else {
@@ -1610,8 +1630,8 @@ public final class TargetTui implements AutoCloseable {
 
     private void trackSelectedStringHookValue() throws IOException {
         final JvmStringHookInfo selected = selectedStringHook();
-        if (selected == null || !selected.fieldHook()) {
-            status = "Only a field-backed String hook can become a tracked value.";
+        if (selected == null || (!selected.fieldHook() && !selected.allocationHook())) {
+            status = "Only field and allocation String hooks can become tracked values.";
             return;
         }
         final String name = editText("Tracked reference name", selected.name());
@@ -1625,7 +1645,7 @@ public final class TargetTui implements AutoCloseable {
             @Override public void accept(JvmReferenceInfo value) {
                 tab = Tab.REFERENCES;
                 selectReference(value.name());
-                status = "Tracking String field as " + value.name();
+                status = "Tracking String value as " + value.name();
             }
         });
     }
@@ -4770,7 +4790,7 @@ public final class TargetTui implements AutoCloseable {
             if (hook == null) {
                 result.add("<none>");
                 result.add("");
-                result.add("A adds a field read/write or method entry/exit hook.");
+                result.add("A adds an allocation, field read/write, or method entry/exit hook.");
                 result.add("Select a java.lang.String field in Fields and press ; for a guided hook.");
                 return result;
             }
@@ -4779,16 +4799,30 @@ public final class TargetTui implements AutoCloseable {
             result.add("Kind:       " + hook.kind());
             result.add("Target:     " + hook.className() + "." + hook.memberName());
             result.add("Descriptor: " + hook.descriptor());
-            result.add("Scope:      " + (hook.objectSpecific() ? "current object only" : "all matching instances"));
+            result.add("Scope:      " + (hook.allocationHook() ? "all new matching Strings"
+                    : hook.objectSpecific() ? "current object only" : "all matching instances"));
+            if (hook.allocationSpec() != null) {
+                result.add("Content:    " + hook.allocationSpec().contentPattern());
+                result.add("Creator:    " + hook.allocationSpec().creatorClassPattern() + "#"
+                        + hook.allocationSpec().creatorMethodPattern()
+                        + hook.allocationSpec().creatorDescriptorPattern());
+                result.add("Case:       " + (hook.allocationSpec().caseSensitive()
+                        ? "sensitive" : "insensitive"));
+                result.add("Hits:       " + hook.hitCount());
+                result.add("Last value: " + (hook.lastValue().isEmpty()
+                        ? "<none>" : hook.lastValue()));
+            }
             result.add("Last hit:   " + (hook.lastHit().isEmpty() ? "<none>" : hook.lastHit()));
             result.add("");
             result.add("Field hooks can read, replace, track, or open their current String value.");
+            result.add("Allocation hooks stop matching creators and retain the latest matched String.");
             result.add("Method hook hits pause in Debug; Locals/Frames expose arguments and return values.");
-            addKeyHelp(result, "A", "Add a String field or method hook");
-            addKeyHelp(result, "Enter", hook.fieldHook() ? "Open current String as Context" : "Open last hit in Debug");
+            addKeyHelp(result, "A", "Add a String allocation, field, or method hook");
+            addKeyHelp(result, "Enter", hook.fieldHook() || hook.allocationHook()
+                    ? "Open current/matched String as Context" : "Open last hit in Debug");
             addKeyHelp(result, "F9", "Enable or disable this hook");
             addKeyHelp(result, "=", "Replace a field-backed String value");
-            addKeyHelp(result, "&", "Track a field-backed String in References");
+            addKeyHelp(result, "&", "Track a field/allocation String in References");
             addKeyHelp(result, "Delete", "Remove this hook");
             return result;
         }
@@ -5294,7 +5328,8 @@ public final class TargetTui implements AutoCloseable {
                 result.add("CURRENT BCI: yellow > marker; G selects and centres it");
             }
             if (!debuggerState.returnState().isEmpty()) {
-                result.add("RETURN: " + (debuggerState.returnValue() == null
+                result.add(("allocation".equals(debuggerState.returnState())
+                        ? "MATCHED STRING: " : "RETURN: ") + (debuggerState.returnValue() == null
                         ? debuggerState.returnState() : debuggerState.returnValue().displayValue()));
                 result.add("METHOD_EXIT is observational; force return before this event.");
             }

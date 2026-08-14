@@ -12,7 +12,8 @@ JVMRTDP is a diagnostics, analysis, and debugging tool for HotSpot Java Virtual 
 - Browse runtime state by package, class, field, method, object, stack frame, and static context.
 - Read and modify fields, arrays, and collections; invoke methods and constructors.
 - Retain, weakly track, replace, and release named object or field references across Context changes.
-- Manage precise String field watches and String-bearing method entry/exit hooks.
+- Stop on newly created Strings by content/creator-stack conditions, retain the match, and manage
+  precise String field watches or String-bearing method entry/exit hooks.
 - Decompile classes or individual methods with CFR or Procyon.
 - Inspect JVM bytecode, bytecode indexes (BCI), source lines, constant-pool references, and method metadata.
 - Manage breakpoints, field access/modification watchpoints, stepping, and paused threads.
@@ -40,12 +41,12 @@ The controller, target JVM, and native agent must use compatible architectures. 
 Build outputs:
 
 ```text
-build/libs/JVMRTDP-2.1.1.jar
-build/libs/jvmrtdp-2.1.1-library.jar
+build/libs/JVMRTDP-2.2.0.jar
+build/libs/jvmrtdp-2.2.0-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
 
-`JVMRTDP-2.1.1.jar` is the self-contained executable. `jvmrtdp-2.1.1-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
+`JVMRTDP-2.2.0.jar` is the self-contained executable. `jvmrtdp-2.2.0-library.jar` is the dependency-friendly library artifact and keeps terminal dependencies external.
 
 To publish the agent DLL to the conventional location:
 
@@ -66,13 +67,13 @@ The agent embedded in the JAR and a DLL preloaded by the target JVM should come 
 Start the default TUI:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.1.jar
+java -jar build\libs\JVMRTDP-2.2.0.jar
 ```
 
 Start in command-line mode:
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.1.jar --cli
+java -jar build\libs\JVMRTDP-2.2.0.jar --cli
 ```
 
 Basic CLI workflow:
@@ -166,7 +167,7 @@ Main views:
 - `decompile`: decompiled class or method source
 - `bytecode`: BCI, source lines, and instruction stream
 - `debug`: current stop, threads, stack, and locals
-- `strings`: String field watches and method entry/exit hooks
+- `strings`: conditional String allocation stops, field watches, and method entry/exit hooks
 - `frames` / `locals`: stack frames and local variables
 - `breakpoints`: breakpoint management
 - `threads`: all JVM threads and states
@@ -299,6 +300,7 @@ refs release service
 strings field display-write write com.example.Config displayName
 strings field user-name-write write com.example.User name object
 strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
+strings allocation token-created "*secret-token*" "com.example.*" "*" "*" ignore-case
 strings track display-write displayValue
 strings use display-write
 strings call display-write length ()I
@@ -308,6 +310,12 @@ Strong references keep objects alive until release. Weak references report `COLL
 normal GC. A tracked field reports `NULL` when its current value is Java `null`; this is distinct
 from a collected weak receiver. String replacement updates the owning field/reference/local—Java
 `String` instances remain immutable.
+
+Allocation hooks use `VM_OBJECT_ALLOC` plus completed `String.<init>` exits. Content and creator
+stack patterns are evaluated in the target before pausing, so unrelated allocations never stop.
+The latest match supports `read`, `use`, `call`, and `track`, while Debug exposes its complete
+creator stack. Use `-agentpath` when dynamic attach cannot acquire the object-allocation or
+method-exit capabilities, or local-instance access needed after constructor completion.
 
 Batch mode executes target commands directly:
 
@@ -333,7 +341,7 @@ Publish the current build to the local Maven repository:
 
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1") }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.2.0") }
 ```
 
 Discover and attach to a JVM from Java:
@@ -371,3 +379,4 @@ transformers, transactional ASM bytecode patches, retransformation, and redefini
 - [Scripting Guide](docs/SCRIPTING.md)
 - [JVMTI API Coverage](docs/JVMTI-API-COVERAGE.md)
 - [Java Library Guide](docs/LIBRARY.md)
+- [Java API Reference](docs/JAVA-API.md)

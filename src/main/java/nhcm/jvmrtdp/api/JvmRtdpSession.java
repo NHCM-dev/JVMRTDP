@@ -6,6 +6,7 @@ import nhcm.jvmrtdp.controllerside.RemoteOperations;
 import nhcm.jvmrtdp.controllerside.RemoteWorkspace;
 import nhcm.jvmrtdp.controllerside.TargetSession;
 import nhcm.jvmrtdp.controllerside.debug.DebuggerControlService;
+import nhcm.jvmrtdp.controllerside.analysis.JvmClassPathCatalog;
 import nhcm.jvmrtdp.api.hook.JvmStringHookManager;
 import nhcm.jvmrtdp.api.reference.JvmReferenceManager;
 import nhcm.jvmrtdp.handles.ServerHandle;
@@ -18,6 +19,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -167,6 +169,21 @@ public final class JvmRtdpSession implements AutoCloseable {
         return target.loadClassWithoutInitialization(className);
     }
 
+    /**
+     * Returns the cached target class-path catalog, discovering it on first use. Catalog entries
+     * can describe unloaded classes and are metadata only; they are not live RemoteClass handles.
+     */
+    public JvmClassPathCatalog classPathCatalog() throws IOException {
+        ensureOpen();
+        return target.classPathCatalog();
+    }
+
+    /** Re-scans target class-path entries and loaded-class state, then returns the new catalog. */
+    public JvmClassPathCatalog refreshClassPathCatalog() throws IOException {
+        ensureOpen();
+        return target.refreshClassPathCatalog();
+    }
+
     public RemoteJNIEnv jni() {
         ensureOpen();
         return target.jni();
@@ -189,7 +206,7 @@ public final class JvmRtdpSession implements AutoCloseable {
         return target.references();
     }
 
-    /** Precise String field watches and String-bearing method entry/exit hooks. */
+    /** Conditional String allocation stops, field watches, and String-bearing method hooks. */
     public JvmStringHookManager stringHooks() {
         ensureOpen();
         return target.stringHooks();

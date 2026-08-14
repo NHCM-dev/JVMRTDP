@@ -8,6 +8,8 @@ import java.time.Instant;
  * carries primitive return/new-value bits, timeout, allocation size, tag, flags or code size,
  * depending on {@code type}. Related-method fields describe an exception catch site; member
  * fields describe a watched field; {@code text} carries native code/resource descriptions.
+ * Accessors that do not apply to {@link #type()} return null or zero. See the Java API Reference's
+ * event payload table before interpreting event-specific fields.
  */
 public class JvmtiEvent {
     private final JvmtiEventType type;
@@ -66,12 +68,15 @@ public class JvmtiEvent {
     public String methodName() { return methodName; }
     public String methodDescriptor() { return methodDescriptor; }
     public long location() { return location; }
+    /** Primary event object: receiver, exception, monitor, allocated object, or class. */
     public Object subject() { return subject; }
+    /** Event-specific primitive data: flags, timeout, size, tag, address size, or primitive bits. */
     public long value() { return value; }
     /** Catch/related method class, when the native event supplies one. */
     public String relatedClassName() { return relatedClassName; }
     public String relatedMethodName() { return relatedMethodName; }
     public String relatedMethodDescriptor() { return relatedMethodDescriptor; }
+    /** Related BCI or event-specific count; for EXCEPTION this is the catch location. */
     public long relatedLocation() { return relatedLocation; }
     /** Field name/descriptor for field watch events. */
     public String memberName() { return memberName; }

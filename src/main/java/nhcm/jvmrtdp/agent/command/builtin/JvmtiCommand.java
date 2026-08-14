@@ -9,6 +9,7 @@ import nhcm.jvmrtdp.handles.JRDHandle;
 import nhcm.jvmrtdp.protocol.CommandReply;
 import nhcm.jvmrtdp.protocol.RemoteObjectDescriptor;
 import nhcm.jvmrtdp.protocol.TextWireCodec;
+import nhcm.jvmrtdp.remoteside.StringAllocationHookService;
 
 import java.util.ArrayList;
 import java.util.Base64;
@@ -31,7 +32,7 @@ public class JvmtiCommand implements RemoteCommand {
                 + "method.info|method.bytecodes|method.lines|field.info|events|events.generate|verbose|retransform|redefine|"
                 + "breakpoint|debug.event-breakpoint|debug.enable|debug.disable|debug.status|debug.status-all|debug.continue|"
                 + "debug.pause-thread|debug.continue-thread|debug.continue-all|debug.step|debug.step-thread|debug.step-out|debug.step-out-thread|"
-                + "debug.locals|debug.set-local|debug.force-return|debug.force-return-void|"
+                + "debug.locals|debug.set-local|debug.force-return|debug.force-return-void|string.alloc|"
                 + "watch|threads|thread.info|thread.state|thread.stack|thread.frame-count|"
                 + "thread.cpu-time|thread.owned-monitors|thread.contended-monitor|thread.suspend|thread.resume|"
                 + "thread.interrupt|thread.frame-pop|object.size|object.hash|object.monitor-usage|"
@@ -50,6 +51,19 @@ public class JvmtiCommand implements RemoteCommand {
         if ("bytes".equals(operation) && arguments.size() == 2) {
             return success(Base64.getUrlEncoder().withoutPadding().encodeToString(
                     handle.targetJvm().getClassBytes(arguments.get(1))));
+        }
+        if ("string.alloc".equals(operation) && arguments.size() >= 3) {
+            String action = arguments.get(1).toLowerCase(Locale.ROOT);
+            String id = arguments.get(2);
+            if ("clear".equals(action)) {
+                return success(Boolean.toString(StringAllocationHookService.remove(id)));
+            }
+            if ("set".equals(action) && arguments.size() == 8) {
+                StringAllocationHookService.set(id, arguments.get(3), arguments.get(4),
+                        arguments.get(5), arguments.get(6), Boolean.parseBoolean(arguments.get(7)));
+                return success("ok");
+            }
+            return invalid();
         }
         if ("capabilities".equals(operation) && arguments.size() == 1) {
             return success(NativeAgent.capabilities());

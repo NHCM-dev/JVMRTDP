@@ -2,7 +2,13 @@ package nhcm.jvmrtdp.api.jvmti;
 
 import java.util.Objects;
 
-/** Immutable method-event or exception breakpoint specification. Patterns support {@code *} and {@code ?}. */
+/**
+ * Immutable method-entry, method-exit, or exception breakpoint specification.
+ * Patterns support {@code *} and {@code ?}. Unlike a BCI breakpoint, an event breakpoint can
+ * stop native and abstract declarations because it does not require a Java Code attribute.
+ * Symbolic registrations remain useful for future class loads; {@link #includingSubtypes()}
+ * instead requires one exact, already-loaded base class or interface.
+ */
 public final class JvmEventBreakpointSpec {
     private final JvmEventBreakpointKind kind;
     private final String classPattern;

@@ -239,6 +239,22 @@ public class NativeAgent {
                 registrationId, receiver);
     }
 
+    public static void setStringAllocationHook(String registrationId,
+            String contentPattern, String creatorClassPattern, String creatorMethodPattern,
+            String creatorDescriptorPattern, boolean caseSensitive, boolean enabled) {
+        requireAvailable();
+        if (registrationId == null || registrationId.isEmpty()) {
+            throw new IllegalArgumentException("registrationId must not be empty");
+        }
+        NativeJvmtiBridge.setStringAllocationHook(registrationId,
+                contentPattern == null || contentPattern.isEmpty() ? "*" : contentPattern,
+                creatorClassPattern == null || creatorClassPattern.isEmpty() ? "*" : creatorClassPattern,
+                creatorMethodPattern == null || creatorMethodPattern.isEmpty() ? "*" : creatorMethodPattern,
+                creatorDescriptorPattern == null || creatorDescriptorPattern.isEmpty()
+                        ? "*" : creatorDescriptorPattern,
+                caseSensitive, enabled);
+    }
+
     public static void setFieldWatch(String className, String fieldName, String descriptor,
             boolean modification, boolean enabled, String registrationId) {
         requireAvailable();

@@ -69,7 +69,7 @@ public class TargetSession implements AutoCloseable {
     /** Shared object/field reference registry used by CLI, TUI, and the Java API. */
     public JvmReferenceManager references() { return references; }
 
-    /** Shared precise String watch/method-hook registry. */
+    /** Shared String allocation/watch/method-hook registry. */
     public JvmStringHookManager stringHooks() { return stringHooks; }
 
     public RemoteClass findClass(String className) {

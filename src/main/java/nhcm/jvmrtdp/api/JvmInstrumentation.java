@@ -90,14 +90,23 @@ public final class JvmInstrumentation {
         return jvmti.addJar(name, jar, scope, anchorClass);
     }
 
-    /** Registers a deployed {@code JvmtiEventHandler}. Close the result to remove the hook. */
+    /**
+     * Registers a deployed {@code JvmtiEventHandler}. The target-side handler must be public and
+     * have a public no-argument constructor. Prefer asynchronous delivery ({@code synchronous =
+     * false}) for observation; synchronous callbacks block the native event thread. Close the
+     * result to remove the hook.
+     */
     public RemoteJvmtiCallback hook(RemoteCodeDeployment deployment, String handlerClass,
             Set<JvmtiEventType> events, boolean synchronous) {
         if (deployment == null) throw new IllegalArgumentException("deployment must not be null");
         return deployment.registerCallback(handlerClass, events, synchronous);
     }
 
-    /** Registers a deployed {@code JvmtiClassFileTransformer}. Retransform to apply it to loaded classes. */
+    /**
+     * Registers a deployed {@code JvmtiClassFileTransformer}. A transformer returns a complete
+     * class file (or null to keep the current bytes), is necessarily synchronous, and runs for
+     * future loads. Call {@link #retransform(String)} to apply it to an already-loaded class.
+     */
     public RemoteJvmtiCallback transformer(RemoteCodeDeployment deployment,
             String transformerClass, boolean synchronous) {
         if (deployment == null) throw new IllegalArgumentException("deployment must not be null");

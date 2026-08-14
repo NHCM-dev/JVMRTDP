@@ -11,6 +11,7 @@ JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析�
 - 扫描并连接本机 Java 进程，包括嵌入式 JVM。
 - 按包、类、字段、方法、对象、调用栈和静态上下文浏览运行时状态。
 - 读取和修改字段、数组与集合，调用方法和构造器。
+- 按内容和创建调用栈条件捕获任意新 String，命中后暂停、读取、调用或加入引用管理。
 - 使用 CFR 或 Procyon 反编译类和单个方法。
 - 查看 JVM 字节码、字节码索引（BCI）、源码行号、常量池引用和方法元数据。
 - 管理断点、字段访问/修改监视点、单步执行和多线程暂停状态。
@@ -38,12 +39,12 @@ JVMRTDP 是面向 Windows x64 HotSpot Java 虚拟机（JVM）的诊断、分析�
 构建产物位于：
 
 ```text
-build/libs/JVMRTDP-2.1.1.jar
-build/libs/jvmrtdp-2.1.1-library.jar
+build/libs/JVMRTDP-2.2.0.jar
+build/libs/jvmrtdp-2.2.0-library.jar
 build/native-output/agent/x64/Release/jvmrtdp-agent-build.dll
 ```
 
-`JVMRTDP-2.1.1.jar` 是自包含可执行程序；`jvmrtdp-2.1.1-library.jar` 是适合作为依赖的库产物，终端相关依赖保持外置。
+`JVMRTDP-2.2.0.jar` 是自包含可执行程序；`jvmrtdp-2.2.0-library.jar` 是适合作为依赖的库产物，终端相关依赖保持外置。
 
 如需将代理 DLL 发布到传统目录：
 
@@ -64,13 +65,13 @@ JAR 中包含的代理和目标 JVM 预加载的 DLL 应来自同一次构建。
 启动默认 TUI：
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.1.jar
+java -jar build\libs\JVMRTDP-2.2.0.jar
 ```
 
 启动命令行模式：
 
 ```powershell
-java -jar build\libs\JVMRTDP-2.1.1.jar --cli
+java -jar build\libs\JVMRTDP-2.2.0.jar --cli
 ```
 
 命令行基本流程：
@@ -240,13 +241,18 @@ references set service-name "updated"
 
 strings field name-write write com.example.Service name
 strings method parse-exit exit com.example.Parser parse (Ljava/lang/String;)Ljava/lang/String;
+strings allocation token-created "*secret-token*" "com.example.*" "*" "*" ignore-case
 strings track name-write observed-name
 strings call name-write length ()I
 ```
 
 `references` 页管理对象快照、实例字段和静态字段。强引用会保持对象存活，弱引用被 GC 回收后显示 `COLLECTED`，Java null 单独显示为 `NULL`。条目可以刷新、写入、作为 Context 打开或手动释放。
 
-`strings` 页管理 String 字段读取/写入监视点以及带 String 签名的方法进入/退出断点。字段值可读取、替换、保存为托管引用或作为接收者调用方法；Hook 命中会同步到 Debug、Frames 和 Locals。调试快照的 JSON/JSONL 也包含引用与 String Hook 状态。
+`strings` 页还可组合 `VM_OBJECT_ALLOC` 和完成后的 `String.<init>`，在目标 JVM 内按内容 glob
+及创建者 class/method/descriptor 调用栈过滤。未匹配的分配不会暂停；命中值可读取、调用、
+保存为引用或作为 Context 打开，完整创建栈显示在 Debug/Frames。该功能需要对象分配、方法退出
+和局部变量访问能力；动态 attach 无法取得时应使用 `-agentpath`。字段和方法 Hook 的原有操作保持不变，调试快照也会导出
+Allocation 条件与命中状态。
 
 ## 自动化
 
@@ -274,7 +280,7 @@ script workflow.jrd
 
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1") }
+dependencies { implementation("nhcm.jvmrtdp:jvmrtdp:2.2.0") }
 ```
 
 在 Java 中发现并连接 JVM：
@@ -308,4 +314,5 @@ try (JvmRtdpClient client = JvmRtdpClient.open();
 - [脚本指南](docs/SCRIPTING_ZH.md)
 - [JVMTI API 覆盖范围](docs/JVMTI-API-COVERAGE_ZH.md)
 - [Java 库指南](docs/LIBRARY_ZH.md)
+- [Java API 参考](docs/JAVA-API_ZH.md)
 <!-- English is the canonical documentation; this file is the Chinese translation. -->

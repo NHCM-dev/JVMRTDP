@@ -124,7 +124,7 @@ public final class DebuggerAnalysisExporter {
 
     private static String json(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
-        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 4,");
+        out.append("{\n  \"schema\": \"jvmrtdp.debug-analysis\",\n  \"version\": 5,");
         field(out, "capturedAt", value.capturedAt, true, 2);
         out.append(",\n  \"target\": {\"pid\": ").append(value.pid).append("},");
         out.append("\n  \"freeze\": ");
@@ -175,7 +175,7 @@ public final class DebuggerAnalysisExporter {
     private static String jsonLines(Snapshot value) {
         StringBuilder out = new StringBuilder(8192);
         out.append("{\"type\":\"meta\",\"schema\":\"jvmrtdp.debug-analysis\","
-                + "\"version\":4,\"capturedAt\":");
+                + "\"version\":5,\"capturedAt\":");
         quote(out, value.capturedAt);
         out.append(",\"pid\":").append(value.pid).append(",\"freeze\":");
         appendFreeze(out, value.freeze);
@@ -375,8 +375,19 @@ public final class DebuggerAnalysisExporter {
         field(out, "descriptor", value.descriptor(), false, 0);
         out.append(",\"objectSpecific\":").append(value.objectSpecific())
                 .append(",\"enabled\":").append(value.enabled())
-                .append(",\"lastHitSequence\":").append(value.lastHitSequence());
+                .append(",\"lastHitSequence\":").append(value.lastHitSequence())
+                .append(",\"hitCount\":").append(value.hitCount());
         nullableField(out, "lastHit", emptyToNull(value.lastHit()));
+        nullableField(out, "lastValue", emptyToNull(value.lastValue()));
+        if (value.allocationSpec() != null) {
+            out.append(",\"allocation\":{");
+            field(out, "content", value.allocationSpec().contentPattern(), true, 0);
+            field(out, "creatorClass", value.allocationSpec().creatorClassPattern(), false, 0);
+            field(out, "creatorMethod", value.allocationSpec().creatorMethodPattern(), false, 0);
+            field(out, "creatorDescriptor", value.allocationSpec().creatorDescriptorPattern(), false, 0);
+            out.append(",\"caseSensitive\":")
+                    .append(value.allocationSpec().caseSensitive()).append('}');
+        }
         out.append('}');
     }
 

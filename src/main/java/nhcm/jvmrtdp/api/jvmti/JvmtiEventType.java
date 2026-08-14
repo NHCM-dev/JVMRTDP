@@ -2,7 +2,12 @@ package nhcm.jvmrtdp.api.jvmti;
 
 import java.util.Locale;
 
-/** JVMTI events that can be enabled for Java callbacks. */
+/**
+ * JVMTI events that can be enabled for Java callbacks. Register a set with
+ * {@code JvmInstrumentation.hook} or {@code RemoteCodeDeployment.registerCallback}. Consult
+ * {@link #requiredCapability()} before registration; null means no additional capability is
+ * declared by this API, not that the event is valid in every JVM phase.
+ */
 public enum JvmtiEventType {
     VM_INIT(JvmtiEventCategory.VM, null),
     VM_DEATH(JvmtiEventCategory.VM, null),
@@ -44,7 +49,9 @@ public enum JvmtiEventType {
         this.requiredCapability = requiredCapability;
     }
 
+    /** Logical dispatch group used by {@link JvmtiCategorizedEventHandler}. */
     public JvmtiEventCategory category() { return category; }
+    /** Capability required by this event, or null when none is declared. */
     public JvmtiCapability requiredCapability() { return requiredCapability; }
 
     public String wireName() {

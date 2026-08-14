@@ -4,6 +4,8 @@
 
 JVMRTDP 可通过 `nhcm.jvmrtdp.api` 中的公开 API 嵌入其他 Java 应用。构建仍会同时生成供 CLI 和 TUI 使用的独立可执行 JAR。
 
+包含事件回调、断点、字段 Watch、调试器和插桩完整示例的任务式说明见 [Java API 参考](JAVA-API_ZH.md)。
+
 ## 1. 安装
 
 将开发构建发布到本地 Maven 仓库：
@@ -20,7 +22,7 @@ repositories {
 }
 
 dependencies {
-    implementation("nhcm.jvmrtdp:jvmrtdp:2.1.1")
+    implementation("nhcm.jvmrtdp:jvmrtdp:2.2.0")
 }
 ```
 
@@ -30,11 +32,11 @@ Maven：
 <dependency>
   <groupId>nhcm.jvmrtdp</groupId>
   <artifactId>jvmrtdp</artifactId>
-  <version>2.1.1</version>
+  <version>2.2.0</version>
 </dependency>
 ```
 
-本地文件依赖使用 `build/libs/jvmrtdp-2.1.1-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 ASM 与 JLine；使用文件依赖时，字节码 API 需自行添加 `asm-tree` 与 `asm-util`，终端控制类需添加 JLine。`build/libs/JVMRTDP-2.1.1.jar` 仍是自包含可执行程序。
+本地文件依赖使用 `build/libs/jvmrtdp-2.2.0-library.jar`。库产物包含 JVMRTDP 类、Windows x64 原生组件和反编译器实现。Maven/Gradle 元数据会提供 ASM 与 JLine；使用文件依赖时，字节码 API 需自行添加 `asm-tree` 与 `asm-util`，终端控制类需添加 JLine。`build/libs/JVMRTDP-2.2.0.jar` 仍是自包含可执行程序。
 
 发布产物包括库 JAR、源码包、Javadoc 和 Maven POM。自动模块名为 `nhcm.jvmrtdp`。
 
@@ -140,7 +142,7 @@ System.out.println(session.jvmti().capabilityStatuses());
 | `session.workspace()` | 具名类和对象句柄 |
 | `session.debugger()` | 可逆分析冻结和调试器协调 |
 | `session.references()` | 强/弱对象快照与实时实例/静态字段槽 |
-| `session.stringHooks()` | String 字段监视与带 String 签名的方法进入/退出 Hook |
+| `session.stringHooks()` | String 分配条件、字段监视与方法进入/退出 Hook |
 | `session.serverHandle()` | 高级认证协议访问 |
 
 远程对象句柄是强引用。不再使用 `RemoteObject`、`RemoteJvmtiThread`、部署、回调和其他可关闭句柄时，应尽快关闭。
@@ -176,6 +178,12 @@ session.stringHooks().watchField("message-write", message, true, null);
 session.stringHooks().breakMethod("parse-exit", JvmStringHookKind.METHOD_EXIT,
         "com.example.Parser", "parse",
         "(Ljava/lang/String;)Ljava/lang/String;");
+session.stringHooks().breakAllocation("secret-created",
+        JvmStringAllocationSpec.builder()
+                .contentGlob("*secret-token*")
+                .createdFrom("com.example.*", "*", "*")
+                .caseSensitive(false)
+                .build());
 
 try (RemoteObject value = session.stringHooks().acquireValue("message-write")) {
     System.out.println(value.displayValue());
@@ -186,7 +194,11 @@ session.stringHooks().trackValue("message-write", session.references(),
 
 字段 Hook 使用 JVMTI 字段访问/修改监视点，可选择所有实例或精确接收者。方法 Hook 使用托管 `METHOD_ENTRY`/`METHOD_EXIT` 事件断点。内置 CLI/TUI 会自动把 Hook 命中与共享调试器关联；自定义界面可将 `debuggerStates()` 传给 `observe(...)`。String 不可变，`replaceValue` 替换字段引用，而不是改写 String 内部数组。
 
-引用与 Hook 会随 session 关闭而清理，并写入调试器 JSON/JSONL 快照 schema v4。部署回调仍使用 `JvmtiEventHandler`/`JvmtiMethodEvent`；同步 class-file transformer 仅适合需要返回字节码的场景，普通观察 Hook 应使用异步事件分发。
+Allocation Hook 会在目标端组合 `VM_OBJECT_ALLOC` 与完成后的 `String.<init>`，按内容和创建栈
+过滤后才暂停。最近一次命中可读取、调用、加入引用或作为 Context 使用；String 本身不可变，
+要修改程序状态应替换拥有它的字段/local。引用与 Hook 会随 session 关闭而清理，并写入调试器
+JSON/JSONL 快照 schema v5。部署回调仍使用 `JvmtiEventHandler`/`JvmtiMethodEvent`；同步
+class-file transformer 仅适合需要返回字节码的场景，普通观察 Hook 应使用异步事件分发。
 
 ## 7. Agent 命令与异步调用
 
